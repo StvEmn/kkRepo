@@ -1155,6 +1155,10 @@ body {
   min-width: 1240px;
 }
 
+.repositories-table {
+  min-width: 1240px;
+}
+
 .state-badge {
   display: inline-flex;
   align-items: center;

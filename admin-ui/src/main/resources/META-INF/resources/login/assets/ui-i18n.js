@@ -139,6 +139,7 @@
     "Check": "检查",
     "edit": "编辑",
     "delete": "删除",
+    "refresh cache": "刷新缓存",
     "view": "查看",
     "Security": "安全",
     "Users": "用户",
