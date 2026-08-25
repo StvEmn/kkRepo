@@ -1105,6 +1105,9 @@ function renderRepositories() {
         <td class="actions-column">
           <button class="row-action edit-repository-button" data-name="${escapeHtml(repo.name)}" type="button">edit</button>
           <button class="row-action delete-repository-button" data-name="${escapeHtml(repo.name)}" type="button">delete</button>
+          ${lowerOrEmpty(repo.type) === "proxy" || lowerOrEmpty(repo.type) === "group"
+            ? `<button class="row-action refresh-cache-button" data-name="${escapeHtml(repo.name)}" type="button">refresh cache</button>`
+            : ""}
         </td>
       </tr>
     `;
@@ -2629,6 +2632,28 @@ async function deleteRepository(name) {
     showToast(`Repository ${name} deleted.`, "ok");
   } catch (error) {
     showToast(`Delete failed: ${error.message}`, "error");
+  }
+}
+
+async function refreshRepositoryCache(name) {
+  const button = document.querySelector(`.refresh-cache-button[data-name="${CSS.escape(name)}"]`);
+  if (!button) return;
+  button.disabled = true;
+  try {
+    const response = await fetch(`/internal/repositories/${encodeURIComponent(name)}/cache/invalidate`, {
+      method: "POST",
+      headers: { Accept: "application/json" },
+      cache: "no-store"
+    });
+    if (response.status === 403) {
+      throw new Error(`You don't have permission to refresh the cache of ${name}.`);
+    }
+    if (!response.ok) throw new Error(await responseErrorMessage(response));
+    showToast(`Cache invalidated for ${name}.`, "ok");
+  } catch (error) {
+    showToast(error.message || `Cache refresh failed for ${name}.`, "error");
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -7102,6 +7127,11 @@ document.getElementById("repository-table").addEventListener("click", (event) =>
   const deleteButton = event.target.closest(".delete-repository-button");
   if (deleteButton) {
     deleteRepository(deleteButton.dataset.name);
+    return;
+  }
+  const refreshButton = event.target.closest(".refresh-cache-button");
+  if (refreshButton) {
+    refreshRepositoryCache(refreshButton.dataset.name);
   }
 });
 document.getElementById("create-cleanup-policy-button").addEventListener("click", showCreateCleanupPolicyForm);
