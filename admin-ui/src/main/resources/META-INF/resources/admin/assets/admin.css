@@ -1155,7 +1155,9 @@ body {
   min-width: 1240px;
 }
 
-.repositories-table {
+/* Later rules win on equal specificity: .nx-table sets min-width further down the file,
+   so use a two-class selector to guarantee this floor applies. */
+.nx-table.repositories-table {
   min-width: 1240px;
 }
 
