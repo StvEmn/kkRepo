@@ -1161,6 +1161,14 @@ body {
   min-width: 1240px;
 }
 
+/* The actions column holds up to three row-action buttons; auto table layout
+   under-allocates it and the last button overflows the cell. Enforce a floor
+   wide enough for both the zh-CN and en labels. */
+#repositories-view .nx-table th.actions-column,
+#repositories-view .nx-table td.actions-column {
+  min-width: 250px;
+}
+
 .state-badge {
   display: inline-flex;
   align-items: center;
