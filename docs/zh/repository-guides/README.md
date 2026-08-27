@@ -14,7 +14,7 @@
 | Maven | hosted / proxy / group | [Maven 使用示例](../client-recipes.md#maven) | [Maven 仓库使用指南](maven.md) |
 | npm | hosted / proxy / group | [npm 使用示例](../client-recipes.md#npm) | [npm 仓库使用指南](npm.md) |
 | PyPI | hosted / proxy / group | [PyPI 使用示例](../client-recipes.md#pypi) | [PyPI 仓库使用指南](pypi.md) |
-| Go | proxy / group | [Go 使用示例](../client-recipes.md#go) | [Go 仓库使用指南](go.md) |
+| Go | hosted / proxy / group | [Go 使用示例](../client-recipes.md#go) | [Go 仓库使用指南](go.md) |
 | Helm | hosted / proxy | [Helm 使用示例](../client-recipes.md#helm) | [Helm 仓库使用指南](helm.md) |
 | Cargo / Rust | hosted / proxy / group | [Cargo / Rust 使用示例](../client-recipes.md#cargo--rust) | [Cargo / Rust 仓库使用指南](cargo-rust.md) |
 | Dart / Pub | hosted / proxy / group | [Dart / Pub 使用示例](../client-recipes.md#dart--pub) | [Dart / Pub 仓库使用指南](dart-pub.md) |
@@ -25,6 +25,9 @@
 | Conda | hosted / proxy / group | [Conda 使用示例](../client-recipes.md#conda) | [Conda 仓库使用指南](conda.md) |
 | APT / Debian | hosted / proxy | [APT / Debian 使用示例](../client-recipes.md#apt--debian) | [APT / Debian 仓库使用指南](apt-debian.md) |
 | Conan 2 | hosted / proxy / group | [Conan 2 使用示例](../client-recipes.md#conan-2) | [Conan 2 仓库使用指南](conan-2.md) |
+| Alpine / APK | hosted / proxy / group | [Alpine / APK 使用示例](../client-recipes.md#alpine--apk) | [Alpine / APK 仓库使用指南](alpine-apk.md) |
+| R / CRAN | hosted / proxy / group | [R / CRAN 使用示例](../client-recipes.md#r--cran) | [R / CRAN 仓库使用指南](r-cran.md) |
+| Hugging Face Models | proxy | [Hugging Face Models 使用示例](../client-recipes.md#hugging-face-models) | [Hugging Face Models 仓库使用指南](hugging-face-models.md) |
 | NuGet | hosted / proxy / group | [NuGet 使用示例](../client-recipes.md#nuget) | [NuGet 仓库使用指南](nuget.md) |
 | RubyGems | hosted / proxy / group | [RubyGems 使用示例](../client-recipes.md#rubygems) | [RubyGems 仓库使用指南](rubygems.md) |
 | Yum | hosted / proxy / group | [Yum 使用示例](../client-recipes.md#yum) | [Yum 仓库使用指南](yum.md) |

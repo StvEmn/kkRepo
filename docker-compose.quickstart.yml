@@ -42,7 +42,7 @@ services:
     network_mode: none
 
   kkrepo:
-    image: ghcr.io/klboke/kkrepo:${KKREPO_IMAGE_TAG:-0.8.0}
+    image: ghcr.io/klboke/kkrepo:${KKREPO_IMAGE_TAG:-0.9.0}
     depends_on:
       mysql:
         condition: service_healthy
@@ -56,6 +56,7 @@ services:
       KKREPO_CREDENTIAL_SECRET: ${KKREPO_CREDENTIAL_SECRET:-quickstart-credential-secret-change-me-0123456789}
       KKREPO_API_KEY_PAYLOAD_SECRET: ${KKREPO_API_KEY_PAYLOAD_SECRET:-quickstart-api-key-payload-secret-change-me-0123456789}
       KKREPO_FILE_BASE_DIR: ${KKREPO_FILE_BASE_DIR:-/var/lib/kkrepo/blobs}
+      SERVER_TOMCAT_MAX_PART_COUNT: ${KKREPO_TOMCAT_MAX_PART_COUNT:-200}
       # Deployment capability only: starts kkRepo scan coordination and policy integration.
       # The scanner container also requires --profile security-scanning, and repository
       # administrators still activate scanning per repository in the Admin UI.
@@ -75,7 +76,7 @@ services:
     restart: unless-stopped
 
   scanner:
-    image: ghcr.io/klboke/kkrepo-scanner:${KKREPO_SCANNER_IMAGE_TAG:-0.8.0}
+    image: ghcr.io/klboke/kkrepo-scanner:${KKREPO_SCANNER_IMAGE_TAG:-0.9.0}
     profiles: ["security-scanning"]
     environment:
       KKREPO_SCANNER_SERVICE_CREDENTIAL: ${KKREPO_SECURITY_SCANNING_SERVICE_CREDENTIAL:-}
@@ -105,7 +106,7 @@ services:
     restart: unless-stopped
 
   scanner-database-updater:
-    image: ghcr.io/klboke/kkrepo-scanner:${KKREPO_SCANNER_IMAGE_TAG:-0.8.0}
+    image: ghcr.io/klboke/kkrepo-scanner:${KKREPO_SCANNER_IMAGE_TAG:-0.9.0}
     profiles: ["security-scanning"]
     entrypoint: ["/bin/sh", "-ec"]
     command:

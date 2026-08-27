@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -22,6 +23,7 @@ import com.github.klboke.kkrepo.persistence.jdbc.api.AssetDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.BrowseNodeDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.ComponentDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.DockerRegistryDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.HuggingFaceRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.PersistenceHashes;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryIndexRebuildDao;
@@ -41,6 +43,7 @@ import com.github.klboke.kkrepo.server.docker.DockerManifestParser;
 import com.github.klboke.kkrepo.server.conda.CondaRepositoryDataMigrationWriter;
 import com.github.klboke.kkrepo.server.conan.ConanRepositoryDataMigrationWriter;
 import com.github.klboke.kkrepo.server.maven.BlobStorageRegistry;
+import com.github.klboke.kkrepo.server.r.RRepositoryDataMigrationWriter;
 import com.github.klboke.kkrepo.server.support.dao.AssetDaoAdapter;
 import com.github.klboke.kkrepo.server.transaction.TransientTransactionRetry;
 import java.io.ByteArrayInputStream;
@@ -72,6 +75,47 @@ import org.springframework.transaction.support.SimpleTransactionStatus;
 class RepositoryDataMigrationWriterTest {
   private static final byte[] SAMPLE = "kkrepo migration checksum\n".getBytes(StandardCharsets.UTF_8);
   private static final MavenPathParser MAVEN_PATH_PARSER = new MavenPathParser();
+
+  @Test
+  void delegatesRSourcePackagesToTheProtocolMigrationWriter() {
+    RepositoryDao repositories = mock(RepositoryDao.class);
+    when(repositories.findById(15L)).thenReturn(Optional.of(rRepository()));
+    RepositoryDataMigrationWriter writer = migrationWriter(
+        repositories, mock(ComponentDao.class), mock(AssetDao.class), mock(BrowseNodeDao.class));
+    RepositoryDataMigrationAssetRecord source = rSource(
+        "src/contrib/demo_1.0.0.tar.gz", 7);
+
+    assertEquals("R migration writer is not configured", assertThrows(
+        IllegalStateException.class,
+        () -> writer.write(15L, source, new ByteArrayInputStream(SAMPLE),
+            "application/x-gzip", true)).getMessage());
+
+    RRepositoryDataMigrationWriter r = mock(RRepositoryDataMigrationWriter.class);
+    when(r.write(any(), any(), any(), anyBoolean())).thenReturn(
+        new RRepositoryDataMigrationWriter.MigratedAsset(21L, 22L, 23L, "object"));
+    writer.setRMigrationWriter(r);
+
+    RepositoryDataMigrationWriter.WriteResult result = writer.write(
+        15L, source, new ByteArrayInputStream(SAMPLE), "application/x-gzip", true);
+
+    assertEquals(21L, result.componentId());
+    assertEquals(22L, result.assetId());
+    assertEquals(23L, result.assetBlobId());
+    assertEquals("object", result.assetBlobObjectKey());
+    verify(r).write(any(), any(), any(), anyBoolean());
+  }
+
+  @Test
+  void classifiesRMigrationAssetsByCanonicalSourcePath() throws Exception {
+    Method assetKind = RepositoryDataMigrationWriter.class.getDeclaredMethod(
+        "assetKind", RepositoryFormat.class, RepositoryDataMigrationAssetRecord.class);
+    assetKind.setAccessible(true);
+
+    assertEquals("r-source-package", assetKind.invoke(
+        null, RepositoryFormat.R, rSource("src/contrib/demo_1.0.0.tar.gz", 7)));
+    assertEquals("r-metadata", assetKind.invoke(
+        null, RepositoryFormat.R, rSource("src/contrib/PACKAGES.gz", 7)));
+  }
 
   @Test
   void generatedMavenChecksumPayloadsMatchNexusUploadHandlerSemantics() {
@@ -471,6 +515,125 @@ class RepositoryDataMigrationWriterTest {
         null, RepositoryFormat.CONAN, conanSource("conan_export.tgz", SAMPLE.length)));
   }
 
+  @Test
+  void migratesCommitPinnedHuggingFaceFilesWithVerifiedIdentityAndLogicalBrowsePath() {
+    byte[] model = "model-weights".getBytes(StandardCharsets.UTF_8);
+    String commit = "0123456789abcdef0123456789abcdef01234567";
+    String path = "org/model/resolve/" + commit + "/weights/model.safetensors";
+    RepositoryDao repositories = mock(RepositoryDao.class);
+    ComponentDao components = mock(ComponentDao.class);
+    RecordingAssetDao assets = new RecordingAssetDao();
+    BrowseNodeDao browse = mock(BrowseNodeDao.class);
+    HuggingFaceRegistryDao registry = mock(HuggingFaceRegistryDao.class);
+    when(repositories.findById(14L)).thenReturn(Optional.of(huggingFaceRepository()));
+    when(components.upsertReturningId(any())).thenReturn(501L);
+    when(registry.upsertRevision(any())).thenAnswer(invocation -> {
+      HuggingFaceRegistryDao.ModelRevision value = invocation.getArgument(0);
+      return new HuggingFaceRegistryDao.ModelRevision(
+          601L, value.repositoryId(), value.repoId(), value.commitHash(), value.componentId(),
+          value.rawMetadataAssetId(), value.author(), value.committedAt(), value.privateModel(),
+          value.gated(), value.libraryName(), value.pipelineTag(), value.license(),
+          value.observedAt(), value.updatedAt());
+    });
+    when(registry.upsertFileMetadata(any())).thenAnswer(invocation -> invocation.getArgument(0));
+    RepositoryDataMigrationWriter writer = migrationWriter(
+        repositories, components, assets, browse);
+    writer.setHuggingFaceRegistry(registry);
+
+    RepositoryDataMigrationWriter.WriteResult result = writer.write(
+        14L,
+        huggingFaceSource(path, "org", "model", commit, model.length,
+            Map.of("checksums", List.of(Map.of("SHA-256", sha256Unchecked(model))))),
+        new ByteArrayInputStream(model),
+        "application/octet-stream",
+        true);
+
+    assertEquals(501L, result.componentId());
+    assertEquals(200L, result.assetId());
+    assertEquals("huggingface-model-file", assets.asset.kind());
+    assertEquals("model-file", assets.asset.attributes().get("huggingfaceRole"));
+    assertEquals("weights/model.safetensors", assets.asset.attributes().get("filePath"));
+    assertEquals((long) model.length, assets.asset.attributes().get("expectedSize"));
+    verify(browse).upsertPathAncestors(
+        14L, "org/model/" + commit + "/weights/model.safetensors", 200L, 501L);
+
+    ArgumentCaptor<ComponentRecord> component = ArgumentCaptor.forClass(ComponentRecord.class);
+    verify(components).upsertReturningId(component.capture());
+    assertEquals("model-revision", component.getValue().kind());
+    assertEquals("org/model", component.getValue().attributes().get("repoId"));
+    assertEquals(commit, component.getValue().attributes().get("commit"));
+
+    ArgumentCaptor<HuggingFaceRegistryDao.ModelFile> file =
+        ArgumentCaptor.forClass(HuggingFaceRegistryDao.ModelFile.class);
+    verify(registry).upsertFileMetadata(file.capture());
+    assertEquals(HuggingFaceRegistryDao.FILE_READY, file.getValue().state());
+    assertEquals(200L, file.getValue().assetId());
+    assertEquals(sha256Unchecked(model), file.getValue().internalSha256());
+  }
+
+  @Test
+  void rejectsAmbiguousOrUnverifiableHuggingFaceMigrationRecords() {
+    byte[] model = "model-weights".getBytes(StandardCharsets.UTF_8);
+    String commit = "0123456789abcdef0123456789abcdef01234567";
+    String canonical = "org/model/resolve/" + commit + "/model.bin";
+    RepositoryDao repositories = mock(RepositoryDao.class);
+    when(repositories.findById(14L)).thenReturn(Optional.of(huggingFaceRepository()));
+    ComponentDao components = mock(ComponentDao.class);
+    when(components.upsertReturningId(any())).thenReturn(501L);
+    RepositoryDataMigrationWriter writer = migrationWriter(
+        repositories, components, new RecordingAssetDao(), mock(BrowseNodeDao.class));
+    writer.setHuggingFaceRegistry(mock(HuggingFaceRegistryDao.class));
+
+    assertThrows(IllegalStateException.class, () -> writer.write(
+        14L,
+        huggingFaceSource("org/model/resolve/main/model.bin", "org", "model", commit,
+            model.length, Map.of("sha256", sha256Unchecked(model))),
+        new ByteArrayInputStream(model), null, true));
+    assertThrows(IllegalStateException.class, () -> writer.write(
+        14L,
+        huggingFaceSource(canonical.replace(commit, commit.toUpperCase()), "org", "model", commit,
+            model.length, Map.of("sha256", sha256Unchecked(model))),
+        new ByteArrayInputStream(model), null, true));
+    assertThrows(IllegalStateException.class, () -> writer.write(
+        14L,
+        huggingFaceSource(canonical, "org", "model", "f".repeat(40),
+            model.length, Map.of("sha256", sha256Unchecked(model))),
+        new ByteArrayInputStream(model), null, true));
+    assertThrows(IllegalStateException.class, () -> writer.write(
+        14L,
+        huggingFaceSource(canonical, "wrong", "identity", commit,
+            model.length, Map.of("sha256", sha256Unchecked(model))),
+        new ByteArrayInputStream(model), null, true));
+    assertThrows(IllegalStateException.class, () -> writer.write(
+        14L,
+        huggingFaceSource(canonical, "org", "model", commit, model.length, Map.of()),
+        new ByteArrayInputStream(model), null, true));
+    assertThrows(IllegalStateException.class, () -> writer.write(
+        14L,
+        huggingFaceSource(canonical, "org", "model", commit, model.length,
+            Map.of("sha-256", "a".repeat(64))),
+        new ByteArrayInputStream(model), null, true));
+  }
+
+  @Test
+  void failsClosedWhenHuggingFaceRegistryProjectionIsUnavailable() {
+    byte[] model = "model-weights".getBytes(StandardCharsets.UTF_8);
+    String commit = "0123456789abcdef0123456789abcdef01234567";
+    String path = "model/resolve/" + commit + "/config.json";
+    RepositoryDao repositories = mock(RepositoryDao.class);
+    when(repositories.findById(14L)).thenReturn(Optional.of(huggingFaceRepository()));
+    ComponentDao components = mock(ComponentDao.class);
+    when(components.upsertReturningId(any())).thenReturn(501L);
+    RepositoryDataMigrationWriter writer = migrationWriter(
+        repositories, components, new RecordingAssetDao(), mock(BrowseNodeDao.class));
+
+    assertThrows(IllegalStateException.class, () -> writer.write(
+        14L,
+        huggingFaceSource(path, null, "model", commit, model.length,
+            Map.of("sha256", sha256Unchecked(model))),
+        new ByteArrayInputStream(model), "application/json", true));
+  }
+
   private static void assertChecksum(
       RepositoryDataMigrationWriter.GeneratedMavenChecksum checksum,
       String expectedPath,
@@ -525,6 +688,48 @@ class RepositoryDataMigrationWriterTest {
         Map.of());
   }
 
+  private static RepositoryRecord huggingFaceRepository() {
+    return new RepositoryRecord(
+        14L,
+        "huggingface-proxy",
+        RepositoryFormat.HUGGINGFACE,
+        RepositoryType.PROXY,
+        "huggingface-proxy",
+        true,
+        1L,
+        null,
+        "https://huggingface.co",
+        null,
+        null,
+        "ALLOW",
+        true,
+        Map.of());
+  }
+
+  private static RepositoryRecord rRepository() {
+    return new RepositoryRecord(
+        15L, "r-hosted", RepositoryFormat.R, RepositoryType.HOSTED,
+        "r-hosted", true, 1L, null, null, null, null, "ALLOW_ONCE", true, Map.of());
+  }
+
+  private static RepositoryDataMigrationWriter migrationWriter(
+      RepositoryDao repositories,
+      ComponentDao components,
+      AssetDao assets,
+      BrowseNodeDao browse) {
+    return new RepositoryDataMigrationWriter(
+        repositories,
+        components,
+        assets,
+        browse,
+        new FixedBlobStorageRegistry(new MemoryBlobStorage()),
+        mock(RepositoryIndexRebuildDao.class),
+        mock(DockerRegistryDao.class),
+        new DockerManifestParser(new ObjectMapper()),
+        null,
+        new TransientTransactionRetry(new RecordingTransactionManager(), 1, 0));
+  }
+
   private static RepositoryDao mockRepositoryDao() {
     RepositoryDao repositoryDao = mock(RepositoryDao.class);
     when(repositoryDao.findById(10L)).thenReturn(Optional.of(dockerRepository()));
@@ -574,6 +779,47 @@ class RepositoryDataMigrationWriterTest {
         now.minusSeconds(180));
   }
 
+  private static RepositoryDataMigrationAssetRecord huggingFaceSource(
+      String path,
+      String namespace,
+      String name,
+      String version,
+      int size,
+      Map<String, Object> metadata) {
+    Instant now = Instant.parse("2026-08-17T00:00:00Z");
+    return new RepositoryDataMigrationAssetRecord(
+        1L,
+        2L,
+        "hf-source-asset",
+        "hf-source-component",
+        path,
+        PersistenceHashes.pathHash(path),
+        RepositoryFormat.HUGGINGFACE,
+        namespace,
+        name,
+        version,
+        "huggingface-model-file",
+        "application/octet-stream",
+        (long) size,
+        "source-blob-ref",
+        now.minusSeconds(60),
+        null,
+        now.minusSeconds(120),
+        now.minusSeconds(60),
+        "nexus-admin",
+        "127.0.0.1",
+        null,
+        0,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        metadata,
+        now.minusSeconds(180));
+  }
+
   private static RepositoryDataMigrationAssetRecord condaSource(String path, int size) {
     return new RepositoryDataMigrationAssetRecord(
         1L, 2L, "source", "component", path, PersistenceHashes.pathHash(path),
@@ -582,6 +828,16 @@ class RepositoryDataMigrationWriterTest {
         Instant.EPOCH, Instant.EPOCH, Instant.EPOCH, Instant.EPOCH,
         "nexus", "127.0.0.1", "PENDING", 0, null, null,
         null, null, null, null, Map.of("sha256", "a".repeat(64)), Instant.EPOCH);
+  }
+
+  private static RepositoryDataMigrationAssetRecord rSource(String path, int size) {
+    return new RepositoryDataMigrationAssetRecord(
+        1L, 2L, "source", "component", path, PersistenceHashes.pathHash(path),
+        RepositoryFormat.R, "src/contrib", "demo", "1.0.0", "r-source-package",
+        "application/x-gzip", (long) size, null,
+        Instant.EPOCH, Instant.EPOCH, Instant.EPOCH, Instant.EPOCH,
+        "nexus", "127.0.0.1", "PENDING", 0, null, null,
+        null, null, null, null, Map.of(), Instant.EPOCH);
   }
 
   private static RepositoryDataMigrationAssetRecord conanSource(String path, int size) {

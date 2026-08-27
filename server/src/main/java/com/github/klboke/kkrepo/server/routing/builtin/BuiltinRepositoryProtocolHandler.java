@@ -1,0 +1,2102 @@
+package com.github.klboke.kkrepo.server.routing.builtin;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.klboke.kkrepo.auth.PermissionSubject;
+import com.github.klboke.kkrepo.core.RepositoryFormat;
+import com.github.klboke.kkrepo.core.RepositoryType;
+import com.github.klboke.kkrepo.protocol.maven.path.MavenPath;
+import com.github.klboke.kkrepo.protocol.maven.path.MavenPathParser;
+import com.github.klboke.kkrepo.protocol.cargo.CargoPath;
+import com.github.klboke.kkrepo.protocol.cargo.CargoPathParser;
+import com.github.klboke.kkrepo.protocol.composer.ComposerPath;
+import com.github.klboke.kkrepo.protocol.composer.ComposerPathParser;
+import com.github.klboke.kkrepo.protocol.npm.NpmPath;
+import com.github.klboke.kkrepo.protocol.npm.NpmPathParser;
+import com.github.klboke.kkrepo.protocol.nuget.NugetPaths;
+import com.github.klboke.kkrepo.protocol.pub.PubPath;
+import com.github.klboke.kkrepo.protocol.pub.PubPathParser;
+import com.github.klboke.kkrepo.protocol.swift.SwiftMediaTypes;
+import com.github.klboke.kkrepo.protocol.terraform.TerraformPath;
+import com.github.klboke.kkrepo.protocol.terraform.TerraformPathParser;
+import com.github.klboke.kkrepo.server.blob.TempBlobFiles;
+import com.github.klboke.kkrepo.server.ansible.AnsibleGalaxyExceptions;
+import com.github.klboke.kkrepo.server.ansible.AnsibleGalaxyMultipartReader;
+import com.github.klboke.kkrepo.server.ansible.AnsibleGalaxyService;
+import com.github.klboke.kkrepo.server.cargo.CargoExceptions;
+import com.github.klboke.kkrepo.server.cargo.CargoGroupService;
+import com.github.klboke.kkrepo.server.cargo.CargoHostedService;
+import com.github.klboke.kkrepo.server.cargo.CargoProxyService;
+import com.github.klboke.kkrepo.server.cargo.CargoSearchQuery;
+import com.github.klboke.kkrepo.server.composer.ComposerGroupService;
+import com.github.klboke.kkrepo.server.composer.ComposerHostedService;
+import com.github.klboke.kkrepo.server.composer.ComposerProxyService;
+import com.github.klboke.kkrepo.server.conda.CondaService;
+import com.github.klboke.kkrepo.server.conan.ConanService;
+import com.github.klboke.kkrepo.server.apt.AptService;
+import com.github.klboke.kkrepo.server.alpine.AlpineService;
+import com.github.klboke.kkrepo.server.goartifact.GoGroupService;
+import com.github.klboke.kkrepo.server.goartifact.GoHostedService;
+import com.github.klboke.kkrepo.server.goartifact.GoProxyService;
+import com.github.klboke.kkrepo.server.helm.HelmHostedService;
+import com.github.klboke.kkrepo.server.helm.HelmProxyService;
+import com.github.klboke.kkrepo.server.huggingface.HuggingFaceService;
+import com.github.klboke.kkrepo.server.http.ConditionalResponses;
+import com.github.klboke.kkrepo.server.maven.MavenExceptions;
+import com.github.klboke.kkrepo.server.maven.MavenGroupService;
+import com.github.klboke.kkrepo.server.maven.MavenHostedService;
+import com.github.klboke.kkrepo.server.maven.MavenHtmlListingService;
+import com.github.klboke.kkrepo.server.maven.MavenPartialFetchSupport;
+import com.github.klboke.kkrepo.server.maven.MavenProxyService;
+import com.github.klboke.kkrepo.server.maven.MavenResponse;
+import com.github.klboke.kkrepo.server.maven.RepositoryRuntime;
+import com.github.klboke.kkrepo.server.npm.NpmExceptions;
+import com.github.klboke.kkrepo.server.npm.NpmGroupService;
+import com.github.klboke.kkrepo.server.npm.NpmHostedService;
+import com.github.klboke.kkrepo.server.npm.NpmPackumentVariant;
+import com.github.klboke.kkrepo.server.npm.NpmProxyService;
+import com.github.klboke.kkrepo.server.npm.NpmSearchService;
+import com.github.klboke.kkrepo.server.npm.NpmTokenService;
+import com.github.klboke.kkrepo.server.nuget.NugetService;
+import com.github.klboke.kkrepo.server.pypi.PypiExceptions;
+import com.github.klboke.kkrepo.server.pypi.PypiGroupService;
+import com.github.klboke.kkrepo.server.pypi.PypiHostedService;
+import com.github.klboke.kkrepo.server.pypi.PypiPartialFetchSupport;
+import com.github.klboke.kkrepo.server.pypi.PypiProxyService;
+import com.github.klboke.kkrepo.server.pypi.PypiRequestPath;
+import com.github.klboke.kkrepo.server.pypi.PypiResponse;
+import com.github.klboke.kkrepo.server.pub.PubExceptions;
+import com.github.klboke.kkrepo.server.pub.PubGroupService;
+import com.github.klboke.kkrepo.server.pub.PubHostedService;
+import com.github.klboke.kkrepo.server.pub.PubProxyService;
+import com.github.klboke.kkrepo.server.raw.RawGroupService;
+import com.github.klboke.kkrepo.server.raw.RawHostedService;
+import com.github.klboke.kkrepo.server.raw.RawProxyService;
+import com.github.klboke.kkrepo.server.r.RService;
+import com.github.klboke.kkrepo.server.routing.RepositoryProtocolHandler;
+import com.github.klboke.kkrepo.server.routing.RepositoryProtocolRequest;
+import com.github.klboke.kkrepo.server.routing.RepositoryProtocolRoute;
+import com.github.klboke.kkrepo.server.rubygems.RubygemsService;
+import com.github.klboke.kkrepo.server.security.AuthenticatedSubject;
+import com.github.klboke.kkrepo.server.security.ForwardedHeaderPolicy;
+import com.github.klboke.kkrepo.server.security.RepositorySecurityFilter;
+import com.github.klboke.kkrepo.server.swift.SwiftExceptions;
+import com.github.klboke.kkrepo.server.swift.SwiftService;
+import com.github.klboke.kkrepo.server.terraform.TerraformService;
+import com.github.klboke.kkrepo.server.yum.YumService;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.Part;
+import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.nio.charset.StandardCharsets;
+import java.util.Collection;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.stereotype.Component;
+import org.springframework.web.multipart.MultipartFile;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
+
+/**
+ * Compatibility catch-all for protocol paths not yet owned by a focused route handler.
+ *
+ * <p>The dispatcher supplies one immutable repository runtime snapshot. New routes should be
+ * implemented as focused handlers so this class can shrink as protocol runtimes move to their
+ * owning modules.
+ */
+@Component
+public class BuiltinRepositoryProtocolHandler implements RepositoryProtocolHandler {
+  private static final List<RepositoryProtocolRoute> ROUTES =
+      Arrays.stream(RepositoryFormat.values())
+          .flatMap(format -> Arrays.stream(RepositoryType.values())
+              .flatMap(type -> List.of(
+                      HttpMethod.GET,
+                      HttpMethod.HEAD,
+                      HttpMethod.PUT,
+                      HttpMethod.DELETE,
+                      HttpMethod.POST)
+                  .stream()
+                  .map(method -> RepositoryProtocolRoute.anyPath(
+                      format, type, method, 1_000))))
+          .toList();
+  private final MavenHostedService hosted;
+  private final MavenProxyService proxy;
+  private final MavenGroupService group;
+  private final GoProxyService goProxy;
+  private final GoGroupService goGroup;
+  private GoHostedService goHosted;
+  private final HelmHostedService helmHosted;
+  private final HelmProxyService helmProxy;
+  private final MavenHtmlListingService htmlListing;
+  private final NpmHostedService npmHosted;
+  private final NpmProxyService npmProxy;
+  private final NpmGroupService npmGroup;
+  private final NpmSearchService npmSearch;
+  private final NpmTokenService npmToken;
+  private final PypiHostedService pypiHosted;
+  private final PypiProxyService pypiProxy;
+  private final PypiGroupService pypiGroup;
+  private final CargoHostedService cargoHosted;
+  private final CargoProxyService cargoProxy;
+  private final CargoGroupService cargoGroup;
+  private final PubHostedService pubHosted;
+  private final PubProxyService pubProxy;
+  private final PubGroupService pubGroup;
+  private final ComposerHostedService composerHosted;
+  private final ComposerProxyService composerProxy;
+  private final ComposerGroupService composerGroup;
+  private final TerraformService terraform;
+  private SwiftService swift;
+  private AnsibleGalaxyService ansible;
+  private AnsibleGalaxyMultipartReader ansibleMultipart;
+  private CondaService conda;
+  private ConanService conan;
+  private AptService apt;
+  private AlpineService alpine;
+  private RService r;
+  private HuggingFaceService huggingFace;
+  private final NugetService nuget;
+  private final RubygemsService rubygems;
+  private final YumService yum;
+  private final RawHostedService rawHosted;
+  private final RawProxyService rawProxy;
+  private final RawGroupService rawGroup;
+  private final ObjectMapper objectMapper;
+  private final ForwardedHeaderPolicy forwardedHeaderPolicy;
+  private final MavenPathParser parser = new MavenPathParser();
+  private final NpmPathParser npmParser = new NpmPathParser();
+  private final CargoPathParser cargoParser = new CargoPathParser();
+  private final PubPathParser pubParser = new PubPathParser();
+  private final ComposerPathParser composerParser = new ComposerPathParser();
+  private final TerraformPathParser terraformParser = new TerraformPathParser();
+  private final MavenPartialFetchSupport partialFetch = new MavenPartialFetchSupport();
+  private final PypiPartialFetchSupport pypiPartialFetch = new PypiPartialFetchSupport();
+
+  @Autowired(required = false)
+  public void setSwiftService(SwiftService swift) {
+    this.swift = swift;
+  }
+
+  @Autowired(required = false)
+  public void setGoHostedService(GoHostedService goHosted) {
+    this.goHosted = goHosted;
+  }
+
+  @Autowired(required = false)
+  public void setAnsibleGalaxyService(AnsibleGalaxyService ansible) {
+    this.ansible = ansible;
+  }
+
+  @Autowired(required = false)
+  public void setAnsibleGalaxyMultipartReader(AnsibleGalaxyMultipartReader ansibleMultipart) {
+    this.ansibleMultipart = ansibleMultipart;
+  }
+
+  @Autowired(required = false)
+  public void setCondaService(CondaService conda) {
+    this.conda = conda;
+  }
+
+  @Autowired(required = false)
+  public void setConanService(ConanService conan) {
+    this.conan = conan;
+  }
+
+  @Autowired(required = false)
+  public void setAptService(AptService apt) {
+    this.apt = apt;
+  }
+
+  @Autowired(required = false)
+  public void setAlpineService(AlpineService alpine) {
+    this.alpine = alpine;
+  }
+
+  @Autowired(required = false)
+  public void setRService(RService r) {
+    this.r = r;
+  }
+
+  @Autowired(required = false)
+  public void setHuggingFaceService(HuggingFaceService huggingFace) {
+    this.huggingFace = huggingFace;
+  }
+
+  @Autowired
+  public BuiltinRepositoryProtocolHandler(
+      MavenHostedService hosted, MavenProxyService proxy, MavenGroupService group,
+      GoProxyService goProxy, GoGroupService goGroup,
+      HelmHostedService helmHosted, HelmProxyService helmProxy,
+      MavenHtmlListingService htmlListing,
+      NpmHostedService npmHosted, NpmProxyService npmProxy, NpmGroupService npmGroup,
+      NpmSearchService npmSearch, NpmTokenService npmToken,
+      PypiHostedService pypiHosted, PypiProxyService pypiProxy, PypiGroupService pypiGroup,
+      CargoHostedService cargoHosted, CargoProxyService cargoProxy, CargoGroupService cargoGroup,
+      PubHostedService pubHosted, PubProxyService pubProxy, PubGroupService pubGroup,
+      ComposerHostedService composerHosted, ComposerProxyService composerProxy,
+      ComposerGroupService composerGroup,
+      NugetService nuget,
+      RubygemsService rubygems,
+      YumService yum,
+      RawHostedService rawHosted, RawProxyService rawProxy, RawGroupService rawGroup,
+      ObjectMapper objectMapper,
+      ForwardedHeaderPolicy forwardedHeaderPolicy,
+      TerraformService terraform) {
+    this.hosted = hosted;
+    this.proxy = proxy;
+    this.group = group;
+    this.goProxy = goProxy;
+    this.goGroup = goGroup;
+    this.helmHosted = helmHosted;
+    this.helmProxy = helmProxy;
+    this.htmlListing = htmlListing;
+    this.npmHosted = npmHosted;
+    this.npmProxy = npmProxy;
+    this.npmGroup = npmGroup;
+    this.npmSearch = npmSearch;
+    this.npmToken = npmToken;
+    this.pypiHosted = pypiHosted;
+    this.pypiProxy = pypiProxy;
+    this.pypiGroup = pypiGroup;
+    this.cargoHosted = cargoHosted;
+    this.cargoProxy = cargoProxy;
+    this.cargoGroup = cargoGroup;
+    this.pubHosted = pubHosted;
+    this.pubProxy = pubProxy;
+    this.pubGroup = pubGroup;
+    this.composerHosted = composerHosted;
+    this.composerProxy = composerProxy;
+    this.composerGroup = composerGroup;
+    this.terraform = terraform;
+    this.nuget = nuget;
+    this.rubygems = rubygems;
+    this.yum = yum;
+    this.rawHosted = rawHosted;
+    this.rawProxy = rawProxy;
+    this.rawGroup = rawGroup;
+    this.objectMapper = objectMapper;
+    this.forwardedHeaderPolicy = forwardedHeaderPolicy;
+  }
+
+  /** Backward-compatible full constructor retained for focused unit tests. */
+  public BuiltinRepositoryProtocolHandler(
+      MavenHostedService hosted, MavenProxyService proxy, MavenGroupService group,
+      GoProxyService goProxy, GoGroupService goGroup,
+      HelmHostedService helmHosted, HelmProxyService helmProxy,
+      MavenHtmlListingService htmlListing,
+      NpmHostedService npmHosted, NpmProxyService npmProxy, NpmGroupService npmGroup,
+      NpmSearchService npmSearch, NpmTokenService npmToken,
+      PypiHostedService pypiHosted, PypiProxyService pypiProxy, PypiGroupService pypiGroup,
+      CargoHostedService cargoHosted, CargoProxyService cargoProxy, CargoGroupService cargoGroup,
+      PubHostedService pubHosted, PubProxyService pubProxy, PubGroupService pubGroup,
+      ComposerHostedService composerHosted, ComposerProxyService composerProxy,
+      ComposerGroupService composerGroup,
+      NugetService nuget, RubygemsService rubygems, YumService yum,
+      RawHostedService rawHosted, RawProxyService rawProxy, RawGroupService rawGroup,
+      ObjectMapper objectMapper, ForwardedHeaderPolicy forwardedHeaderPolicy) {
+    this(hosted, proxy, group, goProxy, goGroup, helmHosted, helmProxy, htmlListing,
+        npmHosted, npmProxy, npmGroup, npmSearch, npmToken, pypiHosted, pypiProxy, pypiGroup,
+        cargoHosted, cargoProxy, cargoGroup, pubHosted, pubProxy, pubGroup,
+        composerHosted, composerProxy, composerGroup, nuget, rubygems, yum,
+        rawHosted, rawProxy, rawGroup, objectMapper, forwardedHeaderPolicy, null);
+  }
+
+  /** Backward-compatible constructor used by focused controller unit tests. */
+  public BuiltinRepositoryProtocolHandler(
+      MavenHostedService hosted, MavenProxyService proxy, MavenGroupService group,
+      GoProxyService goProxy, GoGroupService goGroup,
+      HelmHostedService helmHosted, HelmProxyService helmProxy,
+      MavenHtmlListingService htmlListing,
+      NpmHostedService npmHosted, NpmProxyService npmProxy, NpmGroupService npmGroup,
+      NpmSearchService npmSearch, NpmTokenService npmToken,
+      PypiHostedService pypiHosted, PypiProxyService pypiProxy, PypiGroupService pypiGroup,
+      CargoHostedService cargoHosted, CargoProxyService cargoProxy, CargoGroupService cargoGroup,
+      PubHostedService pubHosted, PubProxyService pubProxy, PubGroupService pubGroup,
+      NugetService nuget,
+      RubygemsService rubygems,
+      YumService yum,
+      RawHostedService rawHosted, RawProxyService rawProxy, RawGroupService rawGroup,
+      ObjectMapper objectMapper,
+      ForwardedHeaderPolicy forwardedHeaderPolicy) {
+    this(hosted, proxy, group, goProxy, goGroup, helmHosted, helmProxy, htmlListing,
+        npmHosted, npmProxy, npmGroup, npmSearch, npmToken,
+        pypiHosted, pypiProxy, pypiGroup,
+        cargoHosted, cargoProxy, cargoGroup,
+        pubHosted, pubProxy, pubGroup,
+        null, null, null,
+        nuget, rubygems, yum, rawHosted, rawProxy, rawGroup, objectMapper, forwardedHeaderPolicy, null);
+  }
+
+  @Override
+  public Collection<RepositoryProtocolRoute> routes() {
+    return ROUTES;
+  }
+
+  @Override
+  public ResponseEntity<?> handle(RepositoryProtocolRequest request)
+      throws IOException, ServletException {
+    return switch (request.method().name()) {
+      case "GET" -> get(request.runtime(), request.repositoryName(), request.servletRequest());
+      case "HEAD" -> head(request.runtime(), request.repositoryName(), request.servletRequest());
+      case "PUT" -> put(
+          request.runtime(), request.repositoryName(), request.servletRequest(), request.contentType());
+      case "DELETE" -> delete(
+          request.runtime(), request.repositoryName(), request.servletRequest());
+      case "POST" -> post(
+          request.runtime(), request.repositoryName(), request.servletRequest());
+      default -> throw new MavenExceptions.MethodNotAllowed(
+          "Unsupported repository HTTP method: " + request.method());
+    };
+  }
+
+  private ResponseEntity<StreamingResponseBody> get(
+      RepositoryRuntime runtime, String name, HttpServletRequest request) {
+    return serveBody(runtime, name, request, false);
+  }
+
+  private ResponseEntity<Void> head(
+      RepositoryRuntime runtime, String name, HttpServletRequest request) {
+    if (runtime.format() == RepositoryFormat.NPM) {
+      NpmPath path = npmParser.parse(extractRepositoryPath(name, request));
+      return toHeadResponse(dispatchNpmGet(runtime, path, request, true), request);
+    }
+    if (runtime.format() == RepositoryFormat.GO) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse resp = raw.isBlank()
+          ? repositoryInfo(runtime, request, "go", true)
+          : dispatchGoGet(runtime, raw, true);
+      return toHeadResponse(resp, request);
+    }
+    if (runtime.format() == RepositoryFormat.HELM) {
+      String raw = extractRepositoryPath(name, request);
+      MavenResponse resp = raw.isBlank()
+          ? helmRepositoryInfo(runtime, request, true)
+          : dispatchHelmGet(runtime, raw, true);
+      return toHeadResponse(resp, request);
+    }
+    if (runtime.format() == RepositoryFormat.CARGO) {
+      CargoPath path = cargoParser.parse(extractRepositoryPath(name, request, true));
+      MavenResponse resp = dispatchCargoGet(
+          runtime, path, repositoryBaseUrl(request, runtime.name()), cargoSearchQuery(request), true);
+      return toHeadResponse(resp, request);
+    }
+    if (runtime.format() == RepositoryFormat.PUB) {
+      PubPath path = pubParser.parse(extractRepositoryPath(name, request, true));
+      MavenResponse resp = dispatchPubGet(runtime, path, request, true);
+      return toHeadResponse(resp, request);
+    }
+    if (runtime.format() == RepositoryFormat.COMPOSER) {
+      ComposerPath path = composerRequestPath(name, request);
+      MavenResponse resp = dispatchComposerGet(runtime, path, request, true);
+      return toHeadResponse(resp, request);
+    }
+    if (runtime.format() == RepositoryFormat.TERRAFORM) {
+      TerraformPath path = terraformParser.parse(extractRepositoryPath(name, request, true));
+      return toHeadResponse(terraform.get(
+          runtime, path, repositoryBaseUrl(request, runtime.name()),
+          terraformUrlTokenSegment(request), true), request);
+    }
+    if (runtime.format() == RepositoryFormat.SWIFT) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse response = swift().get(
+          runtime,
+          raw,
+          request.getQueryString(),
+          repositoryBaseUrl(request, runtime.name()),
+          request.getHeader(HttpHeaders.ACCEPT),
+          true,
+          requestPermissionSubject(request));
+      return toHeadResponse(response, request);
+    }
+    if (runtime.format() == RepositoryFormat.ANSIBLEGALAXY) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse response = ansible().get(
+          runtime, raw, request.getQueryString(), repositoryBaseUrl(request, runtime.name()),
+          true, requestUserId(request));
+      return toHeadResponse(response, request);
+    }
+    if (runtime.format() == RepositoryFormat.CONDA) {
+      String raw = extractRepositoryPath(name, request, true);
+      return toHeadResponse(conda().get(runtime, raw, true), request);
+    }
+    if (runtime.format() == RepositoryFormat.CONAN) {
+      String raw = extractRepositoryPath(name, request, true);
+      return toHeadResponse(conan().get(
+          runtime, raw, request.getQueryString(), true, requestAuthenticatedSubject(request)),
+          request);
+    }
+    if (runtime.format() == RepositoryFormat.APT) {
+      String raw = extractRepositoryPath(name, request, true);
+      return toHeadResponse(apt().get(runtime, raw, true), request);
+    }
+    if (runtime.format() == RepositoryFormat.ALPINE) {
+      return toHeadResponse(dispatchAlpineGet(runtime, name, request, true), request);
+    }
+    if (runtime.format() == RepositoryFormat.R) {
+      return toHeadResponse(dispatchRGet(runtime, name, request, true), request);
+    }
+    if (runtime.format() == RepositoryFormat.HUGGINGFACE) {
+      return toHeadResponse(dispatchHuggingFaceGet(runtime, name, request, true), request);
+    }
+    if (runtime.format() == RepositoryFormat.PYPI) {
+      String raw = pypiRequestPath(name, request);
+      PypiResponse resp = isDirectoryPath(raw)
+          ? pypiDirectoryListing(runtime.name(), raw, true)
+          : dispatchPypiPackage(runtime, raw, true);
+      return toHeadResponse(adapt(resp), request);
+    }
+    if (runtime.format() == RepositoryFormat.NUGET) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse resp = nuget.get(runtime, raw, repositoryBaseUrl(request, runtime.name()), request, true);
+      return toHeadResponse(resp, request);
+    }
+    if (runtime.format() == RepositoryFormat.RUBYGEMS) {
+      MavenResponse resp = dispatchRubygemsGet(runtime, name, request, true);
+      return toHeadResponse(resp, request);
+    }
+    if (runtime.format() == RepositoryFormat.YUM) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse resp = yum.get(runtime, raw, true);
+      return toHeadResponse(resp, request);
+    }
+    if (isPathRepository(runtime.format())) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse resp = raw.isBlank()
+          ? repositoryInfo(runtime, request, runtime.format().id(), true)
+          : dispatchRawGet(runtime, raw, true);
+      return toHeadResponse(resp, request);
+    }
+    DirectoryRequest dir = detectDirectory(name, request);
+    if (dir != null) {
+      MavenResponse resp = dir.needsRedirect()
+          ? badRepositoryPath(true)
+          : mavenRepositoryInfo(runtime, request, true);
+      return toHeadResponse(resp, request);
+    }
+    RuntimeAndPath rp = resolve(runtime, name, request);
+    MavenResponse resp = dispatchGet(rp, true);
+    return toHeadResponse(resp, request);
+  }
+
+  private ResponseEntity<?> put(
+      RepositoryRuntime runtime,
+      String name,
+      HttpServletRequest request,
+      String contentType)
+      throws IOException, ServletException {
+    String userId = requestUserId(request);
+    if (runtime.format() == RepositoryFormat.NPM) {
+      String rawPath = extractRepositoryPath(name, request);
+      if (NpmTokenService.isLoginPath(rawPath)) {
+        try (InputStream body = request.getInputStream()) {
+          return toStreamingResponse(npmToken.login(body));
+        }
+      }
+      NpmPath path = npmParser.parse(rawPath);
+      MavenResponse resp;
+      try (InputStream body = request.getInputStream()) {
+        resp = switch (path.kind()) {
+          case PACKAGE_ROOT -> npmHosted.putPackage(runtime, path.packageId(), path.revision(),
+              body, userId, request.getRemoteAddr());
+          case DIST_TAG -> npmHosted.putDistTag(runtime, path.packageId(), path.tag(),
+              body, userId, request.getRemoteAddr());
+          default -> throw new NpmExceptions.MethodNotAllowed("Unsupported npm PUT path: " + path.rawPath());
+        };
+      }
+      return toStreamingResponse(resp);
+    }
+    if (runtime.format() == RepositoryFormat.GO) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse response;
+      try (InputStream body = request.getInputStream()) {
+        goHosted().publish(runtime, raw, body, userId, request.getRemoteAddr());
+        response = MavenResponse.created();
+      }
+      return ResponseEntity.status(response.status()).build();
+    }
+    if (runtime.format() == RepositoryFormat.HELM) {
+      String raw = extractRepositoryPath(name, request);
+      MavenResponse resp;
+      try (InputStream body = request.getInputStream()) {
+        resp = helmHosted.put(runtime, raw, body, contentType,
+            userId, request.getRemoteAddr());
+      }
+      return ResponseEntity.status(resp.status()).build();
+    }
+    if (runtime.format() == RepositoryFormat.CARGO) {
+      CargoPath path = cargoParser.parse(extractRepositoryPath(name, request, true));
+      MavenResponse resp;
+      if (path.kind() == CargoPath.Kind.PUBLISH) {
+        try (InputStream body = request.getInputStream()) {
+          resp = cargoHosted.publish(runtime, body, userId, request.getRemoteAddr());
+        }
+      } else if (path.kind() == CargoPath.Kind.UNYANK) {
+        resp = cargoHosted.yank(runtime, path.crateName(), path.version(), false);
+      } else {
+        throw new CargoExceptions.MethodNotAllowed("Unsupported Cargo PUT path: " + path.rawPath());
+      }
+      return toByteArrayResponse(resp);
+    }
+    if (runtime.format() == RepositoryFormat.TERRAFORM) {
+      TerraformPath path = terraformParser.parse(extractRepositoryPath(name, request, true));
+      MavenResponse resp;
+      try (InputStream body = request.getInputStream()) {
+        resp = terraform.put(runtime, path, body, contentType,
+            request.getHeader(HttpHeaders.CONTENT_DISPOSITION),
+            request.getHeader(TerraformService.PROVIDER_PROTOCOLS_HEADER),
+            userId, request.getRemoteAddr());
+      }
+      return ResponseEntity.status(resp.status()).build();
+    }
+    if (runtime.format() == RepositoryFormat.ANSIBLEGALAXY) {
+      String raw = extractRepositoryPath(name, request, true);
+      if (request.getQueryString() != null && !request.getQueryString().isBlank()) {
+        throw new AnsibleGalaxyExceptions.BadRequest(
+            "Query parameters are not valid for Galaxy artifact upload");
+      }
+      MavenResponse response;
+      try (InputStream body = request.getInputStream()) {
+        response = ansible().putArtifact(
+            runtime, raw, body, userId, request.getRemoteAddr());
+      }
+      return ResponseEntity.status(response.status()).build();
+    }
+    if (runtime.format() == RepositoryFormat.CONDA) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse response;
+      try (InputStream body = request.getInputStream()) {
+        response = conda().put(
+            runtime, raw, body, contentType, userId, request.getRemoteAddr());
+      }
+      return ResponseEntity.status(response.status()).build();
+    }
+    if (runtime.format() == RepositoryFormat.CONAN) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse response;
+      try (InputStream body = request.getInputStream()) {
+        response = conan().put(
+            runtime,
+            raw,
+            body,
+            request.getContentLengthLong(),
+            contentType,
+            request.getHeader("X-Checksum-Sha1"),
+            request.getHeader("X-Checksum-Deploy") != null,
+            requestAuthenticatedSubject(request),
+            request.getRemoteAddr());
+      }
+      return ResponseEntity.status(response.status()).build();
+    }
+    if (runtime.format() == RepositoryFormat.APT) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse response;
+      try (InputStream body = request.getInputStream()) {
+        response = apt().put(runtime, raw, body, contentType, userId, request.getRemoteAddr());
+      }
+      return ResponseEntity.status(response.status())
+          .header(HttpHeaders.LOCATION, response.headers().get(HttpHeaders.LOCATION))
+          .build();
+    }
+    if (runtime.format() == RepositoryFormat.ALPINE) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse response;
+      try (InputStream body = request.getInputStream()) {
+        response = alpine().put(runtime, raw, body, contentType, userId, request.getRemoteAddr());
+      }
+      return ResponseEntity.status(response.status())
+          .header(HttpHeaders.LOCATION, response.headers().get(HttpHeaders.LOCATION))
+          .build();
+    }
+    if (runtime.format() == RepositoryFormat.R) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse response;
+      try (InputStream body = request.getInputStream()) {
+        response = r().put(runtime, raw, body, contentType, userId, request.getRemoteAddr());
+      }
+      return ResponseEntity.status(response.status())
+          .header(HttpHeaders.LOCATION, response.headers().get(HttpHeaders.LOCATION))
+          .build();
+    }
+    if (runtime.format() == RepositoryFormat.SWIFT) {
+      String rawPath = extractRepositoryPath(name, request, true);
+      String accept = request.getHeader(HttpHeaders.ACCEPT);
+      swift().validatePublishRequest(runtime, rawPath, request.getQueryString(), accept);
+      if (!isMultipart(contentType)) {
+        throw new SwiftExceptions.UnsupportedMediaType(
+            "Swift publish requires multipart/form-data");
+      }
+      MavenResponse response = swift().publish(
+          runtime,
+          rawPath,
+          request.getQueryString(),
+          swiftParts(request),
+          request.getHeader("X-Swift-Package-Signature-Format"),
+          repositoryBaseUrl(request, runtime.name()),
+          accept,
+          userId,
+          request.getRemoteAddr());
+      // This handler returns ResponseEntity<?> for all repository formats. Returning a
+      // StreamingResponseBody here makes Spring treat the lambda as a regular JSON object and
+      // serialize it as "{}" while preserving SwiftService's larger Content-Length. Publish
+      // responses are tiny JSON documents, so materialize them before returning.
+      return toByteArrayResponse(response);
+    }
+    if (runtime.format() == RepositoryFormat.NUGET) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse resp;
+      if (isNugetPackagePublishPath(raw) && isMultipart(contentType)) {
+        Part part = nugetPackagePart(request);
+        try (InputStream body = part.getInputStream()) {
+          resp = nuget.putPackage(runtime, NugetPaths.PACKAGE_PUBLISH, body,
+              part.getContentType(), userId, request.getRemoteAddr());
+        }
+      } else {
+        try (InputStream body = request.getInputStream()) {
+          resp = nuget.putPackage(runtime, raw, body, contentType, userId, request.getRemoteAddr());
+        }
+      }
+      return ResponseEntity.status(resp.status()).build();
+    }
+    if (runtime.format() == RepositoryFormat.RUBYGEMS) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse resp;
+      try (InputStream body = request.getInputStream()) {
+        resp = rubygems.put(runtime, raw, body, contentType, userId, request.getRemoteAddr());
+      }
+      return ResponseEntity.status(resp.status()).build();
+    }
+    if (runtime.format() == RepositoryFormat.YUM) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse resp;
+      try (InputStream body = request.getInputStream()) {
+        resp = yum.put(runtime, raw, body, contentType, userId, request.getRemoteAddr());
+      }
+      return ResponseEntity.status(resp.status()).build();
+    }
+    if (isPathRepository(runtime.format())) {
+      String raw = extractRepositoryPath(name, request);
+      MavenResponse resp;
+      try (InputStream body = request.getInputStream()) {
+        resp = rawHosted.put(runtime, raw, body, contentType,
+            userId, request.getRemoteAddr());
+      }
+      return ResponseEntity.status(resp.status()).build();
+    }
+    if (runtime.format() != RepositoryFormat.MAVEN2) {
+      throw new MavenExceptions.MethodNotAllowed("PUT is not supported for " + runtime.format() + " repositories");
+    }
+    RuntimeAndPath rp = resolve(runtime, name, request);
+    MavenResponse resp;
+    try (InputStream body = request.getInputStream()) {
+      resp = hosted.put(rp.runtime(), rp.path(), body, contentType,
+          userId, request.getRemoteAddr());
+    }
+    return ResponseEntity.status(resp.status()).build();
+  }
+
+  private ResponseEntity<?> delete(
+      RepositoryRuntime runtime, String name, HttpServletRequest request) throws IOException {
+    if (runtime.format() == RepositoryFormat.NPM) {
+      String rawPath = extractRepositoryPath(name, request);
+      if (NpmTokenService.isLogoutPath(rawPath)) {
+        return toStreamingResponse(npmToken.logout(request));
+      }
+      NpmPath path = npmParser.parse(rawPath);
+      String userId = requestUserId(request);
+      MavenResponse resp = switch (path.kind()) {
+        case PACKAGE_ROOT -> npmHosted.deletePackage(runtime, path.packageId(), path.revision());
+        case TARBALL -> npmHosted.deleteTarball(runtime, path.packageId(), path.tarballName(), path.revision());
+        case DIST_TAG -> npmHosted.deleteDistTag(runtime, path.packageId(), path.tag(), userId, request.getRemoteAddr());
+        default -> throw new NpmExceptions.MethodNotAllowed("Unsupported npm DELETE path: " + path.rawPath());
+      };
+      return toStreamingResponse(resp);
+    }
+    if (runtime.format() == RepositoryFormat.HELM) {
+      String raw = extractRepositoryPath(name, request);
+      MavenResponse resp = helmHosted.delete(runtime, raw);
+      return ResponseEntity.status(resp.status()).build();
+    }
+    if (runtime.format() == RepositoryFormat.CARGO) {
+      CargoPath path = cargoParser.parse(extractRepositoryPath(name, request, true));
+      if (path.kind() != CargoPath.Kind.YANK) {
+        throw new CargoExceptions.MethodNotAllowed("Unsupported Cargo DELETE path: " + path.rawPath());
+      }
+      MavenResponse resp = cargoHosted.yank(runtime, path.crateName(), path.version(), true);
+      return toByteArrayResponse(resp);
+    }
+    if (runtime.format() == RepositoryFormat.TERRAFORM) {
+      throw new MavenExceptions.MethodNotAllowed("Terraform client repository paths do not support DELETE");
+    }
+    if (runtime.format() == RepositoryFormat.SWIFT) {
+      throw new SwiftExceptions.MethodNotAllowed(
+          "Swift client repository paths do not support DELETE");
+    }
+    if (runtime.format() == RepositoryFormat.ANSIBLEGALAXY) {
+      throw new AnsibleGalaxyExceptions.MethodNotAllowed(
+          "Ansible Galaxy client repository paths do not support DELETE");
+    }
+    if (runtime.format() == RepositoryFormat.CONDA) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse response = conda().delete(runtime, raw);
+      return ResponseEntity.status(response.status()).build();
+    }
+    if (runtime.format() == RepositoryFormat.CONAN) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse response = conan().delete(runtime, raw);
+      return ResponseEntity.status(response.status()).build();
+    }
+    if (runtime.format() == RepositoryFormat.APT) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse response = apt().delete(runtime, raw, "repository-content-delete", true);
+      return ResponseEntity.status(response.status()).build();
+    }
+    if (runtime.format() == RepositoryFormat.ALPINE) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse response = alpine().delete(
+          runtime, raw, "repository-content-delete", true);
+      return ResponseEntity.status(response.status()).build();
+    }
+    if (runtime.format() == RepositoryFormat.R) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse response = r().delete(runtime, raw, "repository-content-delete", true);
+      return ResponseEntity.status(response.status()).build();
+    }
+    if (runtime.format() == RepositoryFormat.NUGET) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse resp = nuget.deletePackage(runtime, raw);
+      return ResponseEntity.status(resp.status()).build();
+    }
+    if (runtime.format() == RepositoryFormat.RUBYGEMS) {
+      String raw = withQuery(extractRepositoryPath(name, request, true), request);
+      MavenResponse resp = rubygems.delete(runtime, raw);
+      return ResponseEntity.status(resp.status()).build();
+    }
+    if (runtime.format() == RepositoryFormat.YUM) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse resp = yum.delete(runtime, raw);
+      return ResponseEntity.status(resp.status()).build();
+    }
+    if (isPathRepository(runtime.format())) {
+      String raw = extractRepositoryPath(name, request);
+      MavenResponse resp = rawHosted.delete(runtime, raw);
+      return ResponseEntity.status(resp.status()).build();
+    }
+    if (runtime.format() != RepositoryFormat.MAVEN2) {
+      throw new MavenExceptions.MethodNotAllowed("DELETE is not supported for " + runtime.format() + " repositories");
+    }
+    RuntimeAndPath rp = resolve(runtime, name, request);
+    MavenResponse resp = hosted.delete(rp.runtime(), rp.path());
+    return ResponseEntity.status(resp.status()).build();
+  }
+
+  private ResponseEntity<?> post(
+      RepositoryRuntime runtime, String name, HttpServletRequest request) {
+    if (runtime.format() == RepositoryFormat.HUGGINGFACE) {
+      String raw = extractRepositoryPath(name, request, true);
+      try (InputStream body = request.getInputStream()) {
+        byte[] bytes = body.readNBytes(1024 * 1024 + 1);
+        MavenResponse response = huggingFace().post(
+            runtime, raw, request.getQueryString(), repositoryBaseUrl(request, runtime.name()),
+            bytes, false);
+        // This catch-all POST handler returns ResponseEntity<?>. Spring would otherwise treat a
+        // StreamingResponseBody lambda as a regular object and serialize it as "{}", while
+        // retaining the cached metadata Content-Length. paths-info responses are bounded, so
+        // materialize them just like the Swift publish response below.
+        return toByteArrayResponse(response);
+      } catch (IOException error) {
+        throw new MavenExceptions.BadRequestException(
+            "Unable to read Hugging Face paths-info body", error);
+      }
+    }
+    if (runtime.format() == RepositoryFormat.PYPI) {
+      if (!runtime.isHosted()) {
+        throw new PypiExceptions.MethodNotAllowed(
+            "PyPI uploads are only valid on hosted repositories");
+      }
+      String raw = extractRepositoryPath(name, request, true);
+      if (!raw.isBlank()) {
+        throw new PypiExceptions.MethodNotAllowed(
+            "PyPI multipart upload is only valid at repository root");
+      }
+      if (!isMultipart(request.getContentType())
+          || !hasMultipartBoundary(request.getContentType())) {
+        throw new PypiExceptions.BadRequestException(
+            "PyPI upload requires multipart/form-data with a boundary");
+      }
+      Map<String, String> fields = flattenParameters(request.getParameterMap());
+      MultipartFile content = pypiMultipartFile(request, "content", true);
+      MultipartFile signature = pypiMultipartFile(request, "gpg_signature", false);
+      try {
+        PypiResponse response = pypiHosted.upload(
+            runtime,
+            fields,
+            content,
+            signature,
+            requestUserId(request),
+            request.getRemoteAddr());
+        return ResponseEntity.status(response.status()).build();
+      } catch (IOException error) {
+        throw new PypiExceptions.BadRequestException(
+            "Unable to read PyPI multipart upload: " + error.getMessage());
+      }
+    }
+    if (runtime.format() == RepositoryFormat.APT) {
+      if (!runtime.isHosted()) {
+        throw new MavenExceptions.MethodNotAllowed("APT upload is only valid on hosted repositories");
+      }
+      String raw = extractRepositoryPath(name, request, true);
+      if (!raw.isBlank()) {
+        throw new MavenExceptions.MethodNotAllowed("APT multipart upload is only valid at repository root");
+      }
+      if (!isMultipart(request.getContentType())) {
+        throw new MavenExceptions.BadRequestException("APT upload requires multipart/form-data");
+      }
+      try {
+        if (!hasMultipartBoundary(request.getContentType())) {
+          try (InputStream body = request.getInputStream()) {
+            AptService.PublishedPackage published = apt().publish(
+                runtime,
+                null,
+                body,
+                null,
+                null,
+                requestUserId(request),
+                request.getRemoteAddr());
+            return aptUploadResponse(published);
+          }
+        }
+        Part part = aptPackagePart(request);
+        Map<String, String> fields = multipartFields(request);
+        try (InputStream body = part.getInputStream()) {
+          AptService.PublishedPackage published = apt().publish(
+              runtime,
+              part.getSubmittedFileName(),
+              body,
+              firstNonBlank(fields.get("apt.distribution"), fields.get("distribution")),
+              firstNonBlank(fields.get("apt.component"), fields.get("component")),
+              requestUserId(request),
+              request.getRemoteAddr());
+          return aptUploadResponse(published);
+        }
+      } catch (IOException e) {
+        throw new MavenExceptions.BadRequestException("Unable to read APT multipart upload", e);
+      }
+    }
+    if (runtime.format() == RepositoryFormat.ALPINE) {
+      if (!runtime.isHosted()) {
+        throw new MavenExceptions.MethodNotAllowed(
+            "Alpine upload is only valid on hosted repositories");
+      }
+      String raw = extractRepositoryPath(name, request, true);
+      if (!raw.isBlank()) {
+        throw new MavenExceptions.MethodNotAllowed(
+            "Alpine multipart upload is only valid at repository root");
+      }
+      if (!isMultipart(request.getContentType())) {
+        throw new MavenExceptions.BadRequestException(
+            "Alpine upload requires multipart/form-data");
+      }
+      try {
+        Part part = alpinePackagePart(request);
+        Map<String, String> fields = multipartFields(request);
+        try (InputStream body = part.getInputStream()) {
+          AlpineService.PublishedPackage published = alpine().publish(
+              runtime,
+              firstNonBlank(fields.get("alpine.distribution"), fields.get("distribution")),
+              firstNonBlank(fields.get("alpine.channel"), fields.get("channel")),
+              firstNonBlank(
+                  fields.get("alpine.repositoryArchitecture"), fields.get("architecture")),
+              part.getSubmittedFileName(),
+              body,
+              requestUserId(request),
+              request.getRemoteAddr());
+          return alpineUploadResponse(published);
+        }
+      } catch (IOException error) {
+        throw new MavenExceptions.BadRequestException(
+            "Unable to read Alpine multipart upload", error);
+      }
+    }
+    if (runtime.format() == RepositoryFormat.ANSIBLEGALAXY) {
+      if (!runtime.isHosted()) {
+        throw new AnsibleGalaxyExceptions.NotFound(
+            "Ansible Galaxy resource was not found");
+      }
+      if (!isMultipart(request.getContentType())) {
+        throw new AnsibleGalaxyExceptions.UnsupportedMediaType(
+            "Ansible collection publish requires multipart/form-data");
+      }
+      String raw = extractRepositoryPath(name, request, true);
+      ansible().validatePublishRequest(runtime, raw, request.getQueryString());
+      try (AnsibleGalaxyMultipartReader.Upload upload = ansibleMultipart().read(request);
+           InputStream body = upload.openStream()) {
+        MavenResponse response = ansible().publish(
+            runtime,
+            raw,
+            request.getQueryString(),
+            repositoryBaseUrl(request, runtime.name()),
+            body,
+            upload.filename(),
+            upload.sha256(),
+            requestUserId(request),
+            request.getRemoteAddr(),
+            false);
+        return toByteArrayResponse(response);
+      } catch (IOException e) {
+        throw new AnsibleGalaxyExceptions.BadRequest(
+            "Unable to read Ansible collection multipart artifact", e);
+      }
+    }
+    if (runtime.format() == RepositoryFormat.SWIFT) {
+      String raw = extractRepositoryPath(name, request, true);
+      if (!"login".equals(raw) || (request.getQueryString() != null
+          && !request.getQueryString().isBlank())) {
+        throw new SwiftExceptions.MethodNotAllowed("Unsupported Swift POST path");
+      }
+      return ResponseEntity.status(swift().login(runtime).status())
+          .header("Content-Version", "1")
+          .header(HttpHeaders.CACHE_CONTROL, "no-store")
+          .build();
+    }
+    if (runtime.format() == RepositoryFormat.NPM) {
+      NpmPath path = npmParser.parse(extractRepositoryPath(name, request));
+      if (path.kind() == NpmPath.Kind.ADVISORIES_BULK) {
+        return ResponseEntity.ok()
+            .contentType(MediaType.APPLICATION_JSON)
+            .body(Map.of());
+      }
+      if (path.kind() == NpmPath.Kind.AUDIT || path.kind() == NpmPath.Kind.AUDIT_QUICK) {
+        return ResponseEntity.ok()
+            .contentType(MediaType.APPLICATION_JSON)
+            .body(emptyNpmAuditReport());
+      }
+      throw new NpmExceptions.MethodNotAllowed("Unsupported npm POST path: " + path.rawPath());
+    }
+    if (runtime.format() == RepositoryFormat.RUBYGEMS) {
+      String raw = withQuery(extractRepositoryPath(name, request, true), request);
+      String userId = requestUserId(request);
+      if (raw.startsWith("api/v1/gems/yank")) {
+        MavenResponse resp = rubygems.delete(runtime, raw);
+        return ResponseEntity.status(resp.status()).build();
+      }
+      try (InputStream body = request.getInputStream()) {
+        MavenResponse resp = rubygems.put(runtime, raw, body,
+            request.getContentType(), userId, request.getRemoteAddr());
+        return ResponseEntity.status(resp.status()).build();
+      } catch (IOException e) {
+        throw new IllegalStateException("Failed reading RubyGems request body", e);
+      }
+    }
+    if (runtime.format() != RepositoryFormat.HELM) {
+      if (runtime.format() == RepositoryFormat.PUB) {
+        PubPath path = pubParser.parse(extractRepositoryPath(name, request, true));
+        if (!runtime.isHosted()) {
+          throw new PubExceptions.PubNotFoundException(path.rawPath());
+        }
+        if (path.kind() != PubPath.Kind.PUBLISH_UPLOAD) {
+          throw new PubExceptions.MethodNotAllowed("Unsupported Pub POST path: " + path.rawPath());
+        }
+        Part part = pubFilePart(request);
+        try {
+          return toStreamingResponse(pubHosted.upload(runtime, path.sessionId(), multipartFields(request), part,
+              repositoryBaseUrl(request, runtime.name()), requestUserId(request), requestApiKeyId(request)));
+        } catch (IOException e) {
+          throw new PubExceptions.BadRequestException("Failed reading Pub multipart upload", e);
+        }
+      }
+      throw new MavenExceptions.MethodNotAllowed("POST is not supported for " + runtime.format() + " repositories");
+    }
+    throw new MavenExceptions.MethodNotAllowed("Unsupported Helm POST path: " + extractRepositoryPath(name, request));
+  }
+
+  private Map<String, Object> emptyNpmAuditReport() {
+    Map<String, Integer> severities = Map.of(
+        "info", 0,
+        "low", 0,
+        "moderate", 0,
+        "high", 0,
+        "critical", 0);
+    return Map.of(
+        "actions", List.of(),
+        "advisories", Map.of(),
+        "muted", List.of(),
+        "metadata", Map.of(
+            "vulnerabilities", severities,
+            "dependencies", 0,
+            "devDependencies", 0,
+            "optionalDependencies", 0,
+            "totalDependencies", 0));
+  }
+
+  private ResponseEntity<StreamingResponseBody> serveBody(
+      RepositoryRuntime runtime, String name, HttpServletRequest request, boolean headOnly) {
+    if (runtime.format() == RepositoryFormat.NPM) {
+      NpmPath path = npmParser.parse(extractRepositoryPath(name, request));
+      MavenResponse resp = dispatchNpmGet(runtime, path, request, headOnly);
+      return toStreamingResponse(resp, request, false);
+    }
+    if (runtime.format() == RepositoryFormat.GO) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse resp = raw.isBlank()
+          ? repositoryInfo(runtime, request, "go", headOnly)
+          : dispatchGoGet(runtime, raw, headOnly);
+      return toStreamingResponse(resp, request, false);
+    }
+    if (runtime.format() == RepositoryFormat.HELM) {
+      String raw = extractRepositoryPath(name, request);
+      MavenResponse resp = raw.isBlank()
+          ? helmRepositoryInfo(runtime, request, headOnly)
+          : dispatchHelmGet(runtime, raw, headOnly);
+      return toStreamingResponse(resp, request, false);
+    }
+    if (runtime.format() == RepositoryFormat.CARGO) {
+      CargoPath path = cargoParser.parse(extractRepositoryPath(name, request, true));
+      MavenResponse resp = dispatchCargoGet(
+          runtime, path, repositoryBaseUrl(request, runtime.name()), cargoSearchQuery(request), headOnly);
+      return toStreamingResponse(resp, request, false);
+    }
+    if (runtime.format() == RepositoryFormat.PUB) {
+      PubPath path = pubParser.parse(extractRepositoryPath(name, request, true));
+      MavenResponse resp = dispatchPubGet(runtime, path, request, headOnly);
+      return toStreamingResponse(resp, request, false);
+    }
+    if (runtime.format() == RepositoryFormat.COMPOSER) {
+      ComposerPath path = composerRequestPath(name, request);
+      MavenResponse resp = dispatchComposerGet(runtime, path, request, headOnly);
+      return toStreamingResponse(resp, request, false);
+    }
+    if (runtime.format() == RepositoryFormat.TERRAFORM) {
+      TerraformPath path = terraformParser.parse(extractRepositoryPath(name, request, true));
+      MavenResponse resp = terraform.get(
+          runtime, path, repositoryBaseUrl(request, runtime.name()),
+          terraformUrlTokenSegment(request), headOnly);
+      return toStreamingResponse(resp, request, false);
+    }
+    if (runtime.format() == RepositoryFormat.SWIFT) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse resp = swift().get(
+          runtime,
+          raw,
+          request.getQueryString(),
+          repositoryBaseUrl(request, runtime.name()),
+          request.getHeader(HttpHeaders.ACCEPT),
+          headOnly,
+          requestPermissionSubject(request));
+      boolean archiveResponse = !headOnly
+          && SwiftMediaTypes.ARCHIVE.equalsIgnoreCase(resp.contentType());
+      return toStreamingResponse(resp, request, archiveResponse);
+    }
+    if (runtime.format() == RepositoryFormat.ANSIBLEGALAXY) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse response = ansible().get(
+          runtime, raw, request.getQueryString(), repositoryBaseUrl(request, runtime.name()),
+          headOnly, requestUserId(request));
+      return toStreamingResponse(response, request, !headOnly
+          && "application/octet-stream".equalsIgnoreCase(response.contentType()));
+    }
+    if (runtime.format() == RepositoryFormat.CONDA) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse response = conda().get(runtime, raw, headOnly);
+      boolean packageResponse = !headOnly
+          && (raw.endsWith(".conda") || raw.endsWith(".tar.bz2"));
+      return toStreamingResponse(response, request, packageResponse);
+    }
+    if (runtime.format() == RepositoryFormat.CONAN) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse response = conan().get(
+          runtime,
+          raw,
+          request.getQueryString(),
+          headOnly,
+          requestAuthenticatedSubject(request));
+      boolean packageResponse = !headOnly
+          && (raw.endsWith("/conan_package.tgz")
+              || raw.endsWith("/conan_package.txz")
+              || raw.endsWith("/conan_package.tzst"));
+      return toStreamingResponse(response, request, packageResponse);
+    }
+    if (runtime.format() == RepositoryFormat.APT) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse response = apt().get(runtime, raw, headOnly);
+      return toStreamingResponse(response, request, !headOnly && raw.endsWith(".deb"));
+    }
+    if (runtime.format() == RepositoryFormat.ALPINE) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse response = dispatchAlpineGet(runtime, name, request, headOnly);
+      return toStreamingResponse(response, request, !headOnly && raw.endsWith(".apk"));
+    }
+    if (runtime.format() == RepositoryFormat.R) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse response = dispatchRGet(runtime, name, request, headOnly);
+      return toStreamingResponse(response, request, !headOnly && raw.endsWith(".tar.gz"));
+    }
+    if (runtime.format() == RepositoryFormat.HUGGINGFACE) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse response = dispatchHuggingFaceGet(runtime, name, request, headOnly);
+      boolean fileResponse = !headOnly && !raw.startsWith("api/models/")
+          && raw.contains("/resolve/");
+      return toStreamingResponse(response, request, fileResponse);
+    }
+    if (runtime.format() == RepositoryFormat.PYPI) {
+      String raw = pypiRequestPath(name, request);
+      boolean directory = isDirectoryPath(raw);
+      PypiResponse resp = directory
+          ? pypiDirectoryListing(runtime.name(), raw, headOnly)
+          : dispatchPypiPackage(runtime, raw, headOnly);
+      if (!headOnly && !directory) {
+        resp = pypiPartialFetch.apply(request, resp);
+      }
+      return toStreamingResponse(adapt(resp), request, false);
+    }
+    if (runtime.format() == RepositoryFormat.NUGET) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse resp = nuget.get(runtime, raw, repositoryBaseUrl(request, runtime.name()), request, headOnly);
+      return toStreamingResponse(resp, request, false);
+    }
+    if (runtime.format() == RepositoryFormat.RUBYGEMS) {
+      MavenResponse resp = dispatchRubygemsGet(runtime, name, request, headOnly);
+      return toStreamingResponse(resp, request, false);
+    }
+    if (runtime.format() == RepositoryFormat.YUM) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse resp = yum.get(runtime, raw, headOnly);
+      return toStreamingResponse(resp, request, false);
+    }
+    if (isPathRepository(runtime.format())) {
+      String raw = extractRepositoryPath(name, request, true);
+      MavenResponse resp = raw.isBlank()
+          ? repositoryInfo(runtime, request, runtime.format().id(), headOnly)
+          : dispatchRawGet(runtime, raw, headOnly);
+      return toStreamingResponse(resp, request, false);
+    }
+    DirectoryRequest dir = detectDirectory(name, request);
+    if (dir != null) {
+      if (dir.needsRedirect()) {
+        return toStreamingResponse(badRepositoryPath(headOnly), request, false);
+      }
+      return toStreamingResponse(mavenRepositoryInfo(runtime, request, headOnly), request, false);
+    }
+    RuntimeAndPath rp = resolve(runtime, name, request);
+    MavenResponse resp = dispatchGet(rp, headOnly);
+    return toStreamingResponse(resp, request, !headOnly && !parser.isRepositoryMetadata(rp.path()));
+  }
+
+  private ResponseEntity<Void> toHeadResponse(MavenResponse resp, HttpServletRequest request) {
+    if (ConditionalResponses.shouldReturnNotModified(
+        request, resp.status(), resp.etag(), resp.lastModified())) {
+      resp.closeBodyIfOpen();
+      return ResponseEntity.status(HttpStatus.NOT_MODIFIED).headers(notModifiedHeaders(resp)).build();
+    }
+    HttpHeaders headers = responseHeaders(resp, true);
+    return ResponseEntity.status(resp.status()).headers(headers).build();
+  }
+
+  private ResponseEntity<StreamingResponseBody> toStreamingResponse(MavenResponse resp) {
+    return toStreamingResponse(resp, null, false);
+  }
+
+  private ResponseEntity<byte[]> toByteArrayResponse(MavenResponse resp) throws IOException {
+    HttpHeaders headers = responseHeaders(resp, true);
+    InputStream responseBody = resp.body();
+    if (responseBody == null) {
+      headers.setContentLength(0);
+      return ResponseEntity.status(resp.status()).headers(headers).body(null);
+    }
+    byte[] bytes;
+    try (responseBody) {
+      bytes = responseBody.readAllBytes();
+    }
+    headers.setContentLength(bytes.length);
+    return ResponseEntity.status(resp.status()).headers(headers).body(bytes);
+  }
+
+  private ResponseEntity<StreamingResponseBody> toStreamingResponse(MavenResponse resp, HttpServletRequest request) {
+    return toStreamingResponse(resp, request, false);
+  }
+
+  private ResponseEntity<StreamingResponseBody> toStreamingResponse(
+      MavenResponse resp, HttpServletRequest request, boolean partialFetchAllowed) {
+    if (ConditionalResponses.shouldReturnNotModified(
+        request, resp.status(), resp.etag(), resp.lastModified())) {
+      resp.closeBodyIfOpen();
+      return ResponseEntity.status(HttpStatus.NOT_MODIFIED)
+          .headers(notModifiedHeaders(resp))
+          .body(null);
+    }
+    if (partialFetchAllowed) {
+      resp = partialFetch.apply(request, resp);
+    }
+    HttpHeaders headers = responseHeaders(resp, true);
+    InputStream responseBody = resp.body();
+    if (TempBlobFiles.tryUseTomcatSendfile(request, responseBody)) {
+      return ResponseEntity.status(resp.status()).headers(headers).body(null);
+    }
+    long contentLength = resp.contentLength();
+    StreamingResponseBody body = output ->
+        TempBlobFiles.copyResponse(responseBody, output, request, contentLength);
+    return ResponseEntity.status(resp.status()).headers(headers).body(body);
+  }
+
+  private HttpHeaders responseHeaders(MavenResponse resp, boolean includeEntityHeaders) {
+    HttpHeaders headers = new HttpHeaders();
+    if (includeEntityHeaders && resp.contentType() != null) {
+      try {
+        headers.setContentType(MediaType.parseMediaType(resp.contentType()));
+      } catch (RuntimeException ignored) {
+        headers.add(HttpHeaders.CONTENT_TYPE, resp.contentType());
+      }
+    }
+    if (includeEntityHeaders && resp.contentLength() > 0) {
+      headers.setContentLength(resp.contentLength());
+    }
+    ConditionalResponses.addValidators(headers, resp.etag(), resp.lastModified());
+    resp.headers().forEach(headers::add);
+    return headers;
+  }
+
+  private HttpHeaders notModifiedHeaders(MavenResponse resp) {
+    return responseHeaders(resp, false);
+  }
+
+  private MavenResponse dispatchGet(RuntimeAndPath rp, boolean headOnly) {
+    return switch (rp.runtime().type()) {
+      case HOSTED -> hosted.get(rp.runtime(), rp.path(), headOnly);
+      case PROXY -> proxy.get(rp.runtime(), rp.path(), headOnly);
+      case GROUP -> group.get(rp.runtime(), rp.path(), headOnly);
+    };
+  }
+
+  private MavenResponse dispatchHelmGet(RepositoryRuntime runtime, String rawPath, boolean headOnly) {
+    return switch (runtime.type()) {
+      case HOSTED -> helmHosted.get(runtime, rawPath, headOnly);
+      case PROXY -> helmProxy.get(runtime, rawPath, headOnly);
+      case GROUP -> throw new MavenExceptions.MavenNotFoundException(
+          "Helm group repositories are not supported: " + runtime.name());
+    };
+  }
+
+  private MavenResponse dispatchGoGet(RepositoryRuntime runtime, String rawPath, boolean headOnly) {
+    return switch (runtime.type()) {
+      case HOSTED -> goHosted().get(runtime, rawPath, headOnly);
+      case PROXY -> goProxy.get(runtime, rawPath, headOnly);
+      case GROUP -> goGroup.get(runtime, rawPath, headOnly);
+    };
+  }
+
+  private GoHostedService goHosted() {
+    if (goHosted == null) {
+      throw new IllegalStateException("Go hosted service is not available");
+    }
+    return goHosted;
+  }
+
+  private MavenResponse dispatchRubygemsGet(
+      RepositoryRuntime runtime,
+      String name,
+      HttpServletRequest request,
+      boolean headOnly) {
+    DirectoryRequest directory = detectDirectory(name, request);
+    if (directory != null && directory.path().isEmpty()) {
+      return directory.needsRedirect()
+          ? badRepositoryPath(headOnly)
+          : repositoryInfo(runtime, request, "rubygems", headOnly);
+    }
+    String raw = withQuery(extractRepositoryPath(name, request, true), request);
+    return rubygems.get(runtime, raw, headOnly);
+  }
+
+  private MavenResponse dispatchAlpineGet(
+      RepositoryRuntime runtime,
+      String name,
+      HttpServletRequest request,
+      boolean headOnly) {
+    DirectoryRequest directory = detectDirectory(name, request);
+    if (directory != null && directory.path().isEmpty()) {
+      return directory.needsRedirect()
+          ? badRepositoryPath(headOnly)
+          : repositoryInfo(runtime, request, "alpine", headOnly);
+    }
+    String raw = extractRepositoryPath(name, request, true);
+    return alpine().get(runtime, raw, headOnly);
+  }
+
+  private MavenResponse dispatchRGet(
+      RepositoryRuntime runtime,
+      String name,
+      HttpServletRequest request,
+      boolean headOnly) {
+    DirectoryRequest directory = detectDirectory(name, request);
+    if (directory != null && directory.path().isEmpty()) {
+      return directory.needsRedirect()
+          ? badRepositoryPath(headOnly)
+          : repositoryInfo(runtime, request, "r", headOnly);
+    }
+    return r().get(runtime, extractRepositoryPath(name, request, true), headOnly);
+  }
+
+  private MavenResponse dispatchHuggingFaceGet(
+      RepositoryRuntime runtime,
+      String name,
+      HttpServletRequest request,
+      boolean headOnly) {
+    DirectoryRequest directory = detectDirectory(name, request);
+    if (directory != null && directory.path().isEmpty()) {
+      return directory.needsRedirect()
+          ? badRepositoryPath(headOnly)
+          : repositoryInfo(runtime, request, "huggingface", headOnly);
+    }
+    String raw = extractRepositoryPath(name, request, true);
+    return huggingFace().get(
+        runtime,
+        raw,
+        request.getQueryString(),
+        repositoryBaseUrl(request, runtime.name()),
+        headOnly);
+  }
+
+  private MavenResponse dispatchRawGet(RepositoryRuntime runtime, String rawPath, boolean headOnly) {
+    return switch (runtime.type()) {
+      case HOSTED -> rawHosted.get(runtime, rawPath, headOnly);
+      case PROXY -> rawProxy.get(runtime, rawPath, headOnly);
+      case GROUP -> rawGroup.get(runtime, rawPath, headOnly);
+    };
+  }
+
+  private MavenResponse dispatchCargoGet(
+      RepositoryRuntime runtime,
+      CargoPath path,
+      String baseUrl,
+      CargoSearchQuery search,
+      boolean headOnly) {
+    return switch (runtime.type()) {
+      case HOSTED -> cargoHosted.get(runtime, path, baseUrl, search, headOnly);
+      case PROXY -> cargoProxy.get(runtime, path, baseUrl, search, headOnly);
+      case GROUP -> cargoGroup.get(runtime, path, baseUrl, search, headOnly);
+    };
+  }
+
+  private MavenResponse dispatchPubGet(
+      RepositoryRuntime runtime,
+      PubPath path,
+      HttpServletRequest request,
+      boolean headOnly) {
+    String baseUrl = repositoryBaseUrl(request, runtime.name());
+    return switch (runtime.type()) {
+      case HOSTED -> {
+        if (path.kind() == PubPath.Kind.PUBLISH_INIT) {
+          yield pubHosted.initPublish(runtime, baseUrl, requestUserId(request), requestApiKeyId(request), headOnly);
+        }
+        if (path.kind() == PubPath.Kind.PUBLISH_FINALIZE) {
+          yield pubHosted.finalizeUpload(runtime, path.sessionId(), requestUserId(request),
+              requestApiKeyId(request), request.getHeader(HttpHeaders.USER_AGENT), headOnly);
+        }
+        yield pubHosted.get(runtime, path, baseUrl, headOnly);
+      }
+      case PROXY -> pubProxy.get(runtime, path, baseUrl, headOnly);
+      case GROUP -> pubGroup.get(runtime, path, baseUrl, headOnly);
+    };
+  }
+
+  private MavenResponse dispatchComposerGet(
+      RepositoryRuntime runtime,
+      ComposerPath path,
+      HttpServletRequest request,
+      boolean headOnly) {
+    String baseUrl = repositoryBaseUrl(request, runtime.name());
+    String filter = request.getParameter("filter");
+    return switch (runtime.type()) {
+      case HOSTED -> composerHosted.get(runtime, path, baseUrl, filter, headOnly);
+      case PROXY -> composerProxy.get(runtime, path, baseUrl, filter, headOnly);
+      case GROUP -> composerGroup.get(runtime, path, baseUrl, filter, headOnly);
+    };
+  }
+
+  private PypiResponse dispatchPypiPackage(RepositoryRuntime runtime, String path, boolean headOnly) {
+    return switch (runtime.type()) {
+      case HOSTED -> pypiHosted.getPackage(runtime, path, headOnly);
+      case PROXY -> pypiProxy.getPackage(runtime, path, headOnly);
+      case GROUP -> pypiGroup.getPackage(runtime, path, headOnly);
+    };
+  }
+
+  private PypiResponse pypiDirectoryListing(String repository, String path, boolean headOnly) {
+    String listingPath = trimTrailingSlashes(path);
+    String html = htmlListing.render(repository, listingPath)
+        .orElseThrow(() -> new PypiExceptions.PypiNotFoundException(path));
+    byte[] bytes = html.getBytes(StandardCharsets.UTF_8);
+    if (headOnly) {
+      return PypiResponse.noBody(200, bytes.length, MediaType.TEXT_HTML_VALUE, null, null);
+    }
+    return PypiResponse.ok(new ByteArrayInputStream(bytes), bytes.length,
+        MediaType.TEXT_HTML_VALUE, null, null);
+  }
+
+  private MavenResponse adapt(PypiResponse response) {
+    MavenResponse converted = response.hasBody()
+        ? MavenResponse.ok(response::body, response.contentLength(), response.contentType(),
+            response.etag(), response.lastModified())
+        : MavenResponse.noBody(response.status(), response.contentLength(), response.contentType(),
+            response.etag(), response.lastModified());
+    response.headers().forEach(converted::withHeader);
+    return converted.withStatus(response.status());
+  }
+
+  private RuntimeAndPath resolve(RepositoryRuntime runtime, String name, HttpServletRequest request) {
+    if (runtime.format() != RepositoryFormat.MAVEN2) {
+      throw new MavenExceptions.MavenNotFoundException("Repository is not Maven format: " + name);
+    }
+    String raw = extractMavenPath(name, request);
+    MavenPath path = parser.parsePath(raw);
+    return new RuntimeAndPath(runtime, path);
+  }
+
+  private SwiftService swift() {
+    if (swift == null) {
+      throw new IllegalStateException("Swift repository service is unavailable");
+    }
+    return swift;
+  }
+
+  private AnsibleGalaxyService ansible() {
+    if (ansible == null) {
+      throw new IllegalStateException("Ansible Galaxy repository service is unavailable");
+    }
+    return ansible;
+  }
+
+  private AnsibleGalaxyMultipartReader ansibleMultipart() {
+    if (ansibleMultipart == null) {
+      throw new IllegalStateException("Ansible Galaxy multipart reader is unavailable");
+    }
+    return ansibleMultipart;
+  }
+
+  private CondaService conda() {
+    if (conda == null) {
+      throw new IllegalStateException("Conda repository service is unavailable");
+    }
+    return conda;
+  }
+
+  private ConanService conan() {
+    if (conan == null) {
+      throw new IllegalStateException("Conan repository service is unavailable");
+    }
+    return conan;
+  }
+
+  private AptService apt() {
+    if (apt == null) {
+      throw new IllegalStateException("APT repository service is unavailable");
+    }
+    return apt;
+  }
+
+  private AlpineService alpine() {
+    if (alpine == null) {
+      throw new IllegalStateException("Alpine repository service is unavailable");
+    }
+    return alpine;
+  }
+
+  private RService r() {
+    if (r == null) {
+      throw new IllegalStateException("R repository service is unavailable");
+    }
+    return r;
+  }
+
+  private HuggingFaceService huggingFace() {
+    if (huggingFace == null) {
+      throw new IllegalStateException("Hugging Face repository service is unavailable");
+    }
+    return huggingFace;
+  }
+
+  private MavenResponse dispatchNpmGet(
+      RepositoryRuntime runtime,
+      NpmPath path,
+      HttpServletRequest request,
+      boolean headOnly) {
+    return switch (path.kind()) {
+      case REPOSITORY_ROOT -> npmRepositoryRoot(runtime, request, headOnly);
+      case PING -> npmJson(Map.of(), headOnly);
+      case WHOAMI -> npmWhoami(request, headOnly);
+      case SEARCH_V1 -> npmJson(npmSearch.search(runtime, request.getParameter("text"),
+          parsePositiveInt(request.getParameter("size"), 20),
+          repositoryBaseUrl(request, runtime.name())), headOnly);
+      case SEARCH_INDEX -> npmJson(npmSearch.legacyIndex(runtime), headOnly);
+      case PACKAGE_ROOT, PACKAGE_VERSION, TARBALL, DIST_TAGS -> switch (runtime.type()) {
+        case HOSTED -> npmHosted.get(runtime, path, repositoryBaseUrl(request, runtime.name()), headOnly,
+            npmPackumentVariant(request));
+        case PROXY -> npmProxy.get(runtime, path, repositoryBaseUrl(request, runtime.name()), headOnly,
+            npmPackumentVariant(request));
+        case GROUP -> npmGroup.get(runtime, path, repositoryBaseUrl(request, runtime.name()), headOnly,
+            npmPackumentVariant(request));
+      };
+      default -> throw new NpmExceptions.NpmNotFoundException(path.rawPath());
+    };
+  }
+
+  private NpmPackumentVariant npmPackumentVariant(HttpServletRequest request) {
+    return NpmPackumentVariant.fromAccept(request.getHeader(HttpHeaders.ACCEPT));
+  }
+
+  private MavenResponse mavenRepositoryInfo(
+      RepositoryRuntime runtime,
+      HttpServletRequest request,
+      boolean headOnly) {
+    return repositoryInfo(runtime, request, "maven2", headOnly);
+  }
+
+  private MavenResponse npmWhoami(HttpServletRequest request, boolean headOnly) {
+    return npmJson(Map.of("username", requestUserId(request)), headOnly);
+  }
+
+  private String requestUserId(HttpServletRequest request) {
+    Object subject = request.getAttribute(AuthenticatedSubject.REQUEST_ATTRIBUTE);
+    if (subject instanceof AuthenticatedSubject authenticated
+        && authenticated.userId() != null
+        && !authenticated.userId().isBlank()) {
+      return authenticated.userId();
+    }
+    return "anonymous";
+  }
+
+  private AuthenticatedSubject requestAuthenticatedSubject(HttpServletRequest request) {
+    Object subject = request.getAttribute(AuthenticatedSubject.REQUEST_ATTRIBUTE);
+    return subject instanceof AuthenticatedSubject authenticated ? authenticated : null;
+  }
+
+  private Long requestApiKeyId(HttpServletRequest request) {
+    Object subject = request.getAttribute(AuthenticatedSubject.REQUEST_ATTRIBUTE);
+    if (subject instanceof AuthenticatedSubject authenticated) {
+      return authenticated.apiKeyId();
+    }
+    return null;
+  }
+
+  private PermissionSubject requestPermissionSubject(HttpServletRequest request) {
+    Object subject = request.getAttribute(AuthenticatedSubject.REQUEST_ATTRIBUTE);
+    return subject instanceof AuthenticatedSubject authenticated
+        ? authenticated.permissionSubject()
+        : null;
+  }
+
+  private MavenResponse npmRepositoryRoot(
+      RepositoryRuntime runtime,
+      HttpServletRequest request,
+      boolean headOnly) {
+    return repositoryInfo(runtime, request, "npm", headOnly);
+  }
+
+  private MavenResponse helmRepositoryInfo(
+      RepositoryRuntime runtime,
+      HttpServletRequest request,
+      boolean headOnly) {
+    return repositoryInfo(runtime, request, "helm", headOnly);
+  }
+
+  private MavenResponse rawRepositoryInfo(
+      RepositoryRuntime runtime,
+      HttpServletRequest request,
+      boolean headOnly) {
+    return repositoryInfo(runtime, request, "raw", headOnly);
+  }
+
+  private static boolean isPathRepository(RepositoryFormat format) {
+    return format == RepositoryFormat.RAW;
+  }
+
+  private MavenResponse repositoryInfo(
+      RepositoryRuntime runtime,
+      HttpServletRequest request,
+      String formatLabel,
+      boolean headOnly) {
+    String type = runtime.type().name().toLowerCase(Locale.ROOT);
+    String body = """
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+          <title>Repository - Nexus Repository Manager</title>
+          <meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
+        </head>
+        <body>
+        <div class="nexus-body">
+          <div class="content-header">
+            <span class="title">Repository</span>
+            <span class="description">%s</span>
+          </div>
+          <div class="content-body">
+            <div class="content-section">
+              <p>This %s %s repository is not directly browseable at this URL.</p>
+              <p>Please use the <a href="%s/browse/#browse/browse:%s">browse</a>
+              or <a href="%s/service/rest/repository/browse/%s/">HTML index</a>
+              views to inspect the contents of this repository.</p>
+            </div>
+          </div>
+        </div>
+        </body>
+        </html>
+        """.formatted(
+        escapeHtml(runtime.name()),
+        escapeHtml(formatLabel),
+        escapeHtml(type),
+        escapeHtml(request.getContextPath().isBlank() ? "" : request.getContextPath()),
+        escapeHtml(runtime.name()),
+        escapeHtml(serverBaseUrl(request)),
+        escapeHtml(runtime.name()));
+    byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+    if (headOnly) {
+      return MavenResponse.noBody(200, bytes.length, MediaType.TEXT_HTML_VALUE, null, null);
+    }
+    return MavenResponse.ok(new ByteArrayInputStream(bytes), bytes.length, MediaType.TEXT_HTML_VALUE, null, null);
+  }
+
+  private MavenResponse badRepositoryPath(boolean headOnly) {
+    String body = """
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+          <title>400 - Nexus Repository Manager</title>
+          <meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
+        </head>
+        <body>
+        <div class="nexus-body">
+          <div class="content-header">
+            <span class="title">Error 400</span>
+            <span class="description">Bad Request</span>
+          </div>
+          <div class="content-body">
+            <div class="content-section">
+              Repository path must have another '/' after initial '/'
+            </div>
+          </div>
+        </div>
+        </body>
+        </html>
+        """;
+    byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+    if (headOnly) {
+      return MavenResponse.noBody(400, bytes.length, MediaType.TEXT_HTML_VALUE, null, null);
+    }
+    return MavenResponse.ok(new ByteArrayInputStream(bytes), bytes.length, MediaType.TEXT_HTML_VALUE, null, null)
+        .withStatus(400);
+  }
+
+  private MavenResponse npmJson(Object value, boolean headOnly) {
+    byte[] bytes;
+    try {
+      bytes = objectMapper.writeValueAsBytes(value);
+    } catch (IOException e) {
+      throw new IllegalStateException("Failed to serialize npm JSON", e);
+    }
+    if (headOnly) {
+      return MavenResponse.noBody(200, bytes.length, "application/json", null, null);
+    }
+    return MavenResponse.ok(new ByteArrayInputStream(bytes), bytes.length, "application/json", null, null);
+  }
+
+  private String extractMavenPath(String name, HttpServletRequest request) {
+    String uri = request.getRequestURI();
+    String prefix = "/repository/" + name + "/";
+    int idx = uri.indexOf(prefix);
+    if (idx < 0) {
+      throw new MavenExceptions.MavenNotFoundException("Bad maven URL: " + uri);
+    }
+    String rest = uri.substring(idx + prefix.length());
+    if (rest.isEmpty()) {
+      throw new MavenExceptions.MavenNotFoundException("Missing path");
+    }
+    return rest;
+  }
+
+  private String extractRepositoryPath(String name, HttpServletRequest request, boolean allowEmpty) {
+    Object normalized = request.getAttribute(RepositorySecurityFilter.NORMALIZED_REPOSITORY_PATH_ATTRIBUTE);
+    if (normalized instanceof String path) return path;
+    String uri = request.getRequestURI();
+    String root = request.getContextPath() + "/repository/" + name;
+    if (uri.equals(root)) {
+      if (allowEmpty) return "";
+      throw new MavenExceptions.MavenNotFoundException("Missing path");
+    }
+    String prefix = root + "/";
+    if (!uri.startsWith(prefix)) {
+      throw new MavenExceptions.MavenNotFoundException("Bad repository URL: " + uri);
+    }
+    String rest = uri.substring(prefix.length());
+    if (rest.isEmpty() && !allowEmpty) {
+      throw new MavenExceptions.MavenNotFoundException("Missing path");
+    }
+    return rest;
+  }
+
+  private String extractRepositoryPath(String name, HttpServletRequest request) {
+    Object normalized = request.getAttribute(RepositorySecurityFilter.NORMALIZED_REPOSITORY_PATH_ATTRIBUTE);
+    if (normalized instanceof String path) return path;
+    String uri = request.getRequestURI();
+    String base = request.getContextPath() + "/repository/" + name;
+    if (uri.equals(base)) {
+      return "";
+    }
+    String prefix = base + "/";
+    int idx = uri.indexOf(prefix);
+    if (idx < 0) {
+      throw new NpmExceptions.NpmNotFoundException("Bad npm URL: " + uri);
+    }
+    return uri.substring(idx + prefix.length());
+  }
+
+  private ComposerPath composerRequestPath(String name, HttpServletRequest request) {
+    String path = extractRepositoryPath(name, request, true);
+    return hasNormalizedRepositoryPath(request)
+        ? composerParser.parseCanonical(path)
+        : composerParser.parse(path);
+  }
+
+  private String pypiRequestPath(String name, HttpServletRequest request) {
+    String path = extractRepositoryPath(name, request, true);
+    return hasNormalizedRepositoryPath(request) ? path : PypiRequestPath.decode(path);
+  }
+
+  private static boolean hasNormalizedRepositoryPath(HttpServletRequest request) {
+    return request.getAttribute(RepositorySecurityFilter.NORMALIZED_REPOSITORY_PATH_ATTRIBUTE)
+        instanceof String;
+  }
+
+  private static String withQuery(String path, HttpServletRequest request) {
+    String query = request.getQueryString();
+    return query == null || query.isBlank() ? path : path + "?" + query;
+  }
+
+  private String repositoryBaseUrl(HttpServletRequest request, String name) {
+    return serverBaseUrl(request) + request.getContextPath() + "/repository/" + name;
+  }
+
+  private static String terraformUrlTokenSegment(HttpServletRequest request) {
+    Object value = request.getAttribute(RepositorySecurityFilter.TERRAFORM_URL_TOKEN_SEGMENT_ATTRIBUTE);
+    return value instanceof String token && !token.isBlank() ? token : null;
+  }
+
+  private String serverBaseUrl(HttpServletRequest request) {
+    return forwardedHeaderPolicy.serverBaseUrl(request);
+  }
+
+  private static int parsePositiveInt(String raw, int fallback) {
+    if (raw == null || raw.isBlank()) return fallback;
+    try {
+      return Math.max(1, Integer.parseInt(raw));
+    } catch (NumberFormatException e) {
+      return fallback;
+    }
+  }
+
+  private static CargoSearchQuery cargoSearchQuery(HttpServletRequest request) {
+    int perPage = Math.min(
+        parsePositiveInt(request.getParameter("per_page"), CargoSearchQuery.DEFAULT_PER_PAGE),
+        CargoSearchQuery.MAX_PER_PAGE);
+    int page = parsePositiveInt(request.getParameter("page"), 1);
+    return new CargoSearchQuery(request.getParameter("q"), perPage, page);
+  }
+
+  private static String escapeHtml(String s) {
+    if (s == null) return "";
+    return s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\"", "&quot;");
+  }
+
+  private record RuntimeAndPath(RepositoryRuntime runtime, MavenPath path) {}
+
+  private static boolean isMultipart(String contentType) {
+    return contentType != null
+        && contentType.toLowerCase(Locale.ROOT).startsWith(MediaType.MULTIPART_FORM_DATA_VALUE);
+  }
+
+  private static Collection<Part> swiftParts(HttpServletRequest request) {
+    try {
+      return request.getParts();
+    } catch (IllegalStateException e) {
+      throw new SwiftExceptions.ContentTooLarge(
+          "Swift publish multipart body exceeds the configured limit");
+    } catch (ServletException | IOException e) {
+      throw new SwiftExceptions.BadRequest("Unable to parse Swift publish multipart body", e);
+    }
+  }
+
+  private static boolean isNugetPackagePublishPath(String rawPath) {
+    String path = rawPath == null ? "" : rawPath.trim().replaceAll("/+", "/");
+    while (path.startsWith("/")) path = path.substring(1);
+    while (path.endsWith("/")) path = path.substring(0, path.length() - 1);
+    return path.isEmpty() || NugetPaths.PACKAGE_PUBLISH.equals(path);
+  }
+
+  private static boolean isDirectoryPath(String path) {
+    return path != null && path.endsWith("/");
+  }
+
+  private static String trimTrailingSlashes(String path) {
+    String result = path == null ? "" : path;
+    while (result.endsWith("/")) {
+      result = result.substring(0, result.length() - 1);
+    }
+    return result;
+  }
+
+  private static Part nugetPackagePart(HttpServletRequest request) throws IOException {
+    try {
+      Part firstFile = null;
+      for (Part part : request.getParts()) {
+        if (part == null || part.getSize() <= 0) {
+          continue;
+        }
+        boolean namedPackage = "package".equals(part.getName());
+        boolean hasFilename = part.getSubmittedFileName() != null
+            && !part.getSubmittedFileName().isBlank();
+        if (namedPackage) {
+          return part;
+        }
+        if (firstFile == null && hasFilename) {
+          firstFile = part;
+        }
+      }
+      if (firstFile != null) {
+        return firstFile;
+      }
+      throw new MavenExceptions.LayoutPolicyViolation("NuGet multipart upload requires a package file part");
+    } catch (ServletException e) {
+      throw new MavenExceptions.LayoutPolicyViolation("Invalid NuGet multipart upload");
+    }
+  }
+
+  private static Part pubFilePart(HttpServletRequest request) {
+    try {
+      Part firstFile = null;
+      for (Part part : request.getParts()) {
+        if (part == null || part.getSize() <= 0) {
+          continue;
+        }
+        boolean namedFile = "file".equals(part.getName());
+        boolean hasFilename = part.getSubmittedFileName() != null
+            && !part.getSubmittedFileName().isBlank();
+        if (namedFile) {
+          return part;
+        }
+        if (firstFile == null && hasFilename) {
+          firstFile = part;
+        }
+      }
+      if (firstFile != null) {
+        return firstFile;
+      }
+      throw new PubExceptions.BadRequestException("Pub multipart upload requires a file part");
+    } catch (IOException | ServletException e) {
+      throw new PubExceptions.BadRequestException("Invalid Pub multipart upload", e);
+    }
+  }
+
+  private static Part aptPackagePart(HttpServletRequest request) {
+    try {
+      Part firstFile = null;
+      for (Part part : request.getParts()) {
+        if (part == null || part.getSize() <= 0) continue;
+        boolean namedPackage = "apt.asset".equals(part.getName())
+            || "asset".equals(part.getName()) || "file".equals(part.getName());
+        boolean hasFilename = part.getSubmittedFileName() != null
+            && !part.getSubmittedFileName().isBlank();
+        if (namedPackage && hasFilename) return part;
+        if (firstFile == null && hasFilename) firstFile = part;
+      }
+      if (firstFile != null) return firstFile;
+      throw new MavenExceptions.BadRequestException(
+          "APT multipart upload requires a .deb file part");
+    } catch (IOException | ServletException error) {
+      throw new MavenExceptions.BadRequestException("Invalid APT multipart upload", error);
+    }
+  }
+
+  private static Part alpinePackagePart(HttpServletRequest request) {
+    try {
+      Part firstFile = null;
+      for (Part part : request.getParts()) {
+        if (part == null || part.getSize() <= 0) continue;
+        boolean namedPackage = "alpine.asset".equals(part.getName())
+            || "asset".equals(part.getName()) || "file".equals(part.getName());
+        boolean hasFilename = part.getSubmittedFileName() != null
+            && !part.getSubmittedFileName().isBlank();
+        if (namedPackage && hasFilename) return part;
+        if (firstFile == null && hasFilename) firstFile = part;
+      }
+      if (firstFile != null) return firstFile;
+      throw new MavenExceptions.BadRequestException(
+          "Alpine multipart upload requires an .apk file part");
+    } catch (IOException | ServletException error) {
+      throw new MavenExceptions.BadRequestException("Invalid Alpine multipart upload", error);
+    }
+  }
+
+  private static Map<String, String> flattenParameters(Map<String, String[]> values) {
+    Map<String, String> result = new java.util.LinkedHashMap<>();
+    values.forEach((key, list) -> {
+      if (list == null || list.length == 0) return;
+      result.put(key, String.join("\n", list));
+    });
+    return result;
+  }
+
+  private static MultipartFile pypiMultipartFile(
+      HttpServletRequest request, String name, boolean required) {
+    try {
+      for (Part part : request.getParts()) {
+        if (name.equals(part.getName())) return new PartMultipartFile(part);
+      }
+    } catch (IOException | ServletException error) {
+      throw new PypiExceptions.BadRequestException(
+          "Invalid PyPI multipart upload: " + error.getMessage());
+    }
+    if (required) {
+      throw new PypiExceptions.BadRequestException(
+          "PyPI upload requires multipart file field '" + name + "'");
+    }
+    return null;
+  }
+
+  private record PartMultipartFile(Part part) implements MultipartFile {
+    @Override
+    public String getName() {
+      return part.getName();
+    }
+
+    @Override
+    public String getOriginalFilename() {
+      return part.getSubmittedFileName();
+    }
+
+    @Override
+    public String getContentType() {
+      return part.getContentType();
+    }
+
+    @Override
+    public boolean isEmpty() {
+      return part.getSize() == 0;
+    }
+
+    @Override
+    public long getSize() {
+      return part.getSize();
+    }
+
+    @Override
+    public byte[] getBytes() throws IOException {
+      try (InputStream input = part.getInputStream()) {
+        return input.readAllBytes();
+      }
+    }
+
+    @Override
+    public InputStream getInputStream() throws IOException {
+      return part.getInputStream();
+    }
+
+    @Override
+    public void transferTo(File destination) throws IOException {
+      try (InputStream input = part.getInputStream()) {
+        Files.copy(input, destination.toPath(), StandardCopyOption.REPLACE_EXISTING);
+      }
+    }
+  }
+
+  private static boolean hasMultipartBoundary(String contentType) {
+    return contentType != null
+        && contentType.toLowerCase(Locale.ROOT).contains("boundary=");
+  }
+
+  private static ResponseEntity<?> aptUploadResponse(AptService.PublishedPackage published) {
+    return ResponseEntity.status(201)
+        .header(HttpHeaders.LOCATION, published.path())
+        .body(Map.of(
+            "path", published.path(),
+            "name", published.packageName(),
+            "version", published.version(),
+            "architecture", published.architecture(),
+            "sha256", published.sha256(),
+            "size", published.size()));
+  }
+
+  private static ResponseEntity<?> alpineUploadResponse(
+      AlpineService.PublishedPackage published) {
+    return ResponseEntity.status(201)
+        .header(HttpHeaders.LOCATION, published.path())
+        .body(Map.of(
+            "path", published.path(),
+            "name", published.packageName(),
+            "version", published.version(),
+            "architecture", published.architecture(),
+            "identity", published.identity(),
+            "sha256", published.sha256(),
+            "size", published.size()));
+  }
+
+  private static String firstNonBlank(String first, String second) {
+    if (first != null && !first.isBlank()) return first;
+    return second == null || second.isBlank() ? null : second;
+  }
+
+  private static Map<String, String> multipartFields(HttpServletRequest request) {
+    Map<String, String> fields = new java.util.LinkedHashMap<>();
+    try {
+      for (Part part : request.getParts()) {
+        if (part == null || part.getSubmittedFileName() != null) {
+          continue;
+        }
+        try (InputStream in = part.getInputStream()) {
+          fields.put(part.getName(), new String(in.readAllBytes(), StandardCharsets.UTF_8));
+        }
+      }
+      return fields;
+    } catch (IOException | ServletException e) {
+      throw new PubExceptions.BadRequestException("Invalid Pub multipart fields", e);
+    }
+  }
+
+  /**
+   * Detects {@code /repository/{name}} (needsRedirect=true) and {@code /repository/{name}/[path/]}
+   * (directory). Returns null for file requests.
+   */
+  private DirectoryRequest detectDirectory(String name, HttpServletRequest request) {
+    String uri = request.getRequestURI();
+    String prefix = request.getContextPath() + "/repository/" + name;
+    if (uri.equals(prefix)) {
+      return new DirectoryRequest("", true);
+    }
+    String prefixSlash = prefix + "/";
+    if (!uri.startsWith(prefixSlash)) {
+      return null;
+    }
+    String rest = uri.substring(prefixSlash.length());
+    if (rest.isEmpty()) {
+      return new DirectoryRequest("", false);
+    }
+    if (rest.endsWith("/")) {
+      return new DirectoryRequest(rest.substring(0, rest.length() - 1), false);
+    }
+    return null;
+  }
+
+  private record DirectoryRequest(String path, boolean needsRedirect) {}
+
+}

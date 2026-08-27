@@ -2,8 +2,8 @@ package com.github.klboke.kkrepo.server.maven;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.github.benmanes.caffeine.cache.Cache;
-import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.klboke.kkrepo.cache.LocalCache;
+import com.github.klboke.kkrepo.cache.LocalCacheFactory;
 import com.github.klboke.kkrepo.cache.SharedCache;
 import com.github.klboke.kkrepo.core.RepositoryFormat;
 import com.github.klboke.kkrepo.core.RepositoryType;
@@ -13,6 +13,7 @@ import com.github.klboke.kkrepo.server.catalog.CatalogCacheBroadcaster;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -56,9 +57,9 @@ public class RepositoryRuntimeRegistry {
   private final SharedCache cache;
   private final ObjectMapper objectMapper;
   private final CatalogCacheBroadcaster broadcaster;
-  private final Cache<String, Optional<RepositoryRuntime>> localRuntimes;
-  private final Cache<String, Optional<RepositoryRecord>> localRecordsByName;
-  private final Cache<Long, RepositoryRecord> localRecordsById;
+  private final LocalCache<String, Optional<RepositoryRuntime>> localRuntimes;
+  private final LocalCache<String, Optional<RepositoryRecord>> localRecordsByName;
+  private final LocalCache<Long, RepositoryRecord> localRecordsById;
   private final AtomicBoolean subscribed = new AtomicBoolean();
   private final AtomicLong configurationVersion = new AtomicLong();
 
@@ -85,15 +86,18 @@ public class RepositoryRuntimeRegistry {
     this.broadcaster = broadcaster;
     this.ttl = Duration.ofSeconds(Math.max(0, ttlSeconds));
     Duration localTtl = this.ttl.isZero() ? Duration.ofSeconds(1) : this.ttl;
-    this.localRuntimes = Caffeine.newBuilder()
+    this.localRuntimes = LocalCacheFactory.standard()
+        .<String, Optional<RepositoryRuntime>>builder("repository-runtimes")
         .expireAfterWrite(localTtl)
         .maximumSize(100_000)
         .build();
-    this.localRecordsByName = Caffeine.newBuilder()
+    this.localRecordsByName = LocalCacheFactory.standard()
+        .<String, Optional<RepositoryRecord>>builder("repository-records-by-name")
         .expireAfterWrite(localTtl)
         .maximumSize(100_000)
         .build();
-    this.localRecordsById = Caffeine.newBuilder()
+    this.localRecordsById = LocalCacheFactory.standard()
+        .<Long, RepositoryRecord>builder("repository-records-by-id")
         .expireAfterWrite(localTtl)
         .maximumSize(100_000)
         .build();
@@ -106,15 +110,18 @@ public class RepositoryRuntimeRegistry {
     this.broadcaster = null;
     this.ttl = Duration.ofSeconds(Math.max(0, ttlSeconds));
     Duration localTtl = this.ttl.isZero() ? Duration.ofSeconds(1) : this.ttl;
-    this.localRuntimes = Caffeine.newBuilder()
+    this.localRuntimes = LocalCacheFactory.standard()
+        .<String, Optional<RepositoryRuntime>>builder("repository-runtimes")
         .expireAfterWrite(localTtl)
         .maximumSize(100_000)
         .build();
-    this.localRecordsByName = Caffeine.newBuilder()
+    this.localRecordsByName = LocalCacheFactory.standard()
+        .<String, Optional<RepositoryRecord>>builder("repository-records-by-name")
         .expireAfterWrite(localTtl)
         .maximumSize(100_000)
         .build();
-    this.localRecordsById = Caffeine.newBuilder()
+    this.localRecordsById = LocalCacheFactory.standard()
+        .<Long, RepositoryRecord>builder("repository-records-by-id")
         .expireAfterWrite(localTtl)
         .maximumSize(100_000)
         .build();
@@ -321,6 +328,7 @@ public class RepositoryRuntimeRegistry {
     String proxyRemoteUsername = null;
     String proxyRemotePassword = null;
     String proxyRemoteBearerToken = null;
+    Set<String> allowedRedirectHosts = Set.of();
     com.github.klboke.kkrepo.server.proxy.OutboundProxyConfig outboundProxy = null;
     if (proxyRaw instanceof Map<?, ?> proxyMap) {
       contentMaxAge = asInt(proxyMap.get("contentMaxAgeMinutes"));
@@ -339,6 +347,7 @@ public class RepositoryRuntimeRegistry {
       if (bearerToken != null && !bearerToken.toString().isBlank()) {
         proxyRemoteBearerToken = bearerToken.toString();
       }
+      allowedRedirectHosts = asStringSet(proxyMap.get("allowedRedirectHosts"));
       outboundProxy = readOutboundProxy(proxyMap);
     }
     String rawContentDisposition = null;
@@ -408,7 +417,8 @@ public class RepositoryRuntimeRegistry {
         cargoRequireAuthentication,
         members,
         outboundProxy,
-        minimumReleaseAge);
+        minimumReleaseAge,
+        allowedRedirectHosts);
   }
 
   private static com.github.klboke.kkrepo.server.proxy.OutboundProxyConfig readOutboundProxy(Map<?, ?> proxyMap) {
@@ -429,6 +439,15 @@ public class RepositoryRuntimeRegistry {
     if (value == null) return null;
     if (value instanceof Boolean b) return b;
     return Boolean.parseBoolean(value.toString());
+  }
+
+  private static Set<String> asStringSet(Object value) {
+    if (!(value instanceof Iterable<?> values)) return Set.of();
+    LinkedHashSet<String> result = new LinkedHashSet<>();
+    for (Object item : values) {
+      if (item != null && !item.toString().isBlank()) result.add(item.toString());
+    }
+    return Set.copyOf(result);
   }
 
   private static boolean containsProxySecret(RepositoryRuntime runtime) {

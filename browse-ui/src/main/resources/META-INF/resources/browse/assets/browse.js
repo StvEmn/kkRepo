@@ -22,6 +22,8 @@ let uploadSpecsCache = new Map();
 let uploadAssetCount = 1;
 let repositorySort = { key: "name", direction: "asc" };
 let activeSearchFormat = "maven2";
+let activeCustomSearchFormat = "maven2";
+let activeCustomSearchFormatOption = null;
 let currentSession = null;
 let currentPermissions = [];
 let adminBootstrapStatus = null;
@@ -32,11 +34,15 @@ let latestGeneratedApiToken = "";
 const APP_HASH_PREFIX = "browse";
 const BROWSE_HASH = `${APP_HASH_PREFIX}/browse`;
 const DEFAULT_SEARCH_FORMAT = "maven2";
+const ALL_SEARCH_FORMAT = "all";
+const CUSTOM_SEARCH_FORMAT = "custom";
 const COMPONENT_SEARCH_LIMIT = 20;
 const AUTH_SNAPSHOT_KEY = "nexusPlus.authSnapshot";
 const AUTH_SNAPSHOT_MAX_AGE_MS = 10 * 60 * 1000;
 let pendingLoginReturnTo = readPendingLoginReturnTo();
 const SEARCH_ROUTE_FORMAT = {
+  all: "all",
+  custom: "custom",
   cargo: "cargo",
   go: "go",
   helm: "helm",
@@ -50,12 +56,19 @@ const SEARCH_ROUTE_FORMAT = {
   conda: "conda",
   conan: "conan",
   apt: "apt",
+  alpine: "alpine",
+  r: "r",
+  huggingface: "huggingface",
   pypi: "pypi",
   rubygems: "rubygems",
   yum: "yum",
   npm: "npm",
+  docker: "docker",
+  raw: "raw",
 };
 const FORMAT_ROUTE_SEGMENT = {
+  all: "all",
+  custom: "custom",
   cargo: "cargo",
   go: "go",
   helm: "helm",
@@ -69,10 +82,41 @@ const FORMAT_ROUTE_SEGMENT = {
   conda: "conda",
   conan: "conan",
   apt: "apt",
+  alpine: "alpine",
+  r: "r",
+  huggingface: "huggingface",
   pypi: "pypi",
   rubygems: "rubygems",
   yum: "yum",
   npm: "npm",
+  docker: "docker",
+  raw: "raw",
+};
+const SEARCH_FORMAT_LABEL = {
+  all: "All components",
+  custom: "Custom search",
+  cargo: "Cargo",
+  go: "Go",
+  helm: "Helm",
+  maven2: "Maven",
+  nuget: "NuGet",
+  pub: "Pub",
+  composer: "Composer",
+  terraform: "Terraform",
+  swift: "Swift",
+  ansiblegalaxy: "Ansible Galaxy",
+  conda: "Conda",
+  conan: "Conan 2",
+  apt: "APT / Debian",
+  alpine: "Alpine / APK",
+  r: "R / CRAN",
+  huggingface: "Hugging Face Models",
+  pypi: "PyPI",
+  rubygems: "RubyGems",
+  yum: "Yum",
+  npm: "npm",
+  docker: "Docker / OCI",
+  raw: "Raw",
 };
 
 function installCsrfFetch() {
@@ -118,9 +162,36 @@ function normalizeSearchFormat(format) {
   return SEARCH_ROUTE_FORMAT[format] || DEFAULT_SEARCH_FORMAT;
 }
 
-function searchHash(format) {
+function normalizeCustomSearchFormat(format) {
+  const normalized = SEARCH_ROUTE_FORMAT[format];
+  if (!normalized || normalized === ALL_SEARCH_FORMAT || normalized === CUSTOM_SEARCH_FORMAT) {
+    return DEFAULT_SEARCH_FORMAT;
+  }
+  return normalized;
+}
+
+function searchFormatLabel(format) {
+  return SEARCH_FORMAT_LABEL[normalizeSearchFormat(format)];
+}
+
+function searchPageTitle(format) {
   const normalized = normalizeSearchFormat(format);
-  return `#${APP_HASH_PREFIX}/search/${FORMAT_ROUTE_SEGMENT[normalized]}`;
+  if (normalized === ALL_SEARCH_FORMAT) return "Search all components";
+  if (normalized === CUSTOM_SEARCH_FORMAT) return "Custom search";
+  return `Search ${searchFormatLabel(normalized)}`;
+}
+
+function searchHash(format, keyword = "", customFormat = DEFAULT_SEARCH_FORMAT) {
+  const normalized = normalizeSearchFormat(format);
+  const base = `#${APP_HASH_PREFIX}/search/${FORMAT_ROUTE_SEGMENT[normalized]}`;
+  const params = new URLSearchParams();
+  if (normalized === CUSTOM_SEARCH_FORMAT) {
+    params.set("format", normalizeCustomSearchFormat(customFormat));
+  }
+  const q = String(keyword || "").trim();
+  if (q) params.set("q", q);
+  const query = params.toString();
+  return query ? `${base}?${query}` : base;
 }
 
 function repositoryBrowseHash(repoName, path = "") {
@@ -176,6 +247,12 @@ function componentBrowsePath(component) {
   if (format === "apt") {
     return [group, name, version].filter(Boolean).join("/");
   }
+  if (format === "alpine") {
+    return [group, name, version].filter(Boolean).join("/");
+  }
+  if (format === "huggingface") {
+    return [group, name, version].filter(Boolean).join("/");
+  }
   return "";
 }
 
@@ -186,10 +263,28 @@ function parseBrowseHash() {
   if (hash === `${APP_HASH_PREFIX}/welcome`) return { view: "welcome" };
   if (hash === `${APP_HASH_PREFIX}/upload`) return { view: "upload" };
   if (hash === `${APP_HASH_PREFIX}/my-token`) return { view: "my-token" };
-  if (hash === `${APP_HASH_PREFIX}/search`) return { view: "search", searchFormat: DEFAULT_SEARCH_FORMAT };
+  if (hash === `${APP_HASH_PREFIX}/search`) {
+    return { view: "search", searchFormat: DEFAULT_SEARCH_FORMAT, keyword: "" };
+  }
   if (hash.startsWith(`${APP_HASH_PREFIX}/search/`)) {
-    const rawFormat = hash.slice(`${APP_HASH_PREFIX}/search/`.length);
-    return { view: "search", searchFormat: normalizeSearchFormat(rawFormat) };
+    const routeValue = hash.slice(`${APP_HASH_PREFIX}/search/`.length);
+    const separator = routeValue.indexOf("?");
+    const rawFormat = separator === -1 ? routeValue : routeValue.slice(0, separator);
+    const query = separator === -1 ? "" : routeValue.slice(separator + 1);
+    const params = new URLSearchParams(query);
+    let searchFormat = normalizeSearchFormat(rawFormat);
+    // Before Custom search gained a format selector, this route represented all formats.
+    if (searchFormat === CUSTOM_SEARCH_FORMAT && !params.has("format")) {
+      searchFormat = ALL_SEARCH_FORMAT;
+    }
+    return {
+      view: "search",
+      searchFormat,
+      customSearchFormat: searchFormat === CUSTOM_SEARCH_FORMAT
+        ? normalizeCustomSearchFormat(params.get("format"))
+        : undefined,
+      keyword: params.get("q") || "",
+    };
   }
   const prefix = `${BROWSE_HASH}:`;
   if (!hash.startsWith(prefix)) return null;
@@ -260,6 +355,12 @@ function sessionIdentity(session) {
 
 function displaySource(source) {
   return source == null ? "" : String(source);
+}
+
+function accountSourceLabel(source) {
+  const value = displaySource(source).trim();
+  if (!value) return "Authenticated account";
+  return `${value.charAt(0).toUpperCase()}${value.slice(1)} account`;
 }
 
 function readAuthSnapshot() {
@@ -490,7 +591,10 @@ function updateTopbarAuth() {
   const adminLink = document.getElementById("admin-workspace-link");
   const loginButton = document.getElementById("login-button");
   const userMenu = document.getElementById("user-menu");
+  const userMenuTrigger = document.getElementById("user-menu-trigger");
   const currentUser = document.getElementById("current-user");
+  const userMenuName = document.getElementById("user-menu-name");
+  const userMenuSource = document.getElementById("user-menu-source");
   const uploadNav = document.getElementById("upload-nav");
 
   const signedIn = Boolean(currentSession && currentSession.userId);
@@ -501,8 +605,16 @@ function updateTopbarAuth() {
   userMenu.hidden = !signedIn;
   if (!signedIn) closeUserMenu();
   if (signedIn) {
-    const source = currentSession.source ? `${displaySource(currentSession.source)}/` : "";
-    currentUser.textContent = `${source}${currentSession.userId}`;
+    const userId = String(currentSession.userId);
+    const source = displaySource(currentSession.source).trim();
+    const sourceLabel = accountSourceLabel(source);
+    const qualifiedUser = source ? `${source}/${userId}` : userId;
+
+    currentUser.textContent = userId;
+    userMenuName.textContent = userId;
+    userMenuSource.textContent = sourceLabel;
+    userMenuTrigger.title = `Account menu for ${qualifiedUser}`;
+    userMenuTrigger.setAttribute("aria-label", `Account menu for ${qualifiedUser}`);
   }
 
   const uploadVisible = canUseUpload();
@@ -632,12 +744,21 @@ async function fetchChildren(repo, path) {
   return data.entries;
 }
 
-async function fetchSearchComponents(format, keyword) {
+function componentSearchParams(format, keyword, customFormat = DEFAULT_SEARCH_FORMAT) {
   const params = new URLSearchParams();
   const q = (keyword || "").trim();
   if (q) params.set("q", q);
-  params.set("format", normalizeSearchFormat(format));
+  const normalizedFormat = normalizeSearchFormat(format);
+  const effectiveFormat = normalizedFormat === CUSTOM_SEARCH_FORMAT
+    ? normalizeCustomSearchFormat(customFormat)
+    : normalizedFormat;
+  if (effectiveFormat !== ALL_SEARCH_FORMAT) params.set("format", effectiveFormat);
   params.set("limit", String(COMPONENT_SEARCH_LIMIT));
+  return params;
+}
+
+async function fetchSearchComponents(format, keyword, customFormat = DEFAULT_SEARCH_FORMAT) {
+  const params = componentSearchParams(format, keyword, customFormat);
   const res = await fetch(`/internal/search/components?${params.toString()}`, {
     headers: { Accept: "application/json" },
     cache: "no-store",
@@ -669,6 +790,9 @@ const FORMAT_ICON_NAMES = Object.freeze({
   conda: "conda",
   conan: "conan",
   apt: "apt",
+  alpine: "alpine",
+  r: "r",
+  huggingface: "huggingface",
   go: "go",
   helm: "helm",
   docker: "docker",
@@ -710,6 +834,14 @@ const FILE_ICON_RULES = Object.freeze([
     suffixes: Object.freeze([".mod", ".sum", ".list", ".yaml", ".yml"]),
   }),
   Object.freeze({
+    icon: "layers",
+    suffixes: Object.freeze([".safetensors"]),
+  }),
+  Object.freeze({
+    icon: "binary",
+    suffixes: Object.freeze([".bin"]),
+  }),
+  Object.freeze({
     icon: "file-box",
     suffixes: Object.freeze([".whl", ".egg", ".nupkg", ".snupkg", ".crate", ".gem", ".rpm"]),
   }),
@@ -730,6 +862,8 @@ const FILE_ICON_RULES = Object.freeze([
 function fileIconName(name, repositoryFormat = "") {
   const normalized = String(name || "").toLowerCase();
   const format = String(repositoryFormat || "").toLowerCase();
+  if (format === "alpine" && normalized.endsWith(".apk")) return "file-apk";
+  if (format === "r" && normalized.endsWith(".tar.gz")) return "file-archive";
   if (format === "cargo" && normalized && !normalized.includes(".")) return "file-json";
   if (format === "go" && normalized === "list") return "file-text";
   if (format === "go" && normalized === "@latest") return "file-json";
@@ -1129,17 +1263,28 @@ async function copyGeneratedToken() {
   setTimeout(() => { button.textContent = "Copy"; }, 1200);
 }
 
-function activateSearch(format = DEFAULT_SEARCH_FORMAT, syncHash = true) {
+function activateSearch(
+    format = DEFAULT_SEARCH_FORMAT,
+    syncHash = true,
+    customFormat = activeCustomSearchFormat) {
   const normalized = normalizeSearchFormat(format);
-  if (syncHash) pushBrowseRoute(searchHash(normalized));
+  activeCustomSearchFormat = normalizeCustomSearchFormat(customFormat);
+  if (syncHash) pushBrowseRoute(searchHash(normalized, "", activeCustomSearchFormat));
   setSearchSubnavOpen(true);
   switchView("search");
-  selectSearchFormat(normalized);
+  selectSearchFormat(normalized, activeCustomSearchFormat);
   return normalized;
 }
 
-function showSearch(format = DEFAULT_SEARCH_FORMAT, syncHash = true) {
-  renderSearch(activateSearch(format, syncHash));
+function showSearch(
+    format = DEFAULT_SEARCH_FORMAT,
+    syncHash = true,
+    keyword = null,
+    customFormat = activeCustomSearchFormat) {
+  if (keyword !== null) document.getElementById("component-keyword").value = keyword;
+  renderSearch(
+      activateSearch(format, syncHash, customFormat),
+      activeCustomSearchFormat);
 }
 
 function openSearchResult(component) {
@@ -1458,6 +1603,18 @@ function pathSelectorValue(path) {
   return String(path).replaceAll("\\", "\\\\").replaceAll('"', '\\"');
 }
 
+function centerTreeRow(row) {
+  const tree = row?.closest?.(".tree-left");
+  if (!tree) return;
+  const treeRect = tree.getBoundingClientRect();
+  const rowRect = row.getBoundingClientRect();
+  const target = tree.scrollTop
+    + rowRect.top + (rowRect.height / 2)
+    - treeRect.top - (tree.clientHeight / 2);
+  const maxScrollTop = Math.max(0, tree.scrollHeight - tree.clientHeight);
+  tree.scrollTop = Math.min(maxScrollTop, Math.max(0, target));
+}
+
 async function selectInitialTreePath() {
   if (!state.path) return;
   await revealTreePath(state.path);
@@ -1465,7 +1622,7 @@ async function selectInitialTreePath() {
   const row = node?.querySelector(":scope > .tree-row");
   if (!row) return;
   selectRow(row);
-  row.scrollIntoView({ block: "center" });
+  centerTreeRow(row);
   const entry = treeNodeEntries.get(node) || findCachedTreeEntry(state.path);
   if (!entry) return;
   if (entry.leaf) await showAssetDetail(entry);
@@ -1608,6 +1765,9 @@ function renderAttributesSection(detail, opts = {}) {
     renderAttributeGroup("Pub", detail.pub),
     renderAttributeGroup("Composer", detail.composer),
     renderAttributeGroup("Conda", detail.conda),
+    renderAttributeGroup("Alpine", detail.alpine),
+    renderAttributeGroup("R / CRAN", detail.r),
+    renderAttributeGroup("Hugging Face", detail.huggingface),
     renderAttributeGroup("Swift", detail.swift),
     renderAttributeGroup("Ansible Galaxy", detail.ansible),
     renderAttributeGroup("Provenance", detail.provenance),
@@ -2776,6 +2936,139 @@ function aptUsageDetail(entry, detail = null) {
   return { crumbText: entry.path, summaryRows, snippets };
 }
 
+function alpineUsageDetail(entry, detail = null) {
+  const metadata = detail?.alpine || {};
+  const repo = currentRepository();
+  const settings = repo?.alpine || {};
+  const distribution = metadata.distribution || settings.distributions?.[0] || "v3.23";
+  const channel = metadata.channel || settings.channels?.[0] || "main";
+  const repositoryArchitecture = metadata.repository_architecture
+    || settings.architectures?.[0] || "x86_64";
+  const packageName = metadata.package || "<package>";
+  const version = metadata.version || "";
+  const repositoryUrl = `${repositoryBaseUrl().replace(/\/+$/, "")}/${distribution}/${channel}`;
+  const keyFilename = settings.keyFilename || `${state.repo}.rsa.pub`;
+  const summaryRows = [
+    ["Repository", state.repo],
+    ["Format", "alpine"],
+    ["Distribution", distribution],
+    ["Channel", channel],
+    ["Repository architecture", repositoryArchitecture],
+    ["Package", packageName],
+    ["Version", version || "-"],
+    ["Package architecture", metadata.package_architecture || "-"],
+  ];
+  if (metadata.identity) summaryRows.push(["APK identity", metadata.identity]);
+  if (metadata.sha256) summaryRows.push(["SHA-256", metadata.sha256]);
+  const snippets = [
+    usageSnippet(
+      "Trust key",
+      `sudo cp '/path/to/${keyFilename}' '/etc/apk/keys/${keyFilename}'`,
+      "An administrator can export the scoped public key from the repository settings",
+    ),
+    usageSnippet(
+      "repositories",
+      `echo '${repositoryUrl}' | sudo tee -a /etc/apk/repositories`,
+      "For private repositories, use an apk-compatible Basic/token credential source; do not commit credentials in URLs",
+    ),
+    usageSnippet("Update", "sudo apk update"),
+    usageSnippet(
+      "Install",
+      `sudo apk add '${packageName}${version ? `=${version}` : ""}'`,
+    ),
+    usageSnippet(
+      "Fetch",
+      `apk fetch --repository '${repositoryUrl}' '${packageName}${version ? `=${version}` : ""}'`,
+    ),
+  ];
+  if (repo?.type === "hosted") {
+    snippets.push(usageSnippet(
+      "Publish",
+      `curl --fail --user '<username>:<token>' -F 'alpine.distribution=${distribution}' -F 'alpine.channel=${channel}' -F 'alpine.repositoryArchitecture=${repositoryArchitecture}' -F 'alpine.asset=@package.apk' '${window.location.origin}/service/rest/v1/components?repository=${encodeURIComponent(state.repo)}'`,
+      "The server validates APK v2 members, .PKGINFO, filename, architecture, datahash, and package identity",
+    ));
+  }
+  return { crumbText: entry.path, summaryRows, snippets };
+}
+
+function rUsageDetail(entry, detail = null) {
+  const metadata = detail?.r || {};
+  const repo = currentRepository();
+  const repositoryUrl = repositoryBaseUrl().replace(/\/+$/, "");
+  const packageName = metadata.package || entry.name || "<package>";
+  const version = metadata.version || entry.version || "";
+  const summaryRows = [
+    ["Repository", state.repo],
+    ["Format", "r"],
+    ["Namespace", "src/contrib"],
+    ["Package", packageName],
+    ["Version", version || "-"],
+  ];
+  if (metadata.license) summaryRows.push(["License", metadata.license]);
+  if (metadata.md5) summaryRows.push(["MD5", metadata.md5]);
+  if (metadata.sha256) summaryRows.push(["SHA-256", metadata.sha256]);
+  const snippets = [
+    usageSnippet(
+      ".Rprofile",
+      `options(repos = c(KKRepo = '${repositoryUrl}'))`,
+      "Use a credential helper or netrc for private repositories; do not commit tokens in URLs",
+    ),
+    usageSnippet(
+      "Available packages",
+      `available.packages(repos = '${repositoryUrl}', type = 'source')`,
+    ),
+    usageSnippet(
+      "Install",
+      `install.packages('${packageName}', repos = '${repositoryUrl}', type = 'source')`,
+    ),
+  ];
+  if (String(repo?.type || "").toLowerCase() === "hosted") {
+    snippets.push(usageSnippet(
+      "Publish",
+      `curl --fail --user '<username>:<token>' -F 'r.asset=@${packageName}_${version || "1.0.0"}.tar.gz' '${window.location.origin}/service/rest/v1/components?repository=${encodeURIComponent(state.repo)}'`,
+      "The server validates DESCRIPTION and archive limits without executing package code",
+    ));
+  }
+  return { crumbText: entry.path, summaryRows, snippets };
+}
+
+function huggingFaceUsageDetail(entry, detail = null) {
+  const metadata = detail?.huggingface || {};
+  const parts = pathSegments(entry.path);
+  const commitIndex = parts.findIndex((part) => /^[0-9a-f]{40,64}$/i.test(part));
+  const repoId = metadata.repoId || (commitIndex > 0 ? parts.slice(0, commitIndex).join("/") : "<namespace>/<model>");
+  const commit = metadata.commit || (commitIndex >= 0 ? parts[commitIndex] : "<commit>");
+  const filePath = metadata.filePath || (commitIndex >= 0 ? parts.slice(commitIndex + 1).join("/") : entry.name || "<file>");
+  const endpoint = repositoryBaseUrl().replace(/\/+$/, "");
+  const summaryRows = [
+    ["Repository", state.repo],
+    ["Format", "huggingface"],
+    ["Model", repoId],
+    ["Commit", commit],
+    ["File", filePath],
+    ["File kind", metadata.fileKind || "-"],
+    ["Cache state", metadata.cacheState || "READY"],
+  ];
+  if (metadata.lfsSha256) summaryRows.push(["LFS SHA-256", metadata.lfsSha256]);
+  if (metadata.gitOid) summaryRows.push(["Git OID", metadata.gitOid]);
+  const snippets = [
+    usageSnippet(
+      "Environment",
+      `export HF_ENDPOINT='${endpoint}'`,
+      "All Hub API and file traffic stays behind the repository permission boundary",
+    ),
+    usageSnippet(
+      "Python file download",
+      `python -c \"from huggingface_hub import hf_hub_download; print(hf_hub_download('${repoId}', '${filePath}', revision='${commit}'))\"`,
+    ),
+    usageSnippet(
+      "Snapshot download",
+      `hf download '${repoId}' --revision '${commit}'`,
+    ),
+  ];
+  return { crumbText: entry.path, summaryRows, snippets };
+}
+
 async function usageDetailForEntry(entry, detail = null) {
   const repo = currentRepository();
   if (!repo) return null;
@@ -2793,6 +3086,9 @@ async function usageDetailForEntry(entry, detail = null) {
   if (repo.format === "conda") return condaUsageDetail(entry, detail);
   if (repo.format === "conan") return conanUsageDetail(entry);
   if (repo.format === "apt") return aptUsageDetail(entry, detail);
+  if (repo.format === "alpine") return alpineUsageDetail(entry, detail);
+  if (repo.format === "r") return rUsageDetail(entry, detail);
+  if (repo.format === "huggingface") return huggingFaceUsageDetail(entry, detail);
   if (repo.format === "docker") return dockerUsageDetail(entry);
   return null;
 }
@@ -2908,6 +3204,10 @@ function uploadableRepositories(repos) {
 function selectedUploadRepository() {
   const name = document.getElementById("upload-repository").value;
   return uploadRepositoriesCache.find((repo) => repo.name === name) || null;
+}
+
+function selectedUploadSpec(repo = selectedUploadRepository()) {
+  return repo ? uploadSpecsCache.get(repo.format) || null : null;
 }
 
 function renderUploadFields() {
@@ -3147,6 +3447,47 @@ function renderUploadFields() {
     `;
     return;
   }
+  if (repo.format === "alpine") {
+    const settings = repo.alpine || {};
+    fields.innerHTML = `
+      <label>
+        <span>Distribution</span>
+        <input id="upload-alpine-distribution" type="text" value="${escapeHtml(settings.distributions?.[0] || "v3.23")}" required>
+      </label>
+      <label>
+        <span>Channel</span>
+        <input id="upload-alpine-channel" type="text" value="${escapeHtml(settings.channels?.[0] || "main")}" required>
+      </label>
+      <label>
+        <span>Repository architecture</span>
+        <input id="upload-alpine-architecture" type="text" value="${escapeHtml(settings.architectures?.[0] || "x86_64")}" required>
+      </label>
+      <label class="upload-file">
+        <span>APK v2 package</span>
+        <input id="upload-file" type="file" accept=".apk,application/vnd.alpine.apk" required>
+      </label>
+      <div class="muted-row full-width">The server safely inspects concatenated gzip/tar members and validates <code>.PKGINFO</code>, datahash, filename, architecture, checksums, and resource limits before publishing a signed index snapshot.</div>
+      <label class="upload-path">
+        <span>Package path</span>
+        <input id="upload-path" type="text" value="Package filename is read from the selected APK" readonly>
+      </label>
+    `;
+    return;
+  }
+  if (repo.format === "r") {
+    fields.innerHTML = `
+      <label class="upload-file">
+        <span>R source package</span>
+        <input id="upload-file" type="file" accept=".tar.gz,application/gzip,application/x-gzip" required>
+      </label>
+      <div class="muted-row full-width">Upload the canonical <code>Package_Version.tar.gz</code> produced by <code>R CMD build</code>. The server validates the archive and <code>DESCRIPTION</code> without executing package code, then atomically publishes <code>PACKAGES.gz</code>.</div>
+      <label class="upload-path">
+        <span>Package path</span>
+        <input id="upload-path" type="text" value="src/contrib/Package_Version.tar.gz" readonly>
+      </label>
+    `;
+    return;
+  }
   if (repo.format === "ansiblegalaxy") {
     fields.innerHTML = `
       <label class="upload-file">
@@ -3161,16 +3502,134 @@ function renderUploadFields() {
     `;
     return;
   }
-  fields.innerHTML = `
-    <label class="upload-file">
-      <span>File</span>
-      <input id="upload-file" type="file" required>
-    </label>
-    <label class="upload-path">
-      <span>Asset</span>
-      <input id="upload-path" type="text" readonly>
+  renderUploadSpecFields(repo);
+}
+
+function uploadSpecFieldLabel(name) {
+  const labels = {
+    asset: "File",
+    directory: "Directory",
+    filename: "Filename",
+  };
+  return labels[name] || name
+    .replaceAll("-", " ")
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function uploadSpecComponentField(field) {
+  const label = uploadSpecFieldLabel(field.name);
+  const id = `upload-spec-component-${field.name}`;
+  if (field.type === "BOOLEAN") {
+    return `
+      <label class="upload-check">
+        <input id="${escapeHtml(id)}" data-upload-component-field="${escapeHtml(field.name)}" type="checkbox">
+        <span>${escapeHtml(label)}</span>
+      </label>
+    `;
+  }
+  const value = field.name === "directory" ? "/" : "";
+  return `
+    <label class="${field.name === "directory" ? "full-width" : ""}">
+      <span>${escapeHtml(label)}</span>
+      <input id="${escapeHtml(id)}" data-upload-component-field="${escapeHtml(field.name)}"
+        type="text" value="${escapeHtml(value)}"
+        placeholder="${escapeHtml(field.description || "")}" ${field.optional ? "" : "required"}>
     </label>
   `;
+}
+
+function uploadSpecAssetRow(spec, index) {
+  const fields = [...(spec.assetFields || [])]
+    .sort((left, right) => (left.type === "FILE" ? -1 : right.type === "FILE" ? 1 : 0))
+    .map((field) => {
+      const label = uploadSpecFieldLabel(field.name);
+      if (field.type === "FILE") {
+        return `
+          <label class="upload-file">
+            <span>${escapeHtml(label)}</span>
+            <input class="upload-spec-file" data-upload-asset-field="${escapeHtml(field.name)}"
+              type="file" ${field.optional ? "" : "required"}>
+          </label>
+        `;
+      }
+      return `
+        <label>
+          <span>${escapeHtml(label)}</span>
+          <input class="upload-spec-asset-field" data-upload-asset-field="${escapeHtml(field.name)}"
+            data-upload-autofill="${field.name === "filename" ? "true" : "false"}"
+            type="text" placeholder="${escapeHtml(field.description || "")}" ${field.optional ? "" : "required"}>
+        </label>
+      `;
+    }).join("");
+  return `
+    <div class="upload-asset-row upload-spec-asset-row" data-asset-index="${index}">
+      ${fields}
+      ${spec.multipleUpload
+        ? `<button class="secondary-button upload-spec-remove-asset" type="button">Remove</button>`
+        : ""}
+    </div>
+  `;
+}
+
+function renderUploadSpecFields(repo) {
+  const fields = document.getElementById("upload-fields");
+  const spec = selectedUploadSpec(repo);
+  if (!spec) {
+    fields.innerHTML = '<div class="muted-row upload-empty">No upload definition is available.</div>';
+    return;
+  }
+  fields.innerHTML = `
+    ${(spec.componentFields || []).map(uploadSpecComponentField).join("")}
+    <div class="upload-assets" id="upload-spec-assets">
+      ${Array.from({ length: uploadAssetCount }, (_, index) => uploadSpecAssetRow(spec, index + 1)).join("")}
+    </div>
+    ${spec.multipleUpload
+      ? '<button class="secondary-button upload-add-asset" id="upload-spec-add-asset" type="button">Add asset</button>'
+      : ""}
+    <label class="upload-path">
+      <span>Path</span>
+      <textarea id="upload-path" readonly></textarea>
+    </label>
+  `;
+  document.querySelectorAll(".upload-spec-asset-row").forEach(bindUploadSpecAssetRow);
+  syncUploadSpecRemoveButtons();
+  document.getElementById("upload-spec-add-asset")?.addEventListener("click", () => {
+    uploadAssetCount += 1;
+    const assets = document.getElementById("upload-spec-assets");
+    assets.insertAdjacentHTML("beforeend", uploadSpecAssetRow(spec, uploadAssetCount));
+    bindUploadSpecAssetRow(assets.lastElementChild);
+    syncUploadSpecRemoveButtons();
+    updateUploadPath();
+  });
+}
+
+function bindUploadSpecAssetRow(row) {
+  const file = row.querySelector(".upload-spec-file");
+  const filename = row.querySelector('[data-upload-asset-field="filename"]');
+  file?.addEventListener("change", () => {
+    if (filename && (filename.dataset.uploadAutofill === "true" || !filename.value.trim())) {
+      filename.value = file.files?.[0]?.name || "";
+      filename.dataset.uploadAutofill = "true";
+    }
+    updateUploadPath();
+  });
+  filename?.addEventListener("input", () => {
+    filename.dataset.uploadAutofill = "false";
+  });
+  row.querySelector(".upload-spec-remove-asset")?.addEventListener("click", () => {
+    if (document.querySelectorAll(".upload-spec-asset-row").length <= 1) return;
+    row.remove();
+    uploadAssetCount = document.querySelectorAll(".upload-spec-asset-row").length;
+    syncUploadSpecRemoveButtons();
+    updateUploadPath();
+  });
+}
+
+function syncUploadSpecRemoveButtons() {
+  const disabled = document.querySelectorAll(".upload-spec-asset-row").length <= 1;
+  document.querySelectorAll(".upload-spec-remove-asset").forEach((button) => {
+    button.disabled = disabled;
+  });
 }
 
 function updateTerraformUploadKind() {
@@ -3265,6 +3724,16 @@ function uploadFieldValue(id) {
 function computedUploadPaths() {
   const repo = selectedUploadRepository();
   if (!repo) return [];
+  const specRows = Array.from(document.querySelectorAll(".upload-spec-asset-row"));
+  if (specRows.length) {
+    const directory = document.querySelector('[data-upload-component-field="directory"]')?.value || "/";
+    const prefix = directory.trim().replaceAll("\\", "/").replace(/^\/+|\/+$/g, "");
+    return specRows.map((row) => {
+      const filename = row.querySelector('[data-upload-asset-field="filename"]')?.value?.trim()
+        || row.querySelector(".upload-spec-file")?.files?.[0]?.name;
+      return filename ? `/${[prefix, filename.replace(/^\/+/, "")].filter(Boolean).join("/")}` : "";
+    }).filter(Boolean);
+  }
   if (repo.format === "conan") {
     const name = uploadFieldValue("upload-conan-name");
     const version = uploadFieldValue("upload-conan-version");
@@ -3557,9 +4026,59 @@ function buildUploadForm(repo, form) {
     form.append("apt.asset", file, file.name);
     return;
   }
-  const file = document.getElementById("upload-file")?.files?.[0];
-  if (!file) throw new Error("File is required.");
-  form.append(`${repo.format}.asset`, file, file.name);
+  if (repo.format === "alpine") {
+    const file = document.getElementById("upload-file")?.files?.[0];
+    const distribution = uploadFieldValue("upload-alpine-distribution");
+    const channel = uploadFieldValue("upload-alpine-channel");
+    const architecture = uploadFieldValue("upload-alpine-architecture");
+    if (!distribution || !channel || !architecture
+        || !file || !file.name.toLowerCase().endsWith(".apk")) {
+      throw new Error("Distribution, channel, architecture, and an .apk package are required.");
+    }
+    form.append("alpine.distribution", distribution);
+    form.append("alpine.channel", channel);
+    form.append("alpine.repositoryArchitecture", architecture);
+    form.append("alpine.asset", file, file.name);
+    return;
+  }
+  if (repo.format === "r") {
+    const file = document.getElementById("upload-file")?.files?.[0];
+    if (!file || !file.name.toLowerCase().endsWith(".tar.gz")) {
+      throw new Error("A canonical R source .tar.gz package is required.");
+    }
+    form.append("r.asset", file, file.name);
+    return;
+  }
+  const spec = selectedUploadSpec(repo);
+  const rows = Array.from(document.querySelectorAll(".upload-spec-asset-row"));
+  if (!spec || !rows.length) throw new Error("Upload definition is unavailable.");
+  (spec.componentFields || []).forEach((field) => {
+    const node = document.querySelector(`[data-upload-component-field="${CSS.escape(field.name)}"]`);
+    const value = field.type === "BOOLEAN" ? (node?.checked ? "true" : "") : node?.value?.trim();
+    if (!field.optional && !value) throw new Error(`${uploadSpecFieldLabel(field.name)} is required.`);
+    if (value) form.append(`${repo.format}.${field.name}`, value);
+  });
+  if (!spec.multipleUpload && rows.length !== 1) {
+    throw new Error("This repository format accepts exactly one asset.");
+  }
+  rows.forEach((row, index) => {
+    const fileField = (spec.assetFields || []).find((field) => field.type === "FILE");
+    const fileInput = fileField
+      ? row.querySelector(`[data-upload-asset-field="${CSS.escape(fileField.name)}"]`)
+      : null;
+    const file = fileInput?.files?.[0];
+    if (!fileField || !file) throw new Error("File is required.");
+    const assetKey = spec.multipleUpload && fileField.name === "asset"
+      ? `${repo.format}.asset${index + 1}`
+      : `${repo.format}.${fileField.name}`;
+    form.append(assetKey, file, file.name);
+    (spec.assetFields || []).filter((field) => field.type !== "FILE").forEach((field) => {
+      const node = row.querySelector(`[data-upload-asset-field="${CSS.escape(field.name)}"]`);
+      const value = field.type === "BOOLEAN" ? (node?.checked ? "true" : "") : node?.value?.trim();
+      if (!field.optional && !value) throw new Error(`${uploadSpecFieldLabel(field.name)} is required.`);
+      if (value) form.append(`${assetKey}.${field.name}`, value);
+    });
+  });
 }
 
 async function uploadError(response) {
@@ -3573,14 +4092,25 @@ async function uploadError(response) {
   }
 }
 
-async function renderSearch(format = DEFAULT_SEARCH_FORMAT) {
+async function renderSearch(
+    format = DEFAULT_SEARCH_FORMAT,
+    customFormat = activeCustomSearchFormat) {
   const seq = ++searchRequestSeq;
+  const normalizedFormat = normalizeSearchFormat(format);
+  activeCustomSearchFormat = normalizeCustomSearchFormat(customFormat);
   const keyword = document.getElementById("component-keyword").value.trim().toLowerCase();
+  const target = `/browse/${searchHash(normalizedFormat, keyword, activeCustomSearchFormat)}`;
+  const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  if (current !== target) window.history.replaceState(null, "", target);
+  window.kkrepoGlobalComponentSearch?.setKeyword(document, keyword);
   document.getElementById("component-table").innerHTML =
     '<tr><td colspan="7" class="muted-row">Searching...</td></tr>';
   let payload;
   try {
-    payload = await fetchSearchComponents(format, keyword);
+    payload = await fetchSearchComponents(
+        normalizedFormat,
+        keyword,
+        activeCustomSearchFormat);
   } catch (error) {
     if (seq !== searchRequestSeq) return;
     document.getElementById("component-total").textContent = "0";
@@ -3659,8 +4189,195 @@ function clearSearchFormatSelection() {
   });
 }
 
-function selectSearchFormat(format) {
+function customSearchFormatOptionElements() {
+  return Array.from(document.querySelectorAll("[data-custom-search-format]"));
+}
+
+function visibleCustomSearchFormatOptionElements() {
+  return customSearchFormatOptionElements().filter((option) => !option.hidden);
+}
+
+function setActiveCustomSearchFormatOption(format, scroll = false) {
+  const filter = document.getElementById("component-custom-format-filter");
+  activeCustomSearchFormatOption = format || null;
+  let activeOption = null;
+  customSearchFormatOptionElements().forEach((option) => {
+    const active = !option.hidden
+      && option.dataset.customSearchFormat === activeCustomSearchFormatOption;
+    option.classList.toggle("is-active", active);
+    if (active) activeOption = option;
+  });
+  if (activeOption) {
+    filter.setAttribute("aria-activedescendant", activeOption.id);
+    if (scroll) activeOption.scrollIntoView({ block: "nearest" });
+  } else {
+    filter.removeAttribute("aria-activedescendant");
+  }
+}
+
+function filterCustomSearchFormatOptions() {
+  const filter = document.getElementById("component-custom-format-filter");
+  const empty = document.getElementById("component-custom-format-empty");
+  const query = filter.value.trim().toLowerCase();
+  customSearchFormatOptionElements().forEach((option) => {
+    const searchable = `${option.dataset.customSearchFormat} ${option.textContent}`.toLowerCase();
+    option.hidden = Boolean(query) && !searchable.includes(query);
+  });
+  const visible = visibleCustomSearchFormatOptionElements();
+  empty.hidden = visible.length > 0;
+  const currentActive = visible.find(
+      (option) => option.dataset.customSearchFormat === activeCustomSearchFormatOption);
+  const selected = visible.find(
+      (option) => option.dataset.customSearchFormat === activeCustomSearchFormat);
+  setActiveCustomSearchFormatOption(
+      (currentActive || selected || visible[0])?.dataset.customSearchFormat || null);
+}
+
+function syncCustomSearchFormatCombobox() {
+  const select = document.getElementById("component-custom-format");
+  const value = document.getElementById("component-custom-format-value");
+  const normalized = normalizeCustomSearchFormat(activeCustomSearchFormat);
+  activeCustomSearchFormat = normalized;
+  select.value = normalized;
+  value.innerHTML = `
+    <span class="format-logo format-logo-${formatIconName(normalized)}" aria-hidden="true"></span>
+    <span>${escapeHtml(searchFormatLabel(normalized))}</span>
+  `;
+  customSearchFormatOptionElements().forEach((option) => {
+    option.setAttribute(
+        "aria-selected",
+        String(option.dataset.customSearchFormat === normalized));
+  });
+}
+
+function openCustomSearchFormatCombobox() {
+  const trigger = document.getElementById("component-custom-format-trigger");
+  const popover = document.getElementById("component-custom-format-popover");
+  const filter = document.getElementById("component-custom-format-filter");
+  if (!popover.hidden) return;
+  syncCustomSearchFormatCombobox();
+  filter.value = "";
+  activeCustomSearchFormatOption = activeCustomSearchFormat;
+  filterCustomSearchFormatOptions();
+  popover.hidden = false;
+  trigger.setAttribute("aria-expanded", "true");
+  filter.setAttribute("aria-expanded", "true");
+  setTimeout(() => {
+    filter.focus();
+    setActiveCustomSearchFormatOption(activeCustomSearchFormatOption, true);
+  }, 0);
+}
+
+function closeCustomSearchFormatCombobox(focusTrigger = false) {
+  const trigger = document.getElementById("component-custom-format-trigger");
+  const popover = document.getElementById("component-custom-format-popover");
+  const filter = document.getElementById("component-custom-format-filter");
+  popover.hidden = true;
+  trigger.setAttribute("aria-expanded", "false");
+  filter.setAttribute("aria-expanded", "false");
+  filter.removeAttribute("aria-activedescendant");
+  activeCustomSearchFormatOption = null;
+  if (focusTrigger) trigger.focus();
+}
+
+function toggleCustomSearchFormatCombobox() {
+  const popover = document.getElementById("component-custom-format-popover");
+  if (popover.hidden) openCustomSearchFormatCombobox();
+  else closeCustomSearchFormatCombobox(true);
+}
+
+function selectCustomSearchFormat(format) {
+  const select = document.getElementById("component-custom-format");
+  select.value = normalizeCustomSearchFormat(format);
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+  closeCustomSearchFormatCombobox(true);
+}
+
+function moveActiveCustomSearchFormatOption(offset) {
+  const options = visibleCustomSearchFormatOptionElements();
+  if (options.length === 0) return;
+  let currentIndex = options.findIndex(
+      (option) => option.dataset.customSearchFormat === activeCustomSearchFormatOption);
+  if (currentIndex < 0) currentIndex = offset > 0 ? -1 : 0;
+  const nextIndex = (currentIndex + offset + options.length) % options.length;
+  setActiveCustomSearchFormatOption(options[nextIndex].dataset.customSearchFormat, true);
+}
+
+function bindCustomSearchFormatCombobox() {
+  const root = document.getElementById("component-custom-format-combobox");
+  const select = document.getElementById("component-custom-format");
+  const trigger = document.getElementById("component-custom-format-trigger");
+  const filter = document.getElementById("component-custom-format-filter");
+  const options = document.getElementById("component-custom-format-options");
+
+  syncCustomSearchFormatCombobox();
+  customSearchFormatOptionElements().forEach((option) => { option.tabIndex = -1; });
+  trigger.addEventListener("click", toggleCustomSearchFormatCombobox);
+  trigger.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      openCustomSearchFormatCombobox();
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeCustomSearchFormatCombobox(true);
+    }
+  });
+  select.addEventListener("change", (event) => {
+    activeCustomSearchFormat = normalizeCustomSearchFormat(event.target.value);
+    syncCustomSearchFormatCombobox();
+  });
+  filter.addEventListener("input", filterCustomSearchFormatOptions);
+  filter.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      moveActiveCustomSearchFormatOption(event.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
+    if (event.key === "Home" || event.key === "End") {
+      event.preventDefault();
+      const visible = visibleCustomSearchFormatOptionElements();
+      const target = event.key === "Home" ? visible[0] : visible.at(-1);
+      setActiveCustomSearchFormatOption(target?.dataset.customSearchFormat || null, true);
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      if (activeCustomSearchFormatOption) {
+        selectCustomSearchFormat(activeCustomSearchFormatOption);
+      }
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeCustomSearchFormatCombobox(true);
+      return;
+    }
+    if (event.key === "Tab") closeCustomSearchFormatCombobox();
+  });
+  options.addEventListener("mousemove", (event) => {
+    const option = event.target.closest("[data-custom-search-format]");
+    if (option) setActiveCustomSearchFormatOption(option.dataset.customSearchFormat);
+  });
+  options.addEventListener("click", (event) => {
+    const option = event.target.closest("[data-custom-search-format]");
+    if (option) selectCustomSearchFormat(option.dataset.customSearchFormat);
+  });
+  document.addEventListener("click", (event) => {
+    if (!root.contains(event.target)) closeCustomSearchFormatCombobox();
+  });
+}
+
+function selectSearchFormat(format, customFormat = activeCustomSearchFormat) {
   activeSearchFormat = normalizeSearchFormat(format);
+  activeCustomSearchFormat = normalizeCustomSearchFormat(customFormat);
+  document.getElementById("component-search-title").textContent =
+    searchPageTitle(activeSearchFormat);
+  const customField = document.getElementById("component-custom-format-field");
+  if (customField) customField.hidden = activeSearchFormat !== CUSTOM_SEARCH_FORMAT;
+  syncCustomSearchFormatCombobox();
+  if (activeSearchFormat !== CUSTOM_SEARCH_FORMAT) closeCustomSearchFormatCombobox();
   document.querySelectorAll(".side-subitem").forEach((entry) => {
     entry.classList.toggle("is-active", entry.dataset.searchFormat === activeSearchFormat);
   });
@@ -3685,8 +4402,7 @@ function applyHashRoute() {
     return true;
   }
   if (route.view === "search") {
-    showSearch(route.searchFormat, false);
-    window.history.replaceState(null, "", `/browse/${searchHash(route.searchFormat)}`);
+    showSearch(route.searchFormat, false, route.keyword, route.customSearchFormat);
     return true;
   }
   switchView("browse");
@@ -3802,6 +4518,7 @@ document.querySelectorAll(".side-subitem").forEach((item) => {
 document.getElementById("repository-filter").addEventListener("input", () => {
   if (state.mode === "repos") renderRepoList();
 });
+bindCustomSearchFormatCombobox();
 document.querySelectorAll("[data-repo-sort]").forEach((button) => {
   button.addEventListener("click", () => toggleRepositorySort(button.dataset.repoSort));
 });
@@ -3812,7 +4529,10 @@ document.getElementById("upload-repository").addEventListener("change", () => {
 });
 document.getElementById("upload-fields").addEventListener("input", updateUploadPath);
 document.getElementById("upload-fields").addEventListener("change", updateUploadPath);
-document.getElementById("component-search-button").addEventListener("click", () => renderSearch(activeSearchFormat));
+document.getElementById("component-search-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  renderSearch(activeSearchFormat, activeCustomSearchFormat);
+});
 document.getElementById("upload-form").addEventListener("submit", uploadSelectedAsset);
 document.getElementById("my-token-form").addEventListener("submit", createCurrentApiKey);
 document.getElementById("my-token-display-name").addEventListener("input", (event) => {

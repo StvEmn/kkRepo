@@ -138,7 +138,7 @@ twine upload -r kkrepo dist/*
 
 ## Go
 
-Configure a Go module proxy repository or group repository:
+Configure a Go module group as the client read endpoint:
 
 ```bash
 go env -w GOPROXY=https://nexus.example.com/repository/go-group/,direct
@@ -158,7 +158,19 @@ go list -m github.com/pkg/errors@latest
 go mod download github.com/pkg/errors
 ```
 
-Go hosted upload is not supported. Use Go proxy/group repositories for read-through module proxy behavior.
+Publish a canonical module ZIP to a hosted repository. The archive must contain one
+`<module>@<version>/` root and the upload filename must be `<version>.zip`:
+
+```bash
+curl --fail-with-body \
+  -u "$KKREPO_USER:$KKREPO_PASSWORD" \
+  --upload-file v1.2.3.zip \
+  https://nexus.example.com/repository/go-hosted/v1.2.3.zip
+```
+
+Put `go-hosted` before `go-proxy` in `go-group` so private modules resolve before public fallback.
+See the [Go Repository Guide](repository-guides/go.md) for archive validation, write policy,
+Cleanup, and Artifact Scanning behavior.
 
 ## Helm
 
@@ -571,6 +583,93 @@ conan install --requires='demo/1.0.0@team/stable' --remote=kkrepo
 
 For revision commit semantics, Browse paths, cleanup, scanning, proxy/group behavior,
 migration, and troubleshooting, see the [Conan Repository Guide](repository-guides/conan-2.md).
+
+## Alpine / APK
+
+Install the repository-scoped public key with the exact filename configured on the group:
+
+```bash
+curl -u alice:"$KKREPO_PASSWORD" \
+  -o kkrepo-alpine-group.rsa.pub \
+  https://nexus.example.com/internal/repositories/alpine-group/alpine/public-key
+sudo install -m 0644 kkrepo-alpine-group.rsa.pub \
+  /etc/apk/keys/kkrepo-alpine-group.rsa.pub
+```
+
+Configure a group repository, then update, inspect, fetch, and install with the standard client:
+
+```bash
+echo 'https://nexus.example.com/repository/alpine-group/v3.23/main' \
+  | sudo tee /etc/apk/repositories
+apk update
+apk policy acme-agent
+apk fetch acme-agent=1.2.3-r0
+apk add acme-agent=1.2.3-r0
+apk info -e acme-agent=1.2.3-r0
+```
+
+Publish an immutable APK v2 package to a hosted namespace:
+
+```bash
+curl -u alice:"$KKREPO_PASSWORD" \
+  -H 'Content-Type: application/vnd.alpine.apk' \
+  --upload-file acme-agent-1.2.3-r0.apk \
+  https://nexus.example.com/repository/alpine-hosted/v3.23/main/x86_64/acme-agent-1.2.3-r0.apk
+```
+
+Use protected client configuration for authenticated repository URLs. Hosted/group indexes are
+locally signed; passthrough proxies retain the upstream signature. See the
+[Alpine / APK Repository Guide](repository-guides/alpine-apk.md).
+
+## R / CRAN
+
+Use an R group as the normal source repository in `.Rprofile`:
+
+```r
+local({
+  repos <- getOption("repos")
+  repos["KKRepo"] <- "https://nexus.example.com/repository/r-group"
+  options(repos = repos)
+})
+```
+
+Publish a source package to hosted:
+
+```bash
+R CMD build acmepkg
+curl -u alice:"$KKREPO_PASSWORD" \
+  -H 'Content-Type: application/x-gzip' \
+  --upload-file acmepkg_1.2.3.tar.gz \
+  https://nexus.example.com/repository/r-hosted/src/contrib/acmepkg_1.2.3.tar.gz
+```
+
+Resolve and install through the group:
+
+```r
+available.packages(repos = getOption("repos")["KKRepo"], type = "source")
+install.packages("acmepkg", repos = getOption("repos")["KKRepo"], type = "source")
+```
+
+Hosted/group are source-only; address the proxy directly for upstream `.zip`, `.tgz`, or
+`PACKAGES.rds`. See the [R / CRAN Repository Guide](repository-guides/r-cran.md).
+
+## Hugging Face Models
+
+Create a Models-only `huggingface-proxy`, then point the Hub client at its repository root:
+
+```bash
+export HF_ENDPOINT='https://nexus.example.com/repository/huggingface-models'
+export HF_HUB_DOWNLOAD_TIMEOUT=120
+export HF_HUB_ETAG_TIMEOUT=1800
+
+hf download sshleifer/tiny-gpt2 config.json
+hf download sshleifer/tiny-gpt2 --include '*.json' '*.safetensors'
+```
+
+For local authentication, expose a read-scoped kkRepo `GenericToken` as `HF_TOKEN`. Configure a
+separate remote bearer token on the repository only when the upstream model is private or gated.
+`huggingface_hub`, Transformers, and Diffusers inherit the same `HF_ENDPOINT`. See the
+[Hugging Face Models Repository Guide](repository-guides/hugging-face-models.md).
 
 ## NuGet
 

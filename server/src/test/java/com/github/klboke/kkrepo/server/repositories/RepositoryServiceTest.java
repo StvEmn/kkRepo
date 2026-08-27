@@ -8,16 +8,19 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import com.github.klboke.kkrepo.core.RepositoryFormat;
 import com.github.klboke.kkrepo.core.RepositoryType;
 import com.github.klboke.kkrepo.persistence.jdbc.api.BlobStoreDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.AlpineRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AptRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AnsibleGalaxyRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.ConanRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.CondaRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.CleanupPolicyDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.RRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.SecurityDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.BlobStoreRecord;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.RepositoryRecord;
@@ -27,12 +30,14 @@ import com.github.klboke.kkrepo.server.maven.RepositoryRuntimeRegistry;
 import com.github.klboke.kkrepo.server.proxy.OutboundProxyConfig;
 import com.github.klboke.kkrepo.server.proxy.ProxiedHttpClientFactory;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.CargoSettings;
+import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.AlpineSettings;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.AptSettings;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.CreateCommand;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.DockerSettings;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.HostedSettings;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.GroupSettings;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.ProxySettings;
+import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.PypiSettings;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.UpdateCommand;
 import com.github.klboke.kkrepo.server.support.InMemoryVersionWatermark;
 import com.github.klboke.kkrepo.server.support.dao.BlobStoreDaoAdapter;
@@ -43,9 +48,346 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import org.junit.jupiter.api.Test;
 
 class RepositoryServiceTest {
+
+  @Test
+  void pypiProxyRemoteIndexPathDefaultsPreservesEmptyAndRoundTripsUpdates() {
+    StubRepositoryDao repositories = new StubRepositoryDao(repository(1L));
+    RepositoryService service = service(repositories);
+
+    RepositoryView defaulted = service.create(new CreateCommand(
+        "pypi-default", "pypi-proxy", true, "default", true, null,
+        new ProxySettings("https://pypi.org/", 60, 30, true),
+        null, null, null, null, null, null, null));
+    assertEquals("/simple", defaulted.pypi().indexPath());
+
+    RepositoryView rootIndex = service.create(new CreateCommand(
+        "pypi-root", "pypi-proxy", true, "default", true, null,
+        new ProxySettings("https://download.pytorch.org/whl/cpu/", 60, 30, true),
+        null, null, null, null, null, null, new PypiSettings("")));
+    assertEquals("", rootIndex.pypi().indexPath());
+    assertEquals("", ((Map<?, ?>) repositories.findByName("pypi-root").orElseThrow().attributes()
+        .get("pypi")).get("indexPath"));
+
+    RepositoryView updated = service.update("pypi-root", new UpdateCommand(
+        true, null, null, null, null, null, null, null, null, null, null,
+        new PypiSettings(" custom/simple/ ")));
+    assertEquals("/custom/simple", updated.pypi().indexPath());
+
+    assertThrows(RepositoryValidationException.class, () -> service.update(
+        "pypi-root", new UpdateCommand(
+            true, null, null, null, null, null, null, null, null, null, null,
+            new PypiSettings("/../private"))));
+  }
+
+  @Test
+  void rHostedLifecycleInitializesNamespaceAndDeletesProtocolState() {
+    StubRepositoryDao repositories = new StubRepositoryDao(repository(1L));
+    RRegistryDao registry = mock(RRegistryDao.class);
+    RepositoryService service = service(repositories);
+    service.setRRegistry(registry);
+
+    RepositoryView created = service.create(new CreateCommand(
+        "cran-hosted", "r-hosted", true, "default", true,
+        new HostedSettings("ALLOW", null, null), null, null, null, null, null));
+
+    assertEquals(RepositoryFormat.R, created.format());
+    verify(registry).ensureSuite(
+        org.mockito.ArgumentMatchers.eq(100L),
+        org.mockito.ArgumentMatchers.eq("src/contrib"),
+        org.mockito.ArgumentMatchers.any());
+
+    service.delete("cran-hosted");
+    verify(registry).deleteRepositoryState(100L);
+    assertTrue(repositories.findByName("cran-hosted").isEmpty());
+  }
+
+  @Test
+  void rGroupCreationIsLazyAndMemberReplacementDirtiesDurableSnapshot() {
+    StubRepositoryDao repositories = new StubRepositoryDao(
+        rHostedRepository(71L, "cran-first"),
+        rHostedRepository(72L, "cran-second"));
+    RRegistryDao registry = mock(RRegistryDao.class);
+    RepositoryService service = service(repositories);
+    service.setRRegistry(registry);
+
+    RepositoryView created = service.create(new CreateCommand(
+        "cran-root", "r-group", true, "default", true,
+        null, null, null, null, null,
+        new GroupSettings(List.of("cran-first", "cran-second"))));
+
+    assertEquals(List.of("cran-first", "cran-second"), created.group().memberNames());
+    assertEquals(List.of(71L, 72L), repositories.membersByGroupId.get(100L));
+    verify(registry).ensureSuite(
+        org.mockito.ArgumentMatchers.eq(100L),
+        org.mockito.ArgumentMatchers.eq("src/contrib"),
+        org.mockito.ArgumentMatchers.any());
+    verify(registry, org.mockito.Mockito.never()).markSuiteDirty(
+        org.mockito.ArgumentMatchers.anyLong(),
+        org.mockito.ArgumentMatchers.anyString(),
+        org.mockito.ArgumentMatchers.any());
+
+    RepositoryView updated = service.replaceMembers(
+        "cran-root", List.of("cran-second", "cran-first"));
+    assertEquals(List.of("cran-second", "cran-first"), updated.group().memberNames());
+    assertEquals(List.of(72L, 71L), repositories.membersByGroupId.get(100L));
+    verify(registry).markSuiteDirty(
+        org.mockito.ArgumentMatchers.eq(100L),
+        org.mockito.ArgumentMatchers.eq("src/contrib"),
+        org.mockito.ArgumentMatchers.any());
+  }
+
+  @Test
+  void updatingRMemberInvalidatesEveryContainingGroupTransitively() {
+    StubRepositoryDao repositories = new StubRepositoryDao(
+        rHostedRepository(81L, "cran-hosted"),
+        rGroupRepository(82L, "cran-nested"),
+        rGroupRepository(83L, "cran-root"));
+    repositories.replaceMembers(82L, List.of(81L));
+    repositories.replaceMembers(83L, List.of(82L));
+    RRegistryDao registry = mock(RRegistryDao.class);
+    RepositoryService service = service(repositories);
+    service.setRRegistry(registry);
+
+    service.update("cran-hosted",
+        new UpdateCommand(false, null, null, null, null, null, null, null, null));
+
+    verify(registry, org.mockito.Mockito.atLeastOnce()).markSuiteDirty(
+        org.mockito.ArgumentMatchers.eq(81L),
+        org.mockito.ArgumentMatchers.eq("src/contrib"),
+        org.mockito.ArgumentMatchers.any());
+    verify(registry).markSuiteDirty(
+        org.mockito.ArgumentMatchers.eq(82L),
+        org.mockito.ArgumentMatchers.eq("src/contrib"),
+        org.mockito.ArgumentMatchers.any());
+    verify(registry).markSuiteDirty(
+        org.mockito.ArgumentMatchers.eq(83L),
+        org.mockito.ArgumentMatchers.eq("src/contrib"),
+        org.mockito.ArgumentMatchers.any());
+  }
+
+  @Test
+  void alpineHostedDefaultsRoundTripAndInitializeEveryNamespace() {
+    StubRepositoryDao repositories = new StubRepositoryDao(repository(1L));
+    AlpineRegistryDao registry = mock(AlpineRegistryDao.class);
+    RepositoryService service = service(repositories);
+    service.setAlpineRegistry(registry);
+
+    RepositoryView created = service.create(new CreateCommand(
+        "alpine-hosted", "alpine-hosted", null, "default", null,
+        new HostedSettings("ALLOW", null, null), null, null, null, null, null, null, null));
+
+    assertEquals(List.of("v3.23"), created.alpine().distributions());
+    assertEquals(List.of("main"), created.alpine().channels());
+    assertEquals(List.of("x86_64", "aarch64"), created.alpine().architectures());
+    assertEquals("RESIGN", created.alpine().metadataMode());
+    assertEquals(true, created.alpine().verifyUpstreamSignatures());
+    assertEquals(true, created.alpine().staleIfError());
+    assertEquals("alpine-hosted.rsa.pub", created.alpine().keyFilename());
+    assertEquals("RSA", created.alpine().signatureType());
+    assertEquals("kkRepo Alpine repository", created.alpine().description());
+    verify(registry).ensureSuite(
+        org.mockito.ArgumentMatchers.eq(100L),
+        org.mockito.ArgumentMatchers.eq("v3.23/main/x86_64"),
+        org.mockito.ArgumentMatchers.any());
+    verify(registry).ensureSuite(
+        org.mockito.ArgumentMatchers.eq(100L),
+        org.mockito.ArgumentMatchers.eq("v3.23/main/aarch64"),
+        org.mockito.ArgumentMatchers.any());
+  }
+
+  @Test
+  void alpineProxyNormalizesCustomSettingsAndStoredFallbacks() {
+    StubRepositoryDao repositories = new StubRepositoryDao(repository(1L));
+    RepositoryService service = service(repositories);
+    ArrayList<String> keys = new ArrayList<>();
+    keys.add(" public-one ");
+    keys.add(null);
+    keys.add(" ");
+    keys.add("public-one");
+
+    RepositoryView custom = service.create(new CreateCommand(
+        "alpine-proxy", "alpine-proxy", true, "default", true, null,
+        new ProxySettings("https://dl-cdn.alpinelinux.org/alpine/", 60, 30, true),
+        null, null, null, null, null,
+        new AlpineSettings(
+            List.of(" V3.23 ", "v3.23"), List.of(" Community "),
+            List.of(" AARCH64 ", "aarch64"), " passthrough ", false, null,
+            " custom.rsa.pub ", " rsa256 ", " Mirror ", keys)));
+
+    assertEquals(List.of("v3.23"), custom.alpine().distributions());
+    assertEquals(List.of("community"), custom.alpine().channels());
+    assertEquals(List.of("aarch64"), custom.alpine().architectures());
+    assertEquals("PASSTHROUGH", custom.alpine().metadataMode());
+    assertEquals(false, custom.alpine().verifyUpstreamSignatures());
+    assertEquals(true, custom.alpine().staleIfError());
+    assertEquals("custom.rsa.pub", custom.alpine().keyFilename());
+    assertEquals("RSA256", custom.alpine().signatureType());
+    assertEquals("Mirror", custom.alpine().description());
+    assertEquals(List.of("public-one"), custom.alpine().upstreamPublicKeys());
+
+    Map<String, Object> attributes = new LinkedHashMap<>();
+    attributes.put("recipe", "alpine-hosted");
+    attributes.put("alpine", Map.of(
+        "distributions", "not-a-list",
+        "channels", 42,
+        "architectures", true));
+    String longName = "a".repeat(170);
+    RepositoryRecord malformedStored = new RepositoryRecord(
+        91L, longName, RepositoryFormat.ALPINE, RepositoryType.HOSTED, "alpine-hosted",
+        true, 1L, null, null, null, null, "ALLOW", true, attributes);
+    RepositoryView fallback = service(new StubRepositoryDao(malformedStored)).get(longName);
+    assertEquals(List.of("v3.23"), fallback.alpine().distributions());
+    assertEquals(List.of("main"), fallback.alpine().channels());
+    assertEquals(List.of("x86_64", "aarch64"), fallback.alpine().architectures());
+    assertEquals("a".repeat(160) + ".rsa.pub", fallback.alpine().keyFilename());
+  }
+
+  @Test
+  void alpineSettingsRejectUnsafeAndIncompatibleConfigurations() {
+    AlpineSettings valid = alpineSettings("RESIGN", true, List.of());
+    assertInvalidAlpine(RepositoryType.HOSTED, true,
+        alpineSettings("PASSTHROUGH", true, List.of()));
+    assertInvalidAlpine(RepositoryType.PROXY, true,
+        alpineSettings("OTHER", true, List.of("key")));
+    assertInvalidAlpine(RepositoryType.HOSTED, true,
+        new AlpineSettings(valid.distributions(), valid.channels(), valid.architectures(),
+            "RESIGN", false, true, valid.keyFilename(), valid.signatureType(),
+            valid.description(), List.of()));
+    assertInvalidAlpine(RepositoryType.HOSTED, true,
+        new AlpineSettings(valid.distributions(), valid.channels(), valid.architectures(),
+            "RESIGN", true, true, "../bad.rsa.pub", "RSA", "fixture", List.of()));
+    assertInvalidAlpine(RepositoryType.HOSTED, true,
+        new AlpineSettings(valid.distributions(), valid.channels(), valid.architectures(),
+            "RESIGN", true, true, "key.rsa.pub", "DSA", "fixture", List.of()));
+    assertInvalidAlpine(RepositoryType.HOSTED, true,
+        new AlpineSettings(valid.distributions(), valid.channels(), valid.architectures(),
+            "RESIGN", true, true, "key.rsa.pub", "unknown", "fixture", List.of()));
+    assertInvalidAlpine(RepositoryType.HOSTED, true,
+        new AlpineSettings(valid.distributions(), valid.channels(), valid.architectures(),
+            "RESIGN", true, true, "key.rsa.pub", "RSA", "bad\ndescription", List.of()));
+    assertInvalidAlpine(RepositoryType.HOSTED, true,
+        new AlpineSettings(valid.distributions(), valid.channels(), valid.architectures(),
+            "RESIGN", true, true, "key.rsa.pub", "RSA", "x".repeat(256), List.of()));
+    assertInvalidAlpine(RepositoryType.HOSTED, true,
+        new AlpineSettings(valid.distributions(), valid.channels(), valid.architectures(),
+            "RESIGN", true, true, "key.rsa.pub", "RSA", "fixture", List.of("public")));
+    assertInvalidAlpine(RepositoryType.PROXY, true,
+        new AlpineSettings(valid.distributions(), valid.channels(), valid.architectures(),
+            "PASSTHROUGH", false, true, "key.rsa.pub", "RSA", "fixture",
+            List.of("x".repeat(65_537))));
+    assertInvalidAlpine(RepositoryType.HOSTED, true,
+        new AlpineSettings(List.of("bad/name"), valid.channels(), valid.architectures(),
+            "RESIGN", true, true, "key.rsa.pub", "RSA", "fixture", List.of()));
+    assertInvalidAlpine(RepositoryType.HOSTED, true,
+        new AlpineSettings(valid.distributions(), List.of("bad/name"), valid.architectures(),
+            "RESIGN", true, true, "key.rsa.pub", "RSA", "fixture", List.of()));
+    assertInvalidAlpine(RepositoryType.HOSTED, true,
+        new AlpineSettings(valid.distributions(), valid.channels(), List.of("bad/name"),
+            "RESIGN", true, true, "key.rsa.pub", "RSA", "fixture", List.of()));
+    ArrayList<String> withNull = new ArrayList<>();
+    withNull.add(null);
+    assertInvalidAlpine(RepositoryType.HOSTED, true,
+        new AlpineSettings(withNull, valid.channels(), valid.architectures(),
+            "RESIGN", true, true, "key.rsa.pub", "RSA", "fixture", List.of()));
+    List<String> tooMany = java.util.stream.IntStream.range(0, 65)
+        .mapToObj(value -> "v" + value).toList();
+    assertInvalidAlpine(RepositoryType.HOSTED, true,
+        new AlpineSettings(tooMany, valid.channels(), valid.architectures(),
+            "RESIGN", true, true, "key.rsa.pub", "RSA", "fixture", List.of()));
+    assertInvalidAlpine(RepositoryType.PROXY, true,
+        alpineSettings("RESIGN", true, List.of()));
+    assertInvalidAlpine(RepositoryType.PROXY, true,
+        alpineSettings("RESIGN", false, List.of("public")));
+  }
+
+  @Test
+  void alpineUpdatesAndGroupMembershipInvalidateNestedSnapshots() {
+    RepositoryRecord hosted = alpineRepository(
+        70L, "alpine-hosted", RepositoryType.HOSTED, List.of());
+    RepositoryRecord group = alpineRepository(
+        71L, "alpine-group", RepositoryType.GROUP, List.of());
+    RepositoryRecord parent = alpineRepository(
+        72L, "alpine-parent", RepositoryType.GROUP, List.of());
+    StubRepositoryDao repositories = new StubRepositoryDao(hosted, group, parent);
+    repositories.membersByGroupId.put(group.id(), List.of(hosted.id()));
+    repositories.membersByGroupId.put(parent.id(), List.of(group.id()));
+    AlpineRegistryDao registry = mock(AlpineRegistryDao.class);
+    when(registry.listSuites(70L)).thenReturn(List.of(suite(70L)));
+    when(registry.listSuites(71L)).thenReturn(List.of(suite(71L)));
+    when(registry.listSuites(72L)).thenReturn(List.of(suite(72L)));
+    RepositoryService service = service(repositories);
+    service.setAlpineRegistry(registry);
+
+    RepositoryView updated = service.update("alpine-hosted", new UpdateCommand(
+        false, null, null, null, null, null, null, null, null, null,
+        new AlpineSettings(null, List.of("community"), null, null, null, null,
+            null, null, "updated", null)));
+    assertEquals(List.of("v3.23"), updated.alpine().distributions());
+    assertEquals(List.of("community"), updated.alpine().channels());
+    assertEquals(List.of("x86_64"), updated.alpine().architectures());
+    assertEquals("updated", updated.alpine().description());
+    verify(registry, org.mockito.Mockito.atLeastOnce()).markSuiteDirty(
+        org.mockito.ArgumentMatchers.eq(70L),
+        org.mockito.ArgumentMatchers.eq("v3.23/main/x86_64"),
+        org.mockito.ArgumentMatchers.any());
+    verify(registry, org.mockito.Mockito.atLeastOnce()).markSuiteDirty(
+        org.mockito.ArgumentMatchers.eq(71L),
+        org.mockito.ArgumentMatchers.eq("v3.23/main/x86_64"),
+        org.mockito.ArgumentMatchers.any());
+    verify(registry, org.mockito.Mockito.atLeastOnce()).markSuiteDirty(
+        org.mockito.ArgumentMatchers.eq(72L),
+        org.mockito.ArgumentMatchers.eq("v3.23/main/x86_64"),
+        org.mockito.ArgumentMatchers.any());
+
+    RepositoryView replaced = service.replaceMembers(
+        "alpine-group", List.of("alpine-hosted"));
+    assertEquals(List.of("alpine-hosted"), replaced.group().memberNames());
+  }
+
+  @Test
+  void alpineRepositoryDeletionRemovesDurableProtocolState() {
+    StubRepositoryDao repositories = new StubRepositoryDao(
+        alpineRepository(73L, "alpine-hosted", RepositoryType.HOSTED, List.of()));
+    AlpineRegistryDao registry = mock(AlpineRegistryDao.class);
+    RepositoryService service = service(repositories);
+    service.setAlpineRegistry(registry);
+
+    service.delete("alpine-hosted");
+
+    verify(registry).deleteRepositoryState(73L);
+  }
+
+  @Test
+  void alpineResignProxyCanStayOfflineUntilUpstreamTrustIsConfigured() {
+    StubRepositoryDao repositories = new StubRepositoryDao(repository(1L));
+    RepositoryService service = service(repositories);
+    AlpineSettings staged = new AlpineSettings(
+        List.of("v3.23"), List.of("main"), List.of("x86_64"),
+        "RESIGN", true, true, "alpine-proxy.rsa.pub", "RSA", "Migrated", List.of());
+
+    RepositoryView created = service.create(new CreateCommand(
+        "alpine-proxy", "alpine-proxy", false, "default", true,
+        null, new ProxySettings("https://dl-cdn.alpinelinux.org/alpine/", 60, 30, true),
+        null, null, null, null, null, staged));
+
+    assertEquals(false, created.online());
+    assertEquals("RESIGN", created.alpine().metadataMode());
+    assertEquals(List.of(), created.alpine().upstreamPublicKeys());
+    assertThrows(RepositoryValidationException.class, () -> service.update(
+        "alpine-proxy",
+        new UpdateCommand(true, null, null, null, null, null, null, null, null, null, null)));
+
+    RepositoryView activated = service.update("alpine-proxy", new UpdateCommand(
+        true, null, null, null, null, null, null, null, null, null,
+        new AlpineSettings(null, null, null, null, null, null, null, null, null,
+            List.of("-----BEGIN PUBLIC KEY-----\nfixture\n-----END PUBLIC KEY-----"))));
+    assertEquals(true, activated.online());
+    assertEquals(1, activated.alpine().upstreamPublicKeys().size());
+  }
 
   @Test
   void aptHostedDefaultsRoundTripAndInitializeDurableSuite() {
@@ -443,6 +785,148 @@ class RepositoryServiceTest {
         new ProxySettings("https://registry.npmjs.org/", 1440, 1440, true),
         null, null, null, null));
     assertEquals(0, defaulted.proxy().minimumReleaseAgeMinutes());
+  }
+
+  @Test
+  void proxyRedirectHostsRoundTripNormalizePreserveAndClear() {
+    StubRepositoryDao repositories = new StubRepositoryDao(repository(1L));
+    RepositoryService service = service(repositories);
+
+    RepositoryView created = service.create(new CreateCommand(
+        "gradle-plugins",
+        "maven2-proxy",
+        true,
+        "default",
+        true,
+        null,
+        proxyWithRedirectHosts(
+            "http://127.0.0.1/m2/",
+            List.of(
+                " Plugins-Artifacts.Gradle.org. ",
+                "cdn.example.org",
+                "plugins-artifacts.gradle.org")),
+        null,
+        null,
+        null,
+        null));
+
+    assertEquals(
+        List.of("plugins-artifacts.gradle.org", "cdn.example.org"),
+        created.proxy().allowedRedirectHosts());
+    Map<?, ?> storedProxy = (Map<?, ?>) repositories.repository.attributes().get("proxy");
+    assertEquals(created.proxy().allowedRedirectHosts(), storedProxy.get("allowedRedirectHosts"));
+    assertEquals(
+        Set.of("plugins-artifacts.gradle.org", "cdn.example.org"),
+        new RepositoryRuntimeRegistry(repositories, 0)
+            .resolve("gradle-plugins")
+            .orElseThrow()
+            .allowedRedirectHosts());
+
+    RepositoryView preserved = service.update(
+        "gradle-plugins",
+        new UpdateCommand(
+            true,
+            null,
+            null,
+            null,
+            new ProxySettings(null, null, null, null),
+            null,
+            null,
+            null,
+            null));
+    assertEquals(created.proxy().allowedRedirectHosts(), preserved.proxy().allowedRedirectHosts());
+
+    RepositoryView cleared = service.update(
+        "gradle-plugins",
+        new UpdateCommand(
+            true,
+            null,
+            null,
+            null,
+            proxyWithRedirectHosts(null, List.of()),
+            null,
+            null,
+            null,
+            null));
+    assertEquals(List.of(), cleared.proxy().allowedRedirectHosts());
+    Map<?, ?> clearedProxy = (Map<?, ?>) repositories.updated.attributes().get("proxy");
+    assertEquals(false, clearedProxy.containsKey("allowedRedirectHosts"));
+  }
+
+  @Test
+  void proxyRedirectHostsRejectUrlsPortsPathsAndWildcards() {
+    RepositoryService service = service(new StubRepositoryDao(repository(1L)));
+
+    for (String invalid : List.of(
+        "https://plugins-artifacts.gradle.org",
+        "plugins-artifacts.gradle.org:443",
+        "plugins-artifacts.gradle.org/files",
+        "*.gradle.org")) {
+      RepositoryValidationException error = assertThrows(
+          RepositoryValidationException.class,
+          () -> service.create(new CreateCommand(
+              "gradle-plugins",
+              "maven2-proxy",
+              true,
+              "default",
+              true,
+              null,
+              proxyWithRedirectHosts("http://127.0.0.1/m2/", List.of(invalid)),
+              null,
+              null,
+              null,
+              null)));
+      assertEquals(
+          "proxy.allowedRedirectHosts entries must be exact host names without a scheme, port, path, or wildcard",
+          error.getMessage());
+    }
+  }
+
+  @Test
+  void proxyRedirectHostsRejectBlankNullAndExcessEntries() {
+    RepositoryService service = service(new StubRepositoryDao(repository(1L)));
+    List<String> nullHost = new ArrayList<>();
+    nullHost.add(null);
+
+    for (List<String> invalidHosts : List.of(List.of(" "), nullHost)) {
+      RepositoryValidationException error = assertThrows(
+          RepositoryValidationException.class,
+          () -> service.create(new CreateCommand(
+              "gradle-plugins",
+              "maven2-proxy",
+              true,
+              "default",
+              true,
+              null,
+              proxyWithRedirectHosts("http://127.0.0.1/m2/", invalidHosts),
+              null,
+              null,
+              null,
+              null)));
+      assertEquals(
+          "proxy.allowedRedirectHosts entries must be exact host names without a scheme, port, path, or wildcard",
+          error.getMessage());
+    }
+
+    List<String> tooManyHosts = new ArrayList<>();
+    for (int i = 0; i < 65; i++) {
+      tooManyHosts.add("cdn-" + i + ".example.org");
+    }
+    RepositoryValidationException error = assertThrows(
+        RepositoryValidationException.class,
+        () -> service.create(new CreateCommand(
+            "gradle-plugins",
+            "maven2-proxy",
+            true,
+            "default",
+            true,
+            null,
+            proxyWithRedirectHosts("http://127.0.0.1/m2/", tooManyHosts),
+            null,
+            null,
+            null,
+            null)));
+    assertEquals("proxy.allowedRedirectHosts supports at most 64 hosts", error.getMessage());
   }
 
   @Test
@@ -1661,6 +2145,28 @@ class RepositoryServiceTest {
     return mavenProxyWithOutboundProxy(1L, "maven-proxy", outboundPassword);
   }
 
+  private static ProxySettings proxyWithRedirectHosts(
+      String remoteUrl, List<String> allowedRedirectHosts) {
+    return new ProxySettings(
+        remoteUrl,
+        1440,
+        1440,
+        true,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        allowedRedirectHosts);
+  }
+
   private static RepositoryRecord mavenProxyWithOutboundProxy(
       long id, String name, String outboundPassword) {
     Map<String, Object> proxy = new LinkedHashMap<>();
@@ -1709,6 +2215,58 @@ class RepositoryServiceTest {
     assertThrows(RepositoryValidationException.class, () -> service.create(new CreateCommand(
         "invalid-apt-" + System.nanoTime(), recipe, true, "default", true,
         hosted, proxy, null, null, null, null, settings)));
+  }
+
+  private static void assertInvalidAlpine(
+      RepositoryType type, boolean online, AlpineSettings settings) {
+    RepositoryService service = service(new StubRepositoryDao(repository(1L)));
+    String recipe = type == RepositoryType.HOSTED ? "alpine-hosted" : "alpine-proxy";
+    HostedSettings hosted = type == RepositoryType.HOSTED
+        ? new HostedSettings("ALLOW", null, null) : null;
+    ProxySettings proxy = type == RepositoryType.PROXY
+        ? new ProxySettings("https://dl-cdn.alpinelinux.org/alpine/", 60, 30, true) : null;
+    assertThrows(RepositoryValidationException.class, () -> service.create(new CreateCommand(
+        "invalid-alpine", recipe, online, "default", true,
+        hosted, proxy, null, null, null, null, null, settings)));
+  }
+
+  private static AlpineSettings alpineSettings(
+      String metadataMode, boolean verify, List<String> upstreamKeys) {
+    return new AlpineSettings(
+        List.of("v3.23"), List.of("main"), List.of("x86_64"), metadataMode,
+        verify, true, "key.rsa.pub", "RSA", "fixture", upstreamKeys);
+  }
+
+  private static AlpineRegistryDao.SuiteState suite(long repositoryId) {
+    return new AlpineRegistryDao.SuiteState(
+        repositoryId, "v3.23/main/x86_64", 2L, java.time.Instant.EPOCH, 1L, 1,
+        java.time.Instant.EPOCH, null, null, java.time.Instant.EPOCH);
+  }
+
+  private static RepositoryRecord alpineRepository(
+      long id, String name, RepositoryType type, List<String> memberNames) {
+    AlpineSettings settings = alpineSettings("RESIGN", true, List.of());
+    Map<String, Object> alpine = new LinkedHashMap<>();
+    alpine.put("distributions", settings.distributions());
+    alpine.put("channels", settings.channels());
+    alpine.put("architectures", settings.architectures());
+    alpine.put("metadataMode", settings.metadataMode());
+    alpine.put("verifyUpstreamSignatures", settings.verifyUpstreamSignatures());
+    alpine.put("staleIfError", settings.staleIfError());
+    alpine.put("keyFilename", settings.keyFilename());
+    alpine.put("signatureType", settings.signatureType());
+    alpine.put("description", settings.description());
+    alpine.put("upstreamPublicKeys", settings.upstreamPublicKeys());
+    Map<String, Object> attributes = new LinkedHashMap<>();
+    attributes.put("recipe", "alpine-" + type.name().toLowerCase());
+    attributes.put("alpine", alpine);
+    if (type == RepositoryType.GROUP) {
+      attributes.put("group", Map.of());
+    }
+    return new RepositoryRecord(
+        id, name, RepositoryFormat.ALPINE, type,
+        "alpine-" + type.name().toLowerCase(), true, 1L, null, null,
+        null, null, type == RepositoryType.HOSTED ? "ALLOW" : null, true, attributes);
   }
 
   private static RepositoryRecord aptRepository(
@@ -1990,6 +2548,25 @@ class RepositoryServiceTest {
     return new RepositoryRecord(
         id, name, RepositoryFormat.CONAN, RepositoryType.GROUP,
         "conan-group", true, 1L, null, null, null, null,
+        null, true, attributes);
+  }
+
+  private static RepositoryRecord rHostedRepository(long id, String name) {
+    Map<String, Object> attributes = new LinkedHashMap<>();
+    attributes.put("recipe", "r-hosted");
+    return new RepositoryRecord(
+        id, name, RepositoryFormat.R, RepositoryType.HOSTED,
+        "r-hosted", true, 1L, null, null, null, null,
+        "ALLOW", true, attributes);
+  }
+
+  private static RepositoryRecord rGroupRepository(long id, String name) {
+    Map<String, Object> attributes = new LinkedHashMap<>();
+    attributes.put("recipe", "r-group");
+    attributes.put("group", Map.of());
+    return new RepositoryRecord(
+        id, name, RepositoryFormat.R, RepositoryType.GROUP,
+        "r-group", true, 1L, null, null, null, null,
         null, true, attributes);
   }
 

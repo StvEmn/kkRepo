@@ -17,6 +17,12 @@ import com.github.klboke.kkrepo.persistence.jdbc.api.SecurityDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.TerraformRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.AssetRecord;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.RepositoryRecord;
+import com.github.klboke.kkrepo.server.RepositoryProtocolController;
+import com.github.klboke.kkrepo.server.RepositoryProtocolControllerTestSupport;
+import com.github.klboke.kkrepo.server.maven.RepositoryRuntime;
+import com.github.klboke.kkrepo.server.maven.RepositoryRuntimeRegistry;
+import com.github.klboke.kkrepo.server.pypi.PypiHostedService;
+import com.github.klboke.kkrepo.server.pypi.PypiResponse;
 import com.github.klboke.kkrepo.server.support.dao.AssetDaoAdapter;
 import com.github.klboke.kkrepo.server.support.dao.RepositoryDaoAdapter;
 import com.github.klboke.kkrepo.server.support.dao.SecurityDaoAdapter;
@@ -572,6 +578,104 @@ class RepositorySecurityFilterTest {
         request.getAttribute(RepositorySecurityFilter.NORMALIZED_REPOSITORY_PATH_ATTRIBUTE));
     assertNull(request.getAttribute(RepositorySecurityFilter.TERRAFORM_URL_TOKEN_SEGMENT_ATTRIBUTE));
     assertEquals(path, decisions.permission.pathPattern());
+  }
+
+  @Test
+  void pypiAuthorizationAndControllerReuseTheSameCanonicalPath() throws Exception {
+    String canonicalPath =
+        "packages/private/0.0.0+build/demo-0.0.0+build.whl";
+    FakeRepositoryDao repositoryDao = new FakeRepositoryDao(repository(
+        "pypi-private", RepositoryFormat.PYPI, RepositoryType.HOSTED));
+    RecordingDecisionService decisions = new RecordingDecisionService(AccessDecision.allow()) {
+      @Override
+      public AccessDecision decide(PermissionSubject subject, RepositoryPermission permission) {
+        super.decide(subject, permission);
+        return canonicalPath.equals(permission.pathPattern())
+            ? AccessDecision.allow()
+            : AccessDecision.deny("content selector denied non-canonical path");
+      }
+    };
+    RepositorySecurityFilter filter = filter(
+        new StubAuthenticationService(Optional.of(subject("alice"))),
+        decisions,
+        repositoryDao,
+        false);
+    RecordingPypiHostedService hosted = new RecordingPypiHostedService();
+    RepositoryProtocolController controller = pypiController(repositoryDao, hosted);
+    HttpServletRequest request = request(
+        "GET",
+        "/repository/pypi-private/packages/pr%69vate/0.0.0%2Bbuild/"
+            + "demo-0.0.0%2Bbuild.whl");
+
+    filter.doFilter(
+        request,
+        new MockHttpServletResponse(),
+        (filteredRequest, ignored) -> controller.get(
+            "pypi-private", (HttpServletRequest) filteredRequest));
+
+    assertEquals(canonicalPath, decisions.permission.pathPattern());
+    assertEquals(
+        canonicalPath,
+        request.getAttribute(RepositorySecurityFilter.NORMALIZED_REPOSITORY_PATH_ATTRIBUTE));
+    assertEquals(canonicalPath, hosted.requestedPath);
+  }
+
+  @Test
+  void composerAuthorizationUsesExactlyOnceCanonicalDistPath() throws Exception {
+    String canonicalPath =
+        "company/private/1.0.0/company-private-1.0.0%2Bbuild.zip";
+    RecordingDecisionService decisions = new RecordingDecisionService(AccessDecision.allow()) {
+      @Override
+      public AccessDecision decide(PermissionSubject subject, RepositoryPermission permission) {
+        super.decide(subject, permission);
+        return canonicalPath.equals(permission.pathPattern())
+            ? AccessDecision.allow()
+            : AccessDecision.deny("content selector denied non-canonical path");
+      }
+    };
+    RepositorySecurityFilter filter = filter(
+        new StubAuthenticationService(Optional.of(subject("alice"))),
+        decisions,
+        new FakeRepositoryDao(repository(
+            "composer-private", RepositoryFormat.COMPOSER, RepositoryType.HOSTED)),
+        false);
+    HttpServletRequest request = request(
+        "GET",
+        "/repository/composer-private/company/pr%69vate/1.0.0/"
+            + "company-private-1.0.0%252Bbuild.zip");
+    ChainState chain = new ChainState();
+
+    filter.doFilter(request, new MockHttpServletResponse(), chain);
+
+    assertEquals(1, chain.calls);
+    assertEquals(canonicalPath, decisions.permission.pathPattern());
+    assertEquals(
+        canonicalPath,
+        request.getAttribute(RepositorySecurityFilter.NORMALIZED_REPOSITORY_PATH_ATTRIBUTE));
+  }
+
+  @Test
+  void invalidPypiEncodingIsRejectedBeforeAuthenticationAndControllerDispatch() throws Exception {
+    StubAuthenticationService authentication =
+        new StubAuthenticationService(Optional.of(subject("alice")));
+    RepositorySecurityFilter filter = filter(
+        authentication,
+        new RecordingDecisionService(AccessDecision.allow()),
+        new FakeRepositoryDao(repository(
+            "pypi-private", RepositoryFormat.PYPI, RepositoryType.HOSTED)),
+        false);
+    ResponseState response = new ResponseState();
+    ChainState chain = new ChainState();
+
+    filter.doFilter(
+        request("GET", "/repository/pypi-private/packages/demo%2Fevil.whl"),
+        response.proxy(),
+        chain);
+
+    assertEquals(0, authentication.calls);
+    assertEquals(0, chain.calls);
+    assertEquals(HttpServletResponse.SC_BAD_REQUEST, response.status);
+    assertEquals("Invalid PyPI path segment", response.message);
   }
 
   @Test
@@ -1344,6 +1448,26 @@ class RepositorySecurityFilterTest {
         new NexusLegacyUiCompatibility(legacyUiEnabled));
   }
 
+  private static RepositoryProtocolController pypiController(
+      RepositoryDao repositoryDao,
+      PypiHostedService hosted) {
+    return RepositoryProtocolControllerTestSupport.controller(
+        new RepositoryRuntimeRegistry(repositoryDao, 0),
+        null, null, null,
+        null, null,
+        null, null,
+        null,
+        null, null, null, null, null,
+        hosted, null, null,
+        null, null, null,
+        null, null, null,
+        null, null, null,
+        null, null, null,
+        null, null, null,
+        new ObjectMapper(),
+        new ForwardedHeaderPolicy(""));
+  }
+
   private static void assertRepositoryContentAction(String method, PermissionAction action) throws Exception {
     assertRepositoryPathAction(
         repository("maven-releases"),
@@ -1407,6 +1531,13 @@ class RepositorySecurityFilterTest {
     assertCondaPutAction(path, Set.of(path), PermissionAction.EDIT);
   }
 
+  @Test
+  void rPutRequiresAddForANewPathAndEditForAnExistingPath() throws Exception {
+    String path = "src/contrib/demo_1.0.tar.gz";
+    assertRPutAction(path, Set.of(), PermissionAction.ADD);
+    assertRPutAction(path, Set.of(path), PermissionAction.EDIT);
+  }
+
   private static void assertCondaPutAction(
       String path, Set<String> existingPaths, PermissionAction expected) throws Exception {
     StubAuthenticationService authentication =
@@ -1425,6 +1556,31 @@ class RepositorySecurityFilterTest {
 
     filter.doFilter(
         request("PUT", "/repository/conda-hosted/" + path),
+        new MockHttpServletResponse(),
+        chain);
+
+    assertEquals(1, chain.calls);
+    assertEquals(expected, decisions.permission.action());
+  }
+
+  private static void assertRPutAction(
+      String path, Set<String> existingPaths, PermissionAction expected) throws Exception {
+    StubAuthenticationService authentication =
+        new StubAuthenticationService(Optional.of(subject("alice")));
+    RecordingDecisionService decisions = new RecordingDecisionService(AccessDecision.allow());
+    RepositorySecurityFilter filter = new RepositorySecurityFilter(
+        authentication,
+        decisions,
+        new FakeRepositoryDao(repository(
+            "r-hosted", RepositoryFormat.R, RepositoryType.HOSTED)),
+        new FakeAssetDao(existingPaths),
+        terraformRegistry(Set.of()),
+        new ForwardedHeaderPolicy(""),
+        new NexusLegacyUiCompatibility(false));
+    ChainState chain = new ChainState();
+
+    filter.doFilter(
+        request("PUT", "/repository/r-hosted/" + path),
         new MockHttpServletResponse(),
         chain);
 
@@ -1821,6 +1977,20 @@ class RepositorySecurityFilterTest {
               path.substring(path.lastIndexOf('/') + 1), "terraform", "application/zip", 1L,
               null, Instant.EPOCH, Map.of()))
           .toList();
+    }
+  }
+
+  private static final class RecordingPypiHostedService extends PypiHostedService {
+    private String requestedPath;
+
+    private RecordingPypiHostedService() {
+      super(null, null, null, null, null, null, null, 0);
+    }
+
+    @Override
+    public PypiResponse getPackage(RepositoryRuntime runtime, String path, boolean headOnly) {
+      requestedPath = path;
+      return PypiResponse.noBody(200);
     }
   }
 

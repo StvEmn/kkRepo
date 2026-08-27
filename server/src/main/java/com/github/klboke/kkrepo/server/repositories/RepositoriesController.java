@@ -9,8 +9,10 @@ import com.github.klboke.kkrepo.core.RepositoryRecipes;
 import com.github.klboke.kkrepo.core.RepositoryType;
 import com.github.klboke.kkrepo.persistence.jdbc.api.ConanRegistryDao;
 import com.github.klboke.kkrepo.server.apt.AptService;
+import com.github.klboke.kkrepo.server.alpine.AlpineService;
 import com.github.klboke.kkrepo.server.maven.RepositoryRuntime;
 import com.github.klboke.kkrepo.server.maven.RepositoryRuntimeRegistry;
+import com.github.klboke.kkrepo.server.r.RService;
 import com.github.klboke.kkrepo.server.security.AuthenticatedSubject;
 import com.github.klboke.kkrepo.server.security.SecurityAuthenticationService;
 import com.github.klboke.kkrepo.server.security.SecurityManagementService;
@@ -20,6 +22,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.io.IOException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -42,6 +45,8 @@ public class RepositoriesController {
   private final SecurityAuthenticationService authenticationService;
   private final SecurityManagementService securityService;
   private AptService aptService;
+  private AlpineService alpineService;
+  private RService rService;
   private ConanRegistryDao conanRegistry;
   private RepositoryRuntimeRegistry runtimeRegistry;
 
@@ -58,6 +63,19 @@ public class RepositoriesController {
   void setAptManagement(
       AptService aptService, RepositoryRuntimeRegistry runtimeRegistry) {
     this.aptService = aptService;
+    this.runtimeRegistry = runtimeRegistry;
+  }
+
+  @Autowired(required = false)
+  void setAlpineManagement(
+      AlpineService alpineService, RepositoryRuntimeRegistry runtimeRegistry) {
+    this.alpineService = alpineService;
+    this.runtimeRegistry = runtimeRegistry;
+  }
+
+  @Autowired(required = false)
+  void setRManagement(RService rService, RepositoryRuntimeRegistry runtimeRegistry) {
+    this.rService = rService;
     this.runtimeRegistry = runtimeRegistry;
   }
 
@@ -225,6 +243,95 @@ public class RepositoriesController {
         row.revision(), row.keyId(), row.fingerprint(), row.createdAt());
   }
 
+  @GetMapping("/{name}/alpine/status")
+  public AlpineService.Status alpineStatus(
+      @PathVariable("name") String name, HttpServletRequest request) {
+    AuthenticatedSubject subject = requireAuthenticated(request);
+    RepositoryView existing = requireAlpineRepository(name);
+    requireRepositoryAdmin(subject, existing.format(), existing.name(), "read");
+    return alpine().status(alpineRuntime(name));
+  }
+
+  @PostMapping("/{name}/alpine/rebuild")
+  public ResponseEntity<Void> rebuildAlpine(
+      @PathVariable("name") String name,
+      @RequestBody AlpineRebuildRequest body,
+      HttpServletRequest request) {
+    AuthenticatedSubject subject = requireAuthenticated(request);
+    RepositoryView existing = requireAlpineRepository(name);
+    requireRepositoryAdmin(subject, existing.format(), existing.name(), "edit");
+    if (body == null || body.namespace() == null || body.namespace().isBlank()) {
+      throw new RepositoryValidationException("Alpine namespace is required");
+    }
+    alpine().rebuild(alpineRuntime(name), body.namespace());
+    return ResponseEntity.noContent().build();
+  }
+
+  @PutMapping("/{name}/alpine/signing-key")
+  public AlpineService.KeyStatus rotateAlpineSigningKey(
+      @PathVariable("name") String name,
+      @RequestBody AlpineSigningKeyRequest body,
+      HttpServletRequest request) {
+    AuthenticatedSubject subject = requireAuthenticated(request);
+    RepositoryView existing = requireAlpineRepository(name);
+    requireRepositoryAdmin(subject, existing.format(), existing.name(), "edit");
+    if (body == null) {
+      throw new RepositoryValidationException("Alpine signing key request is required");
+    }
+    boolean generate = Boolean.TRUE.equals(body.generate());
+    boolean importing = body.privateKey() != null && !body.privateKey().isBlank();
+    if (generate == importing) {
+      throw new RepositoryValidationException(
+          "Provide exactly one of generate=true or an Alpine private key");
+    }
+    var row = generate
+        ? alpine().rotateGeneratedKey(alpineRuntime(name))
+        : alpine().rotateKey(
+            alpineRuntime(name), body.privateKey(), body.keyFilename(), body.signatureType());
+    return new AlpineService.KeyStatus(
+        row.revision(), row.keyFilename(), row.fingerprint(), row.signatureType(), row.createdAt());
+  }
+
+  @GetMapping("/{name}/alpine/public-key")
+  public ResponseEntity<byte[]> alpinePublicKey(
+      @PathVariable("name") String name, HttpServletRequest request) {
+    AuthenticatedSubject subject = requireAuthenticated(request);
+    RepositoryView existing = requireAlpineRepository(name);
+    requireRepositoryAdmin(subject, existing.format(), existing.name(), "read");
+    var response = alpine().publicKey(alpineRuntime(name), false);
+    try (var input = response.body()) {
+      ResponseEntity.BodyBuilder builder = ResponseEntity.status(response.status())
+          .contentLength(response.contentLength());
+      if (response.contentType() != null) {
+        builder.header("Content-Type", response.contentType());
+      }
+      response.headers().forEach(builder::header);
+      return builder.body(input == null ? new byte[0] : input.readAllBytes());
+    } catch (IOException error) {
+      throw new ResponseStatusException(
+          HttpStatus.INTERNAL_SERVER_ERROR, "Unable to read Alpine public key", error);
+    }
+  }
+
+  @GetMapping("/{name}/r/status")
+  public RService.Status rStatus(
+      @PathVariable("name") String name, HttpServletRequest request) {
+    AuthenticatedSubject subject = requireAuthenticated(request);
+    RepositoryView existing = requireRRepository(name);
+    requireRepositoryAdmin(subject, existing.format(), existing.name(), "read");
+    return r().status(repositoryRuntime(name));
+  }
+
+  @PostMapping("/{name}/r/rebuild")
+  public ResponseEntity<Void> rebuildR(
+      @PathVariable("name") String name, HttpServletRequest request) {
+    AuthenticatedSubject subject = requireAuthenticated(request);
+    RepositoryView existing = requireRRepository(name);
+    requireRepositoryAdmin(subject, existing.format(), existing.name(), "edit");
+    r().rebuild(repositoryRuntime(name));
+    return ResponseEntity.noContent().build();
+  }
+
   @ExceptionHandler(RepositoryNotFoundException.class)
   public ResponseEntity<Map<String, String>> handleNotFound(RepositoryNotFoundException e) {
     return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("message", e.getMessage()));
@@ -244,10 +351,33 @@ public class RepositoriesController {
   public record AptSigningKeyRequest(String privateKey, String passphrase, Boolean generate) {
   }
 
+  public record AlpineRebuildRequest(String namespace) {
+  }
+
+  public record AlpineSigningKeyRequest(
+      String privateKey, String keyFilename, String signatureType, Boolean generate) {
+  }
+
   private RepositoryView requireAptRepository(String name) {
     RepositoryView view = service.get(name);
     if (view.format() != RepositoryFormat.APT || view.type() == RepositoryType.GROUP) {
       throw new RepositoryValidationException("Repository is not an APT hosted/proxy repository");
+    }
+    return view;
+  }
+
+  private RepositoryView requireAlpineRepository(String name) {
+    RepositoryView view = service.get(name);
+    if (view.format() != RepositoryFormat.ALPINE) {
+      throw new RepositoryValidationException("Repository is not an Alpine repository");
+    }
+    return view;
+  }
+
+  private RepositoryView requireRRepository(String name) {
+    RepositoryView view = service.get(name);
+    if (view.format() != RepositoryFormat.R) {
+      throw new RepositoryValidationException("Repository is not an R repository");
     }
     return view;
   }
@@ -260,7 +390,41 @@ public class RepositoriesController {
     return aptService;
   }
 
+  private AlpineService alpine() {
+    if (alpineService == null) {
+      throw new ResponseStatusException(
+          HttpStatus.SERVICE_UNAVAILABLE, "Alpine repository service is unavailable");
+    }
+    return alpineService;
+  }
+
+  private RService r() {
+    if (rService == null) {
+      throw new ResponseStatusException(
+          HttpStatus.SERVICE_UNAVAILABLE, "R repository service is unavailable");
+    }
+    return rService;
+  }
+
+  private RepositoryRuntime repositoryRuntime(String name) {
+    if (runtimeRegistry == null) {
+      throw new ResponseStatusException(
+          HttpStatus.SERVICE_UNAVAILABLE, "Repository runtime registry is unavailable");
+    }
+    return runtimeRegistry.resolve(name)
+        .orElseThrow(() -> new RepositoryNotFoundException("Repository not found: " + name));
+  }
+
   private RepositoryRuntime aptRuntime(String name) {
+    if (runtimeRegistry == null) {
+      throw new ResponseStatusException(
+          HttpStatus.SERVICE_UNAVAILABLE, "Repository runtime registry is unavailable");
+    }
+    return runtimeRegistry.resolve(name)
+        .orElseThrow(() -> new RepositoryNotFoundException("Repository not found: " + name));
+  }
+
+  private RepositoryRuntime alpineRuntime(String name) {
     if (runtimeRegistry == null) {
       throw new ResponseStatusException(
           HttpStatus.SERVICE_UNAVAILABLE, "Repository runtime registry is unavailable");

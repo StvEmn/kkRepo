@@ -49,9 +49,10 @@ Docker / OCI 客户端使用 Registry HTTP API V2 路由：
 
 服务端流程：
 
-1. `RepositoryContentController` 从共享关系数据库中的仓库元数据解析 `<repo>`。
-2. 安全过滤器完成 subject 认证并校验仓库权限。
-3. 服务端根据仓库 format 和 type 分发到协议实现。
+1. 安全过滤器完成 subject 认证、仓库路径规范化和权限校验。
+2. `RepositoryProtocolController` 将已鉴权请求交给协议分派器。
+3. 分派器从共享关系数据库元数据解析 `<repo>`，并按 format、type、HTTP method 和规范化路径选择
+   `RepositoryProtocolHandler` route。
 4. hosted 仓库通过关系数据库事务和 blob storage 读写 asset 与 metadata。
 5. proxy 仓库拉取上游内容，持久化可缓存 asset，并在安全条件下使用 negative cache。
 6. group 仓库按配置顺序解析 member，并缓存可重建的 member 命中结果。
@@ -74,7 +75,7 @@ Admin UI 和 Browse UI 由 Spring Boot 服务提供静态资源：
 | `protocol-maven` | Maven 路径、metadata、layout、policy 辅助逻辑 |
 | `protocol-npm` | npm 路径和 metadata 辅助逻辑 |
 | `protocol-pypi` | PyPI 协议辅助逻辑 |
-| `protocol-go` | Go module proxy 辅助逻辑 |
+| `protocol-go` | Go module path/version 校验，以及 hosted、proxy、group 协议辅助逻辑 |
 | `protocol-helm` | Helm chart 和 index 辅助逻辑 |
 | `protocol-cargo` | Cargo sparse registry 路径、index、publish body、checksum 和错误模型辅助逻辑 |
 | `protocol-pub` | Dart Pub package name、hosted URL、路径、archive、version metadata 和错误模型辅助逻辑 |
@@ -96,9 +97,16 @@ Admin UI 和 Browse UI 由 Spring Boot 服务提供静态资源：
 | `browse-ui` | 用户侧仓库浏览器静态资源 |
 | `compat-test` | 黑盒和协议兼容性测试 |
 
-协议逻辑应位于 service 和 protocol 模块中，不应堆在 controller 里。
+协议逻辑应位于 service 和 protocol 模块中，不应堆在 controller 里。精确路径和前缀 route
+优先于兜底 route；相同优先级的冲突注册会直接失败。内置兜底 handler 在协议运行时服务逐步迁移到
+对应 protocol 模块或独立 `protocol-*-runtime` 模块期间保持现有行为。ArchUnit 测试保证 controller
+只依赖 routing SPI，并禁止 protocol 模块反向引用 `server`。
 
 ## 数据归属
+
+大型 JDBC facade 保持稳定的 API 契约，但会把独立职责委托给聚焦的 package-private collaborator。
+安全扫描的仓库范围构造、运维汇总，以及 retention/blob 引用清理已与命令 facade 分离；后续独立的
+安全扫描持久化职责应继续沿用该边界，避免 facade 再次膨胀。
 
 所选关系数据库存储：
 

@@ -21,9 +21,15 @@ public interface DatabaseDialect {
 
   ComponentPersistenceDialect components();
 
+  AlpinePersistenceDialect alpine();
+
+  RPersistenceDialect r();
+
   CondaPersistenceDialect conda();
 
   ConanPersistenceDialect conan();
+
+  HuggingFacePersistenceDialect huggingFace();
 
   /** Forward-only cursor fetch size suitable for this JDBC backend. */
   default int streamingFetchSize() {

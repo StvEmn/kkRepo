@@ -45,6 +45,7 @@
 .icon-waypoints { --lucide-icon: url("./icons/waypoints.svg"); }
 .icon-network { --lucide-icon: url("./icons/network.svg"); }
 .icon-log-in { --lucide-icon: url("./icons/log-in.svg"); }
+.icon-user-round { --lucide-icon: url("./icons/user-round.svg"); }
 .icon-user-round-x { --lucide-icon: url("./icons/user-round-x.svg"); }
 .icon-scroll-text { --lucide-icon: url("./icons/scroll-text.svg"); }
 .icon-sliders-horizontal { --lucide-icon: url("./icons/sliders-horizontal.svg"); }
@@ -67,12 +68,14 @@
 .icon-files { --lucide-icon: url("./icons/files.svg"); }
 .icon-file-archive { --lucide-icon: url("./icons/file-archive.svg"); }
 .icon-file-java-archive { --lucide-icon: url("./icons/file-java-archive.svg"); }
+.icon-file-apk { --lucide-icon: url("./icons/file-apk.svg"); }
 .icon-file-box { --lucide-icon: url("./icons/file-box.svg"); }
 .icon-file-json { --lucide-icon: url("./icons/file-json.svg"); }
 .icon-file-text { --lucide-icon: url("./icons/file-text.svg"); }
 .icon-file-key { --lucide-icon: url("./icons/file-key.svg"); }
 .icon-file-check { --lucide-icon: url("./icons/file-check.svg"); }
 .icon-binary { --lucide-icon: url("./icons/binary.svg"); }
+.icon-layers { --lucide-icon: url("./icons/layers.svg"); }
 .icon-minus { --lucide-icon: url("./icons/minus.svg"); }
 .icon-circle-slash { --lucide-icon: url("./icons/circle-slash-2.svg"); }
 .icon-list-filter { --lucide-icon: url("./icons/list-filter.svg"); }

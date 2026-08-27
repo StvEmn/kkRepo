@@ -5,12 +5,14 @@ import com.github.klboke.kkrepo.core.RepositoryFormat;
 import com.github.klboke.kkrepo.core.RepositoryType;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AnsibleGalaxyRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AptRegistryDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.AlpineRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AssetDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.BrowseNodeDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.ComponentDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.MetadataRebuildDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryIndexRebuildDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.RRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.SwiftRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.TerraformRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.AssetRecord;
@@ -21,6 +23,8 @@ import com.github.klboke.kkrepo.protocol.conda.CondaPath;
 import com.github.klboke.kkrepo.protocol.nuget.NugetPath;
 import com.github.klboke.kkrepo.protocol.nuget.NugetPathParser;
 import com.github.klboke.kkrepo.protocol.nuget.NugetPaths;
+import com.github.klboke.kkrepo.protocol.maven.path.Coordinates;
+import com.github.klboke.kkrepo.protocol.maven.path.MavenPathParser;
 import com.github.klboke.kkrepo.protocol.swift.SwiftPath;
 import com.github.klboke.kkrepo.protocol.swift.SwiftPathParser;
 import com.github.klboke.kkrepo.protocol.swift.SwiftToolsVersions;
@@ -29,6 +33,7 @@ import com.github.klboke.kkrepo.server.cache.GroupMemberAssetCache;
 import com.github.klboke.kkrepo.server.cache.NexusCacheType;
 import com.github.klboke.kkrepo.server.cache.NexusLikeCacheController;
 import com.github.klboke.kkrepo.server.apt.AptService;
+import com.github.klboke.kkrepo.server.alpine.AlpineService;
 import com.github.klboke.kkrepo.server.conda.CondaBrowsePaths;
 import com.github.klboke.kkrepo.server.conda.CondaService;
 import com.github.klboke.kkrepo.server.maven.MavenResponse;
@@ -36,6 +41,7 @@ import com.github.klboke.kkrepo.server.maven.RepositoryRuntime;
 import com.github.klboke.kkrepo.server.maven.RepositoryRuntimeRegistry;
 import com.github.klboke.kkrepo.server.npm.NpmGroupPackumentCache;
 import com.github.klboke.kkrepo.server.pypi.PypiGroupSimpleIndexCache;
+import com.github.klboke.kkrepo.server.r.RService;
 import com.github.klboke.kkrepo.server.security.AuthenticatedSubject;
 import com.github.klboke.kkrepo.server.security.SecurityAuthenticationService;
 import com.github.klboke.kkrepo.server.security.SecurityManagementService;
@@ -86,6 +92,10 @@ public class BrowseContentDeleteController {
   private RepositoryRuntimeRegistry runtimeRegistry;
   private AptRegistryDao aptRegistry;
   private AptService aptService;
+  private AlpineRegistryDao alpineRegistry;
+  private AlpineService alpineService;
+  private RRegistryDao rRegistry;
+  private RService rService;
   private CondaService condaService;
 
   public BrowseContentDeleteController(
@@ -138,6 +148,26 @@ public class BrowseContentDeleteController {
     this.runtimeRegistry = runtimeRegistry;
     this.aptRegistry = aptRegistry;
     this.aptService = aptService;
+  }
+
+  @Autowired(required = false)
+  void setAlpineDeleteSupport(
+      RepositoryRuntimeRegistry runtimeRegistry,
+      AlpineRegistryDao alpineRegistry,
+      AlpineService alpineService) {
+    this.runtimeRegistry = runtimeRegistry;
+    this.alpineRegistry = alpineRegistry;
+    this.alpineService = alpineService;
+  }
+
+  @Autowired(required = false)
+  void setRDeleteSupport(
+      RepositoryRuntimeRegistry runtimeRegistry,
+      RRegistryDao rRegistry,
+      RService rService) {
+    this.runtimeRegistry = runtimeRegistry;
+    this.rRegistry = rRegistry;
+    this.rService = rService;
   }
 
   @DeleteMapping("/{repository}")
@@ -218,6 +248,34 @@ public class BrowseContentDeleteController {
         }
         return deleteAuthorized(repository, publicPath, repository, actorId).deletedAssets();
       }
+      if (target.format() == RepositoryFormat.ALPINE) {
+        Object assetPath = component.attributes() == null
+            ? null : component.attributes().get("assetPath");
+        String publicPath = assetPath == null ? path : assetPath.toString();
+        if (publicPath == null || publicPath.isBlank()) {
+          List<AssetRecord> componentAssets = assetDao.listAssetsByComponent(component.id());
+          if (componentAssets.isEmpty()) {
+            throw new ResponseStatusException(
+                HttpStatus.NOT_FOUND, "Cleanup component has no assets: " + subjectId);
+          }
+          publicPath = componentAssets.getFirst().path();
+        }
+        return deleteAuthorized(repository, publicPath, repository, actorId).deletedAssets();
+      }
+      if (target.format() == RepositoryFormat.R) {
+        Object assetPath = component.attributes() == null
+            ? null : component.attributes().get("assetPath");
+        String publicPath = assetPath == null ? path : assetPath.toString();
+        if (publicPath == null || publicPath.isBlank()) {
+          List<AssetRecord> componentAssets = assetDao.listAssetsByComponent(component.id());
+          if (componentAssets.isEmpty()) {
+            throw new ResponseStatusException(
+                HttpStatus.NOT_FOUND, "Cleanup component has no assets: " + subjectId);
+          }
+          publicPath = componentAssets.getFirst().path();
+        }
+        return deleteAuthorized(repository, publicPath, repository, actorId).deletedAssets();
+      }
       if (target.format() == RepositoryFormat.TERRAFORM
           && "terraform-provider".equals(component.kind())) {
         terraformRegistryDao.deleteProviderVersion(
@@ -240,7 +298,9 @@ public class BrowseContentDeleteController {
           .orElseThrow(() -> new ResponseStatusException(
               HttpStatus.NOT_FOUND, "Cleanup asset was not found: " + subjectId));
       if (target.format() == RepositoryFormat.CONDA
-          || target.format() == RepositoryFormat.APT) {
+          || target.format() == RepositoryFormat.APT
+          || target.format() == RepositoryFormat.ALPINE
+          || target.format() == RepositoryFormat.R) {
         return deleteAuthorized(repository, asset.path(), repository, actorId).deletedAssets();
       }
       return deleteResolvedAssets(
@@ -281,6 +341,12 @@ public class BrowseContentDeleteController {
     if (requested.format() == RepositoryFormat.APT) {
       storagePath = aptStoragePath(requested, publicPath);
     }
+    if (requested.format() == RepositoryFormat.ALPINE) {
+      storagePath = alpineStoragePath(requested, publicPath);
+    }
+    if (requested.format() == RepositoryFormat.R) {
+      storagePath = rStoragePath(requested, publicPath);
+    }
     String resolvedSourceRepository = sourceRepository;
     if (requested.format() == RepositoryFormat.TERRAFORM) {
       Optional<TerraformBrowseAssetPathResolver.ResolvedStoragePath> resolved =
@@ -307,6 +373,14 @@ public class BrowseContentDeleteController {
     if (target.format() == RepositoryFormat.APT
         && target.type() == RepositoryType.HOSTED) {
       return deleteAptPackage(requested, target, publicPath, storagePath, actorId);
+    }
+    if (target.format() == RepositoryFormat.ALPINE
+        && target.type() == RepositoryType.HOSTED) {
+      return deleteAlpinePackage(requested, target, publicPath, storagePath, actorId);
+    }
+    if (target.format() == RepositoryFormat.R
+        && target.type() == RepositoryType.HOSTED) {
+      return deleteRPackage(requested, target, publicPath, storagePath, actorId);
     }
     List<AssetRecord> assets = matchingAssets(target, storagePath);
     if (assets.isEmpty()) {
@@ -451,6 +525,94 @@ public class BrowseContentDeleteController {
             repository.id(), segments[0], segments[1], segments[2], segments[3], segments[4])
         .filter(record -> segments[5].equals(record.filename()))
         .map(AptRegistryDao.PackageRecord::path)
+        .orElse(publicPath);
+  }
+
+  private BrowseDeleteResult deleteAlpinePackage(
+      RepositoryRecord requested,
+      RepositoryRecord target,
+      String publicPath,
+      String storagePath,
+      String actorId) {
+    if (runtimeRegistry == null || alpineService == null) {
+      throw new ResponseStatusException(
+          HttpStatus.SERVICE_UNAVAILABLE, "Alpine delete service is unavailable");
+    }
+    RepositoryRuntime runtime = runtimeRegistry.resolveById(target.id())
+        .filter(candidate -> candidate.format() == RepositoryFormat.ALPINE
+            && candidate.type() == RepositoryType.HOSTED)
+        .orElseThrow(() -> new ResponseStatusException(
+            HttpStatus.CONFLICT, "Alpine repository runtime is unavailable"));
+    MavenResponse response = alpineService.delete(
+        runtime, storagePath, "administrative delete by " + actorId, false);
+    if (response.status() == 404) {
+      throw new ResponseStatusException(
+          HttpStatus.NOT_FOUND, "Alpine package state was not found");
+    }
+    if (response.status() != 204) {
+      throw new ResponseStatusException(
+          HttpStatus.CONFLICT, "Alpine package could not be deleted");
+    }
+    return new BrowseDeleteResult(requested.name(), target.name(), publicPath, 1);
+  }
+
+  private String alpineStoragePath(RepositoryRecord repository, String publicPath) {
+    if (alpineRegistry == null) return publicPath;
+    Optional<AlpineRegistryDao.PackageRecord> direct =
+        alpineRegistry.findPackageByPath(repository.id(), publicPath);
+    if (direct.isPresent()) return direct.orElseThrow().path();
+    String[] segments = publicPath.split("/", -1);
+    if (segments.length != 6) return publicPath;
+    String namespace;
+    try {
+      namespace = AlpineRegistryDao.namespace(segments[0], segments[1], segments[2]);
+    } catch (IllegalArgumentException invalid) {
+      return publicPath;
+    }
+    return alpineRegistry.findPackage(
+            repository.id(), namespace, segments[1], segments[3], segments[4], segments[2])
+        .filter(record -> segments[5].equals(record.filename()))
+        .map(AlpineRegistryDao.PackageRecord::path)
+        .orElse(publicPath);
+  }
+
+  private BrowseDeleteResult deleteRPackage(
+      RepositoryRecord requested,
+      RepositoryRecord target,
+      String publicPath,
+      String storagePath,
+      String actorId) {
+    if (runtimeRegistry == null || rService == null) {
+      throw new ResponseStatusException(
+          HttpStatus.SERVICE_UNAVAILABLE, "R delete service is unavailable");
+    }
+    RepositoryRuntime runtime = runtimeRegistry.resolveById(target.id())
+        .filter(candidate -> candidate.format() == RepositoryFormat.R
+            && candidate.type() == RepositoryType.HOSTED)
+        .orElseThrow(() -> new ResponseStatusException(
+            HttpStatus.CONFLICT, "R repository runtime is unavailable"));
+    MavenResponse response = rService.delete(
+        runtime, storagePath, "administrative delete by " + actorId, false);
+    if (response.status() == 404) {
+      throw new ResponseStatusException(HttpStatus.NOT_FOUND, "R package state was not found");
+    }
+    if (response.status() != 204) {
+      throw new ResponseStatusException(HttpStatus.CONFLICT, "R package could not be deleted");
+    }
+    return new BrowseDeleteResult(requested.name(), target.name(), publicPath, 1);
+  }
+
+  private String rStoragePath(RepositoryRecord repository, String publicPath) {
+    if (rRegistry == null) return publicPath;
+    Optional<RRegistryDao.PackageRecord> direct =
+        rRegistry.findPackageByPath(repository.id(), publicPath);
+    if (direct.isPresent()) return direct.orElseThrow().path();
+    String[] segments = publicPath.split("/", -1);
+    if (segments.length != 3) return publicPath;
+    return rRegistry.findPackage(
+            repository.id(), "src/contrib", "source", segments[0], segments[1], "source")
+        .filter(record -> segments[2].equals(record.filename()))
+        .map(RRegistryDao.PackageRecord::path)
         .orElse(publicPath);
   }
 
@@ -718,7 +880,7 @@ public class BrowseContentDeleteController {
     if (target.type() != RepositoryType.HOSTED || target.format() != RepositoryFormat.MAVEN2) {
       return;
     }
-    MavenCoordinates coordinates = mavenCoordinates(storagePath);
+    MavenCoordinates coordinates = mavenCoordinates(target.id(), storagePath);
     if (coordinates == null) {
       return;
     }
@@ -767,11 +929,22 @@ public class BrowseContentDeleteController {
     return null;
   }
 
-  private MavenCoordinates mavenCoordinates(String path) {
+  private static final MavenPathParser MAVEN_PATH_PARSER = new MavenPathParser();
+
+  private MavenCoordinates mavenCoordinates(long repositoryId, String path) {
     String normalized = isMavenHash(path)
         ? path.substring(0, path.lastIndexOf('.'))
         : path;
-    String[] segments = normalized.split("/");
+    Coordinates coordinates = MAVEN_PATH_PARSER.parsePath(normalized).coordinates();
+    if (coordinates != null) {
+      return new MavenCoordinates(
+          coordinates.groupId(), coordinates.artifactId(), coordinates.baseVersion());
+    }
+    return mavenDirectoryOrMetadataCoordinates(repositoryId, normalized);
+  }
+
+  private MavenCoordinates mavenDirectoryOrMetadataCoordinates(long repositoryId, String path) {
+    String[] segments = path.split("/");
     if (segments.length < 3) {
       return null;
     }
@@ -782,30 +955,30 @@ public class BrowseContentDeleteController {
       if (groupSegments.isEmpty()) {
         return null;
       }
-      return new MavenCoordinates(String.join(".", groupSegments), artifactId, "");
+      MavenCoordinates gaCoordinates =
+          new MavenCoordinates(String.join(".", groupSegments), artifactId, "");
+      // A V-level metadata path can also look like A-level metadata when the artifactId itself
+      // ends with SNAPSHOT. Preserve an existing GA; otherwise follow Maven's snapshot directory
+      // layout and treat the parent segment as the base version.
+      if (segments.length >= 4
+          && artifactId.endsWith("SNAPSHOT")
+          && componentDao.listByGa(
+                  repositoryId, gaCoordinates.groupId(), gaCoordinates.artifactId())
+              .isEmpty()) {
+        String version = artifactId;
+        artifactId = segments[segments.length - 3];
+        groupSegments = List.of(segments).subList(0, segments.length - 3);
+        return new MavenCoordinates(String.join(".", groupSegments), artifactId, version);
+      }
+      return gaCoordinates;
     }
-
-    boolean assetPath = looksLikeMavenAssetPath(segments);
-    String version = assetPath ? segments[segments.length - 2] : segments[segments.length - 1];
-    String artifactId = assetPath ? segments[segments.length - 3] : segments[segments.length - 2];
-    List<String> groupSegments = assetPath
-        ? List.of(segments).subList(0, segments.length - 3)
-        : List.of(segments).subList(0, segments.length - 2);
+    String version = segments[segments.length - 1];
+    String artifactId = segments[segments.length - 2];
+    List<String> groupSegments = List.of(segments).subList(0, segments.length - 2);
     if (groupSegments.isEmpty()) {
       return null;
     }
     return new MavenCoordinates(String.join(".", groupSegments), artifactId, version);
-  }
-
-  private boolean looksLikeMavenAssetPath(String[] segments) {
-    if (segments.length < 4) {
-      return false;
-    }
-    String filename = segments[segments.length - 1];
-    String version = segments[segments.length - 2];
-    String artifactId = segments[segments.length - 3];
-    return filename.startsWith(artifactId + "-" + version + ".")
-        || filename.startsWith(artifactId + "-" + version + "-");
   }
 
   private static String toStoragePath(RepositoryFormat format, String publicPath) {

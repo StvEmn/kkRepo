@@ -53,6 +53,9 @@ let securityPrivileges = [];
 let securityRealms = [];
 let securityLdap = null;
 let securityOidc = null;
+const SECURITY_PROVIDER_SECRET_MASK = "********";
+let securityProviderJsonSyncing = false;
+const securityProviderAttributes = { ldap: {}, oidc: {} };
 let securityAnonymous = null;
 let securityApiKeys = [];
 let securityScanState = {
@@ -404,6 +407,21 @@ const repositoryRequiredFields = [
     id: "repository-apt-architectures",
     label: "APT architectures",
     required: () => currentRecipe()?.format === "apt"
+  },
+  {
+    id: "repository-alpine-distributions",
+    label: "Alpine distributions",
+    required: () => currentRecipe()?.format === "alpine"
+  },
+  {
+    id: "repository-alpine-channels",
+    label: "Alpine channels",
+    required: () => currentRecipe()?.format === "alpine"
+  },
+  {
+    id: "repository-alpine-architectures",
+    label: "Alpine architectures",
+    required: () => currentRecipe()?.format === "alpine"
   }
 ];
 const securityUserRequiredFields = [
@@ -442,7 +460,8 @@ const securityAnonymousRequiredFields = [
   { id: "security-anonymous-realm-name", label: "Realm name" }
 ];
 const uiSettingsRequiredFields = [
-  { id: "ui-default-language", label: "Default language" }
+  { id: "ui-default-language", label: "Default language" },
+  { id: "ui-default-theme", label: "Default theme" }
 ];
 const nexusMigrationRequiredFields = [
   { id: "migration-source-url", label: "Source URL" },
@@ -494,6 +513,9 @@ const FORMAT_ICON_NAMES = Object.freeze({
   conda: "conda",
   conan: "conan",
   apt: "apt",
+  alpine: "alpine",
+  r: "r",
+  huggingface: "huggingface",
   raw: "raw",
 });
 
@@ -516,6 +538,9 @@ const FORMAT_DISPLAY_NAMES = Object.freeze({
   conda: "Conda",
   conan: "Conan 2",
   apt: "APT / Debian",
+  alpine: "Alpine / APK",
+  r: "R / CRAN",
+  huggingface: "Hugging Face Models",
   raw: "Raw",
 });
 
@@ -744,12 +769,23 @@ function updateSessionControls(session) {
   currentSession = session || null;
   const signedIn = Boolean(currentSession?.userId);
   const userMenu = document.getElementById("user-menu");
-  const currentUserPill = document.getElementById("current-user-pill");
+  const userMenuTrigger = document.getElementById("user-menu-trigger");
+  const currentUser = document.getElementById("current-user");
+  const userMenuName = document.getElementById("user-menu-name");
+  const userMenuSource = document.getElementById("user-menu-source");
   userMenu.hidden = !signedIn;
   if (!signedIn) closeUserMenu();
   if (signedIn) {
-    const source = currentSession.source ? `${displaySource(currentSession.source)}/` : "";
-    currentUserPill.textContent = `${source}${currentSession.userId}`;
+    const userId = String(currentSession.userId);
+    const source = displaySource(currentSession.source).trim();
+    const sourceLabel = accountSourceLabel(source);
+    const qualifiedUser = source ? `${source}/${userId}` : userId;
+
+    currentUser.textContent = userId;
+    userMenuName.textContent = userId;
+    userMenuSource.textContent = sourceLabel;
+    userMenuTrigger.title = `Account menu for ${qualifiedUser}`;
+    userMenuTrigger.setAttribute("aria-label", `Account menu for ${qualifiedUser}`);
     sessionStorage.setItem(AUTH_SNAPSHOT_KEY, JSON.stringify({
       session: currentSession,
       permissions: ["nexus:*"],
@@ -862,6 +898,12 @@ function displaySource(source) {
   return source == null ? "" : String(source);
 }
 
+function accountSourceLabel(source) {
+  const value = displaySource(source).trim();
+  if (!value) return "Authenticated account";
+  return `${value.charAt(0).toUpperCase()}${value.slice(1)} account`;
+}
+
 function commaList(value) {
   return String(value || "")
     .split(",")
@@ -888,9 +930,237 @@ function parseJsonObject(id) {
   } catch (error) {
     input.classList.add("is-invalid");
     input.setAttribute("aria-invalid", "true");
+    input.closest("details")?.setAttribute("open", "");
     showToast(`Invalid JSON: ${error.message}`, "error");
     throw error;
   }
+}
+
+function editableSecurityProviderAttributes(attributes, excludedKeys = []) {
+  const editable = { ...(attributes || {}) };
+  delete editable.source;
+  delete editable.nexusRealm;
+  excludedKeys.forEach((key) => delete editable[key]);
+  return editable;
+}
+
+function securityProviderJsonScalar(value, fallback = "") {
+  return typeof value === "string" || typeof value === "number" ? value : fallback;
+}
+
+function securityProviderJsonNumber(value, fallback = "") {
+  if (value == null || value === "") return fallback;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function securityProviderJsonBoolean(value, fallback = false) {
+  if (value == null) return fallback;
+  if (typeof value === "boolean") return value;
+  if (value === "true") return true;
+  if (value === "false") return false;
+  return fallback;
+}
+
+function setSecurityProviderSecretFromJson(id, value) {
+  if (value === SECURITY_PROVIDER_SECRET_MASK) return;
+  setInputValue(id, securityProviderJsonScalar(value));
+}
+
+function securityLdapFormValue({ attributes = securityProviderAttributes.ldap, maskSecrets = true } = {}) {
+  const authPassword = textInputValue("security-ldap-auth-password");
+  return {
+    enabled: document.getElementById("security-ldap-enabled").checked,
+    priority: numberInputValue("security-ldap-priority") ?? 10,
+    source: "LDAP",
+    url: textInputValue("security-ldap-url"),
+    protocol: textInputValue("security-ldap-protocol") || "ldap",
+    host: textInputValue("security-ldap-host"),
+    port: numberInputValue("security-ldap-port"),
+    useTrustStore: document.getElementById("security-ldap-trust-store").checked,
+    searchBase: textInputValue("security-ldap-search-base"),
+    authScheme: textInputValue("security-ldap-auth-scheme"),
+    authRealm: textInputValue("security-ldap-auth-realm"),
+    authUsername: textInputValue("security-ldap-auth-username"),
+    authPassword: maskSecrets && authPassword ? SECURITY_PROVIDER_SECRET_MASK : authPassword,
+    connectionTimeout: numberInputValue("security-ldap-connection-timeout"),
+    connectionRetryDelay: numberInputValue("security-ldap-retry-delay"),
+    maxIncidentsCount: numberInputValue("security-ldap-max-incidents"),
+    userBaseDn: textInputValue("security-ldap-user-base-dn"),
+    userSubtree: document.getElementById("security-ldap-user-subtree").checked,
+    userObjectClass: textInputValue("security-ldap-user-object-class"),
+    userLdapFilter: textInputValue("security-ldap-user-filter"),
+    userIdAttribute: textInputValue("security-ldap-user-id-attribute"),
+    userRealNameAttribute: textInputValue("security-ldap-user-real-name-attribute"),
+    userMemberOfAttribute: textInputValue("security-ldap-user-member-of-attribute"),
+    userEmailAddressAttribute: textInputValue("security-ldap-user-email-attribute"),
+    userPasswordAttribute: textInputValue("security-ldap-user-password-attribute"),
+    ldapGroupsAsRoles: document.getElementById("security-ldap-groups-as-roles").checked,
+    groupType: textInputValue("security-ldap-group-type"),
+    groupBaseDn: textInputValue("security-ldap-group-base-dn"),
+    groupSubtree: document.getElementById("security-ldap-group-subtree").checked,
+    groupIdAttribute: textInputValue("security-ldap-group-id-attribute"),
+    groupMemberAttribute: textInputValue("security-ldap-group-member-attribute"),
+    groupMemberFormat: textInputValue("security-ldap-group-member-format"),
+    groupObjectClass: textInputValue("security-ldap-group-object-class"),
+    attributes
+  };
+}
+
+function securityOidcFormValue({ attributes = securityProviderAttributes.oidc, maskSecrets = true } = {}) {
+  const clientSecret = textInputValue("security-oidc-client-secret");
+  return {
+    enabled: document.getElementById("security-oidc-enabled").checked,
+    priority: numberInputValue("security-oidc-priority") ?? 20,
+    source: "OIDC",
+    issuer: textInputValue("security-oidc-issuer"),
+    jwksUri: textInputValue("security-oidc-jwks-uri"),
+    audience: textInputValue("security-oidc-audience"),
+    clientId: textInputValue("security-oidc-client-id"),
+    clientSecret: maskSecrets && clientSecret ? SECURITY_PROVIDER_SECRET_MASK : clientSecret,
+    authorizationEndpoint: textInputValue("security-oidc-authorization-endpoint"),
+    tokenEndpoint: textInputValue("security-oidc-token-endpoint"),
+    redirectUri: textInputValue("security-oidc-redirect-uri"),
+    scopes: textInputValue("security-oidc-scopes"),
+    userIdClaim: textInputValue("security-oidc-user-id-claim"),
+    firstNameClaim: textInputValue("security-oidc-first-name-claim"),
+    lastNameClaim: textInputValue("security-oidc-last-name-claim"),
+    emailClaim: textInputValue("security-oidc-email-claim"),
+    groupsClaim: textInputValue("security-oidc-groups-claim"),
+    rolesClaim: textInputValue("security-oidc-roles-claim"),
+    clockSkewSeconds: numberInputValue("security-oidc-clock-skew") ?? 60,
+    jwksCacheSeconds: numberInputValue("security-oidc-jwks-cache") ?? 300,
+    attributes
+  };
+}
+
+function applySecurityLdapJsonValue(value) {
+  setCheckboxValue("security-ldap-enabled", securityProviderJsonBoolean(value.enabled));
+  setInputValue("security-ldap-priority", securityProviderJsonNumber(value.priority, 10));
+  setInputValue("security-ldap-url", securityProviderJsonScalar(value.url));
+  setSelectValue("security-ldap-protocol", securityProviderJsonScalar(value.protocol), "ldap");
+  setInputValue("security-ldap-host", securityProviderJsonScalar(value.host));
+  setInputValue("security-ldap-port", securityProviderJsonNumber(value.port));
+  setCheckboxValue("security-ldap-trust-store", securityProviderJsonBoolean(value.useTrustStore));
+  setInputValue("security-ldap-search-base", securityProviderJsonScalar(value.searchBase));
+  setInputValue("security-ldap-auth-scheme", securityProviderJsonScalar(value.authScheme, "simple"));
+  setInputValue("security-ldap-auth-realm", securityProviderJsonScalar(value.authRealm));
+  setInputValue("security-ldap-auth-username", securityProviderJsonScalar(value.authUsername));
+  setSecurityProviderSecretFromJson("security-ldap-auth-password", value.authPassword);
+  setInputValue("security-ldap-connection-timeout", securityProviderJsonNumber(value.connectionTimeout, 30));
+  setInputValue("security-ldap-retry-delay", securityProviderJsonNumber(value.connectionRetryDelay));
+  setInputValue("security-ldap-max-incidents", securityProviderJsonNumber(value.maxIncidentsCount));
+  setInputValue("security-ldap-user-base-dn", securityProviderJsonScalar(value.userBaseDn));
+  setCheckboxValue("security-ldap-user-subtree", securityProviderJsonBoolean(value.userSubtree, true));
+  setInputValue("security-ldap-user-object-class", securityProviderJsonScalar(value.userObjectClass, "inetOrgPerson"));
+  setInputValue("security-ldap-user-filter", securityProviderJsonScalar(value.userLdapFilter));
+  setInputValue("security-ldap-user-id-attribute", securityProviderJsonScalar(value.userIdAttribute, "uid"));
+  setInputValue("security-ldap-user-real-name-attribute", securityProviderJsonScalar(value.userRealNameAttribute, "cn"));
+  setInputValue("security-ldap-user-member-of-attribute", securityProviderJsonScalar(value.userMemberOfAttribute, "memberOf"));
+  setInputValue("security-ldap-user-email-attribute", securityProviderJsonScalar(value.userEmailAddressAttribute, "mail"));
+  setInputValue("security-ldap-user-password-attribute", securityProviderJsonScalar(value.userPasswordAttribute, "userPassword"));
+  setCheckboxValue("security-ldap-groups-as-roles", securityProviderJsonBoolean(value.ldapGroupsAsRoles, true));
+  setSelectValue("security-ldap-group-type", securityProviderJsonScalar(value.groupType), "static");
+  setInputValue("security-ldap-group-base-dn", securityProviderJsonScalar(value.groupBaseDn));
+  setCheckboxValue("security-ldap-group-subtree", securityProviderJsonBoolean(value.groupSubtree, true));
+  setInputValue("security-ldap-group-id-attribute", securityProviderJsonScalar(value.groupIdAttribute, "cn"));
+  setInputValue("security-ldap-group-member-attribute", securityProviderJsonScalar(value.groupMemberAttribute, "member"));
+  setInputValue("security-ldap-group-member-format", securityProviderJsonScalar(value.groupMemberFormat, "${dn}"));
+  setInputValue("security-ldap-group-object-class", securityProviderJsonScalar(value.groupObjectClass, "groupOfNames"));
+  const attributes = value.attributes && !Array.isArray(value.attributes) && typeof value.attributes === "object"
+    ? editableSecurityProviderAttributes(value.attributes, ["name"])
+    : {};
+  securityProviderAttributes.ldap = attributes;
+  clearRequiredFieldErrors(ldapRequiredFields);
+  refreshSecurityLdapRequiredMarkers();
+}
+
+function applySecurityOidcJsonValue(value) {
+  setCheckboxValue("security-oidc-enabled", securityProviderJsonBoolean(value.enabled));
+  setInputValue("security-oidc-priority", securityProviderJsonNumber(value.priority, 20));
+  setInputValue("security-oidc-issuer", securityProviderJsonScalar(value.issuer ?? value.issuerUri));
+  setInputValue("security-oidc-jwks-uri", securityProviderJsonScalar(value.jwksUri));
+  setInputValue("security-oidc-audience", securityProviderJsonScalar(value.audience));
+  setInputValue("security-oidc-client-id", securityProviderJsonScalar(value.clientId));
+  setSecurityProviderSecretFromJson("security-oidc-client-secret", value.clientSecret);
+  setInputValue("security-oidc-authorization-endpoint", securityProviderJsonScalar(value.authorizationEndpoint));
+  setInputValue("security-oidc-token-endpoint", securityProviderJsonScalar(value.tokenEndpoint));
+  setInputValue("security-oidc-redirect-uri", securityProviderJsonScalar(value.redirectUri));
+  setInputValue("security-oidc-scopes", securityProviderJsonScalar(value.scopes, "openid profile email"));
+  setInputValue("security-oidc-user-id-claim", securityProviderJsonScalar(value.userIdClaim, "preferred_username"));
+  setInputValue("security-oidc-first-name-claim", securityProviderJsonScalar(value.firstNameClaim, "given_name"));
+  setInputValue("security-oidc-last-name-claim", securityProviderJsonScalar(value.lastNameClaim, "family_name"));
+  setInputValue("security-oidc-email-claim", securityProviderJsonScalar(value.emailClaim, "email"));
+  setInputValue("security-oidc-groups-claim", securityProviderJsonScalar(value.groupsClaim, "groups"));
+  setInputValue("security-oidc-roles-claim", securityProviderJsonScalar(value.rolesClaim, "roles"));
+  setInputValue("security-oidc-clock-skew", securityProviderJsonNumber(value.clockSkewSeconds, 60));
+  setInputValue("security-oidc-jwks-cache", securityProviderJsonNumber(value.jwksCacheSeconds, 300));
+  const attributes = value.attributes && !Array.isArray(value.attributes) && typeof value.attributes === "object"
+    ? editableSecurityProviderAttributes(value.attributes)
+    : {};
+  securityProviderAttributes.oidc = attributes;
+  clearRequiredFieldErrors(oidcRequiredFields);
+  refreshSecurityOidcRequiredMarkers();
+}
+
+function setSecurityProviderJsonStatus(provider, state, text) {
+  const status = document.getElementById(`security-${provider}-json-status`);
+  status.dataset.state = state;
+  status.textContent = text;
+}
+
+function syncSecurityProviderJsonFromForm(provider, { force = false } = {}) {
+  if (securityProviderJsonSyncing) return;
+  const editor = document.getElementById(`security-${provider}-json-editor`);
+  if (!force && document.activeElement === editor) return;
+  const value = provider === "ldap" ? securityLdapFormValue() : securityOidcFormValue();
+  editor.value = JSON.stringify(value, null, 2);
+  editor.classList.remove("is-invalid");
+  editor.setAttribute("aria-invalid", "false");
+  editor.removeAttribute("title");
+  setSecurityProviderJsonStatus(provider, "synced", "Synced");
+}
+
+function applySecurityProviderJsonEditor(provider) {
+  const editor = document.getElementById(`security-${provider}-json-editor`);
+  try {
+    const value = JSON.parse(editor.value);
+    if (!value || Array.isArray(value) || typeof value !== "object") {
+      throw new Error("JSON must be an object");
+    }
+    securityProviderJsonSyncing = true;
+    if (provider === "ldap") {
+      applySecurityLdapJsonValue(value);
+    } else {
+      applySecurityOidcJsonValue(value);
+    }
+    editor.classList.remove("is-invalid");
+    editor.setAttribute("aria-invalid", "false");
+    editor.removeAttribute("title");
+    setSecurityProviderJsonStatus(provider, "synced", "Synced");
+    return true;
+  } catch (error) {
+    editor.classList.add("is-invalid");
+    editor.setAttribute("aria-invalid", "true");
+    editor.title = error.message;
+    setSecurityProviderJsonStatus(provider, "error", "Waiting for valid JSON");
+    return false;
+  } finally {
+    securityProviderJsonSyncing = false;
+  }
+}
+
+function bindSecurityProviderJson(provider) {
+  const form = document.getElementById(`security-${provider}-form`);
+  const editor = document.getElementById(`security-${provider}-json-editor`);
+  form.addEventListener("input", () => syncSecurityProviderJsonFromForm(provider));
+  form.addEventListener("change", () => syncSecurityProviderJsonFromForm(provider));
+  editor.addEventListener("input", () => applySecurityProviderJsonEditor(provider));
+  editor.addEventListener("blur", () => {
+    if (applySecurityProviderJsonEditor(provider)) {
+      syncSecurityProviderJsonFromForm(provider, { force: true });
+    }
+  });
 }
 
 function markInputValidity(input, invalid) {
@@ -2129,8 +2399,12 @@ function refreshRepositoryRecipeControls() {
   document.getElementById("repository-conan-operations").hidden =
     format !== "conan" || repositoryFormMode !== "edit";
   document.getElementById("repository-apt-fields").hidden = format !== "apt";
+  document.getElementById("repository-alpine-fields").hidden = format !== "alpine";
   document.getElementById("repository-swift-proxy-note").hidden =
     !(format === "swift" && type === "PROXY");
+  const pypiIndexPathVisible = format === "pypi" && type === "PROXY";
+  document.getElementById("repository-pypi-index-path-field").hidden =
+    !pypiIndexPathVisible;
   const minimumReleaseAgeVisible = format === "npm" && type === "PROXY";
   document.getElementById("repository-minimum-release-age-field").hidden =
     !minimumReleaseAgeVisible;
@@ -2138,6 +2412,7 @@ function refreshRepositoryRecipeControls() {
     !minimumReleaseAgeVisible;
   refreshDockerConnectorControls();
   refreshAptControls();
+  refreshAlpineControls();
   document.getElementById("repository-blobstore").closest("label").hidden = false;
   refreshRepositoryBlobStoreLock();
   document.querySelectorAll("#repository-hosted-fields .maven-only").forEach((el) => {
@@ -2171,7 +2446,10 @@ function refreshRepositoryRemoteDefaults(recipe) {
     ansiblegalaxy: "https://galaxy.ansible.com/",
     conda: "https://repo.anaconda.com/pkgs/main/",
     conan: "https://center2.conan.io/",
-    apt: "https://deb.debian.org/debian/"
+    apt: "https://deb.debian.org/debian/",
+    alpine: "https://dl-cdn.alpinelinux.org/alpine/",
+    r: "https://cloud.r-project.org/",
+    huggingface: "https://huggingface.co/"
   };
   if (recipe.format === "swift") {
     remote.value = defaults.swift;
@@ -2202,6 +2480,26 @@ function refreshAptControls() {
   document.getElementById("repository-apt-label").disabled = !hosted && mode.value !== "RESIGN";
   document.getElementById("repository-apt-operations").hidden =
     !apt || repositoryFormMode !== "edit";
+  updateRequiredMarkers(repositoryRequiredFields);
+}
+
+function refreshAlpineControls() {
+  const recipe = currentRecipe();
+  const alpine = recipe?.format === "alpine";
+  const proxy = alpine && recipe?.type === "PROXY";
+  const locallySigned = alpine && !proxy;
+  const mode = document.getElementById("repository-alpine-metadata-mode");
+  if (locallySigned) mode.value = "RESIGN";
+  mode.disabled = locallySigned;
+  const resignProxy = proxy && mode.value === "RESIGN";
+  document.getElementById("repository-alpine-verify-field").hidden = !proxy;
+  document.getElementById("repository-alpine-stale-field").hidden = !proxy;
+  document.getElementById("repository-alpine-upstream-key-field").hidden = !resignProxy;
+  if (locallySigned || resignProxy) {
+    document.getElementById("repository-alpine-verify-upstream").checked = true;
+  }
+  document.getElementById("repository-alpine-operations").hidden =
+    !alpine || repositoryFormMode !== "edit";
   updateRequiredMarkers(repositoryRequiredFields);
 }
 
@@ -2322,6 +2620,113 @@ async function generateAptSigningKey() {
   }
 }
 
+async function loadAlpineStatus(name = editingRepositoryName) {
+  if (!name) return;
+  const output = document.getElementById("repository-alpine-status");
+  output.textContent = "Loading Alpine status…";
+  try {
+    const response = await fetch(
+      `/internal/repositories/${encodeURIComponent(name)}/alpine/status`);
+    if (!response.ok) throw new Error(await responseErrorMessage(response));
+    const status = await response.json();
+    const key = status.activeKey
+      ? `${status.activeKey.filename} · ${status.activeKey.fingerprint} · revision ${status.activeKey.revision}`
+      : "no active signing key";
+    const namespaces = Array.isArray(status.namespaces) && status.namespaces.length
+      ? status.namespaces.map((item) => {
+        const failure = item.lastError ? `, last error: ${item.lastError}` : "";
+        return `${item.namespace}: ${item.publishedRevision}/${item.desiredRevision}${failure}`;
+      }).join("; ")
+      : "no signed index snapshot published";
+    const proxies = Array.isArray(status.proxyNamespaces) && status.proxyNamespaces.length
+      ? status.proxyNamespaces.map((item) =>
+        `${item.namespace}: ${item.signatureVerified ? "verified" : "unverified"}`).join("; ")
+      : "";
+    output.textContent = `Key: ${key}. Namespaces: ${namespaces}.${proxies ? ` Upstream: ${proxies}.` : ""}`;
+  } catch (error) {
+    output.textContent = `Unable to load Alpine status: ${error.message}`;
+  }
+}
+
+function firstAlpineNamespace() {
+  const first = (id, fallback) => document.getElementById(id).value
+    .split(",").map((value) => value.trim()).filter(Boolean)[0] || fallback;
+  return [
+    first("repository-alpine-distributions", "v3.23"),
+    first("repository-alpine-channels", "main"),
+    first("repository-alpine-architectures", "x86_64")
+  ].join("/");
+}
+
+async function rebuildAlpineMetadata() {
+  if (!editingRepositoryName) return;
+  const namespace = firstAlpineNamespace();
+  showToast(`Rebuilding Alpine index ${namespace}…`);
+  try {
+    const response = await fetch(
+      `/internal/repositories/${encodeURIComponent(editingRepositoryName)}/alpine/rebuild`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ namespace })
+      });
+    if (!response.ok) throw new Error(await responseErrorMessage(response));
+    showToast("Alpine index rebuilt.", "success");
+    await loadAlpineStatus();
+  } catch (error) {
+    showToast(error.message || "Alpine index rebuild failed.", "error");
+  }
+}
+
+async function rotateAlpineSigningKey(generate = false) {
+  if (!editingRepositoryName) return;
+  const privateKey = document.getElementById("repository-alpine-private-key").value.trim();
+  if (!generate && !privateKey) {
+    showToast("Paste a PKCS#8 RSA private key first.", "error");
+    return;
+  }
+  if (generate && !window.confirm(
+      "Generate a new Alpine signing key and republish every known index?")) return;
+  showToast(generate ? "Generating Alpine signing key…" : "Importing Alpine signing key…");
+  try {
+    const response = await fetch(
+      `/internal/repositories/${encodeURIComponent(editingRepositoryName)}/alpine/signing-key`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          generate,
+          privateKey: generate ? null : privateKey,
+          keyFilename: document.getElementById("repository-alpine-key-filename").value.trim(),
+          signatureType: document.getElementById("repository-alpine-signature-type").value
+        })
+      });
+    if (!response.ok) throw new Error(await responseErrorMessage(response));
+    document.getElementById("repository-alpine-private-key").value = "";
+    showToast("Alpine signing key rotated and indexes republished.", "success");
+    await loadAlpineStatus();
+  } catch (error) {
+    showToast(error.message || "Alpine signing key rotation failed.", "error");
+  }
+}
+
+async function downloadAlpinePublicKey() {
+  if (!editingRepositoryName) return;
+  try {
+    const response = await fetch(
+      `/internal/repositories/${encodeURIComponent(editingRepositoryName)}/alpine/public-key`);
+    if (!response.ok) throw new Error(await responseErrorMessage(response));
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = document.getElementById("repository-alpine-key-filename").value.trim()
+      || `${editingRepositoryName}.rsa.pub`;
+    link.click();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    showToast(error.message || "Alpine public key download failed.", "error");
+  }
+}
+
 function repositoryFormPayload() {
   const recipe = currentRecipe();
   const type = recipe ? recipe.type : null;
@@ -2344,8 +2749,11 @@ function repositoryFormPayload() {
     const content = document.getElementById("repository-content-max-age").value;
     const metadata = document.getElementById("repository-metadata-max-age").value;
     const minimumReleaseAge = document.getElementById("repository-minimum-release-age").value;
+    const allowedRedirectHosts = document.getElementById("repository-allowed-redirect-hosts").value
+      .split(",").map((value) => value.trim()).filter(Boolean);
     payload.proxy = {
       remoteUrl: document.getElementById("repository-remote-url").value.trim(),
+      allowedRedirectHosts,
       contentMaxAgeMinutes: content === "" ? null : Number(content),
       metadataMaxAgeMinutes: metadata === "" ? null : Number(metadata),
       minimumReleaseAgeMinutes: recipe.format === "npm"
@@ -2368,6 +2776,11 @@ function repositoryFormPayload() {
       outboundProxyPasswordConfigured:
         document.getElementById("repository-outbound-proxy-password-clear").checked ? false : null
     };
+    if (recipe.format === "pypi") {
+      payload.pypi = {
+        indexPath: document.getElementById("repository-pypi-index-path").value.trim()
+      };
+    }
   } else if (type === "GROUP") {
     payload.group = {
       memberNames: [...memberTransfer.selected]
@@ -2404,6 +2817,25 @@ function repositoryFormPayload() {
       label: document.getElementById("repository-apt-label").value.trim()
     };
   }
+  if (recipe?.format === "alpine") {
+    const list = (id) => document.getElementById(id).value
+      .split(",").map((value) => value.trim()).filter(Boolean);
+    const upstreamKey = document.getElementById(
+      "repository-alpine-upstream-public-key").value.trim();
+    payload.alpine = {
+      distributions: list("repository-alpine-distributions"),
+      channels: list("repository-alpine-channels"),
+      architectures: list("repository-alpine-architectures"),
+      metadataMode: document.getElementById("repository-alpine-metadata-mode").value,
+      verifyUpstreamSignatures:
+        document.getElementById("repository-alpine-verify-upstream").checked,
+      staleIfError: document.getElementById("repository-alpine-stale-if-error").checked,
+      keyFilename: document.getElementById("repository-alpine-key-filename").value.trim(),
+      signatureType: document.getElementById("repository-alpine-signature-type").value,
+      description: document.getElementById("repository-alpine-description").value.trim(),
+      upstreamPublicKeys: upstreamKey ? [upstreamKey] : []
+    };
+  }
   return payload;
 }
 
@@ -2415,6 +2847,8 @@ function setRepositoryFormDefaults() {
   document.getElementById("repository-version-policy").value = "RELEASE";
   document.getElementById("repository-layout-policy").value = "STRICT";
   document.getElementById("repository-remote-url").value = "";
+  document.getElementById("repository-pypi-index-path").value = "/simple";
+  document.getElementById("repository-allowed-redirect-hosts").value = "";
   document.getElementById("repository-remote-username").value = "";
   document.getElementById("repository-remote-password").value = "";
   document.getElementById("repository-remote-password").placeholder = "";
@@ -2449,6 +2883,18 @@ function setRepositoryFormDefaults() {
   document.getElementById("repository-apt-private-key").value = "";
   document.getElementById("repository-apt-key-passphrase").value = "";
   document.getElementById("repository-apt-status").textContent = "APT status not loaded.";
+  document.getElementById("repository-alpine-distributions").value = "v3.23";
+  document.getElementById("repository-alpine-channels").value = "main";
+  document.getElementById("repository-alpine-architectures").value = "x86_64, aarch64";
+  document.getElementById("repository-alpine-metadata-mode").value = "PASSTHROUGH";
+  document.getElementById("repository-alpine-verify-upstream").checked = false;
+  document.getElementById("repository-alpine-stale-if-error").checked = true;
+  document.getElementById("repository-alpine-key-filename").value = "kkrepo-alpine.rsa.pub";
+  document.getElementById("repository-alpine-signature-type").value = "RSA";
+  document.getElementById("repository-alpine-description").value = "kkRepo Alpine repository";
+  document.getElementById("repository-alpine-upstream-public-key").value = "";
+  document.getElementById("repository-alpine-private-key").value = "";
+  document.getElementById("repository-alpine-status").textContent = "Alpine status not loaded.";
   memberTransfer.selected = [];
   memberTransfer.highlight.available.clear();
   memberTransfer.highlight.selected.clear();
@@ -2516,6 +2962,8 @@ function showEditRepositoryForm(name) {
   }
   if (repo.proxy) {
     document.getElementById("repository-remote-url").value = repo.proxy.remoteUrl || "";
+    document.getElementById("repository-allowed-redirect-hosts").value =
+      Array.isArray(repo.proxy.allowedRedirectHosts) ? repo.proxy.allowedRedirectHosts.join(", ") : "";
     document.getElementById("repository-remote-username").value = repo.proxy.remoteUsername || "";
     document.getElementById("repository-remote-password").value = "";
     document.getElementById("repository-remote-password").placeholder =
@@ -2543,6 +2991,8 @@ function showEditRepositoryForm(name) {
       repo.proxy.minimumReleaseAgeMinutes ?? "0";
     document.getElementById("repository-auto-block").checked = repo.proxy.autoBlock !== false;
   }
+  document.getElementById("repository-pypi-index-path").value =
+    repo.pypi?.indexPath ?? "/simple";
   if (repo.type === "GROUP" && repo.group && Array.isArray(repo.group.memberNames)) {
     memberTransfer.selected = [...repo.group.memberNames];
   }
@@ -2570,9 +3020,34 @@ function showEditRepositoryForm(name) {
     document.getElementById("repository-apt-origin").value = repo.apt.origin || "kkRepo";
     document.getElementById("repository-apt-label").value = repo.apt.label || "kkRepo";
   }
+  if (repo.alpine) {
+    document.getElementById("repository-alpine-distributions").value =
+      Array.isArray(repo.alpine.distributions) ? repo.alpine.distributions.join(", ") : "v3.23";
+    document.getElementById("repository-alpine-channels").value =
+      Array.isArray(repo.alpine.channels) ? repo.alpine.channels.join(", ") : "main";
+    document.getElementById("repository-alpine-architectures").value =
+      Array.isArray(repo.alpine.architectures)
+        ? repo.alpine.architectures.join(", ") : "x86_64, aarch64";
+    document.getElementById("repository-alpine-metadata-mode").value =
+      repo.alpine.metadataMode || (repo.type === "PROXY" ? "PASSTHROUGH" : "RESIGN");
+    document.getElementById("repository-alpine-verify-upstream").checked =
+      Boolean(repo.alpine.verifyUpstreamSignatures);
+    document.getElementById("repository-alpine-stale-if-error").checked =
+      repo.alpine.staleIfError !== false;
+    document.getElementById("repository-alpine-key-filename").value =
+      repo.alpine.keyFilename || `${repo.name}.rsa.pub`;
+    document.getElementById("repository-alpine-signature-type").value =
+      repo.alpine.signatureType || "RSA";
+    document.getElementById("repository-alpine-description").value =
+      repo.alpine.description || "kkRepo Alpine repository";
+    document.getElementById("repository-alpine-upstream-public-key").value =
+      Array.isArray(repo.alpine.upstreamPublicKeys)
+        ? (repo.alpine.upstreamPublicKeys[0] || "") : "";
+  }
   refreshRepositoryRecipeControls();
   if (repo.format === "conan") loadConanStatus(repo.name);
   if (repo.format === "apt") loadAptStatus(repo.name);
+  if (repo.format === "alpine") loadAlpineStatus(repo.name);
   clearRequiredFieldErrors(repositoryRequiredFields);
   openFormModal("repository-form", "repository-online");
 }
@@ -2974,28 +3449,68 @@ async function fetchJson(path, fallback, errorLabel) {
   }
 }
 
-function uiLanguageLabel(language) {
-  if (language === "zh-CN") return "Chinese";
-  if (language === "en") return "English";
-  return "Follow browser";
+function uiThemeLabel(theme) {
+  if (theme === "default") return "Default";
+  if (theme === "jfrog") return "JFrog";
+  return String(theme || "")
+    .split("-")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function syncUiThemePreviewStatus() {
+  const settings = window.kkrepoI18n?.settings?.();
+  const themeSelect = document.getElementById("ui-default-theme");
+  const previewStatus = document.getElementById("ui-theme-preview-status");
+  if (!settings || !themeSelect || !previewStatus) return;
+  previewStatus.hidden = themeSelect.value === (settings.defaultTheme || "default");
+}
+
+function previewUiTheme() {
+  const settings = window.kkrepoI18n?.settings?.();
+  const themeSelect = document.getElementById("ui-default-theme");
+  if (!settings || !themeSelect || !window.kkrepoTheme) return;
+  themeSelect.value = window.kkrepoTheme.applyTheme(
+    themeSelect.value,
+    settings.supportedDefaultThemes);
+  syncUiThemePreviewStatus();
 }
 
 function syncUiSettingsForm() {
   const settings = window.kkrepoI18n?.settings?.();
-  const select = document.getElementById("ui-default-language");
-  if (select && settings) {
-    select.value = settings.defaultLanguage || "en";
+  const languageSelect = document.getElementById("ui-default-language");
+  const themeSelect = document.getElementById("ui-default-theme");
+  const previewStatus = document.getElementById("ui-theme-preview-status");
+  const previewTheme = themeSelect && previewStatus && !previewStatus.hidden
+    ? themeSelect.value
+    : null;
+  if (languageSelect && settings) {
+    languageSelect.value = settings.defaultLanguage || "en";
   }
+  if (themeSelect && settings) {
+    const themes = settings.supportedDefaultThemes?.length
+      ? settings.supportedDefaultThemes
+      : ["default"];
+    const savedTheme = settings.defaultTheme || "default";
+    const hasPreview = previewTheme
+      && themes.includes(previewTheme)
+      && previewTheme !== savedTheme;
+    themeSelect.replaceChildren(...themes.map((theme) => {
+      const option = document.createElement("option");
+      option.value = theme;
+      option.textContent = uiThemeLabel(theme);
+      return option;
+    }));
+    themeSelect.value = hasPreview ? previewTheme : savedTheme;
+    if (hasPreview) {
+      // Loading persisted settings applies their theme before dispatching the
+      // change event, so restore the administrator's unsaved preview here.
+      window.kkrepoTheme?.applyTheme(themeSelect.value, themes);
+    }
+  }
+  syncUiThemePreviewStatus();
   clearRequiredFieldErrors(uiSettingsRequiredFields);
-  updateUiSettingsStatus();
-}
-
-function updateUiSettingsStatus() {
-  const status = document.getElementById("ui-settings-status");
-  if (!status || !window.kkrepoI18n) return;
-  const defaultLanguage = window.kkrepoI18n.defaultLanguage();
-  const currentLanguage = window.kkrepoI18n.currentLanguage();
-  status.textContent = `Default language: ${uiLanguageLabel(defaultLanguage)}. Active language: ${uiLanguageLabel(currentLanguage)}.`;
 }
 
 async function loadUiSettings() {
@@ -3006,14 +3521,15 @@ async function loadUiSettings() {
 
 async function saveUiSettings() {
   const button = document.getElementById("save-ui-settings-button");
-  const select = document.getElementById("ui-default-language");
-  if (!button || !select || !window.kkrepoI18n) return;
+  const languageSelect = document.getElementById("ui-default-language");
+  const themeSelect = document.getElementById("ui-default-theme");
+  if (!button || !languageSelect || !themeSelect || !window.kkrepoI18n) return;
   if (!validateRequiredFields(uiSettingsRequiredFields)) return;
   button.disabled = true;
   try {
-    await window.kkrepoI18n.saveDefaultLanguage(select.value);
+    await window.kkrepoI18n.saveSettings(languageSelect.value, themeSelect.value);
     syncUiSettingsForm();
-    showToast("UI language settings saved.", "ok");
+    showToast("UI settings saved.", "ok");
   } catch (error) {
     showToast(`Save failed: ${error.message}`, "error");
   } finally {
@@ -3388,7 +3904,6 @@ async function loadSecurityLdap() {
       enabled: false,
       priority: 10,
       source: "LDAP",
-      name: "LDAP",
       protocol: "ldap",
       authScheme: "simple",
       connectionTimeout: 30,
@@ -3417,8 +3932,6 @@ function renderSecurityLdap() {
   clearRequiredFieldErrors(ldapRequiredFields);
   setCheckboxValue("security-ldap-enabled", settings.enabled);
   setInputValue("security-ldap-priority", Number(settings.priority ?? 10));
-  setInputValue("security-ldap-source", settings.source, "LDAP");
-  setInputValue("security-ldap-name", settings.name, "LDAP");
   setSelectValue("security-ldap-protocol", settings.protocol, "ldap");
   setInputValue("security-ldap-host", settings.host);
   setInputValue("security-ldap-port", settings.port);
@@ -3449,8 +3962,9 @@ function renderSecurityLdap() {
   setInputValue("security-ldap-group-member-attribute", settings.groupMemberAttribute, "member");
   setInputValue("security-ldap-group-member-format", settings.groupMemberFormat, "${dn}");
   setInputValue("security-ldap-group-object-class", settings.groupObjectClass, "groupOfNames");
-  document.getElementById("security-ldap-attributes").value = JSON.stringify(settings.attributes || {}, null, 2);
+  securityProviderAttributes.ldap = editableSecurityProviderAttributes(settings.attributes, ["name"]);
   refreshSecurityLdapRequiredMarkers();
+  syncSecurityProviderJsonFromForm("ldap", { force: true });
 }
 
 function refreshSecurityLdapRequiredMarkers() {
@@ -3491,51 +4005,7 @@ async function saveSecurityLdap() {
   if (!validateSecurityLdapRequiredFields()) {
     return;
   }
-  let attributes;
-  try {
-    attributes = parseJsonObject("security-ldap-attributes");
-  } catch (_) {
-    return;
-  }
-  const url = textInputValue("security-ldap-url");
-  const host = textInputValue("security-ldap-host");
-  const payload = {
-    enabled: document.getElementById("security-ldap-enabled").checked,
-    priority: numberInputValue("security-ldap-priority") ?? 10,
-    source: textInputValue("security-ldap-source") || "LDAP",
-    name: textInputValue("security-ldap-name") || "LDAP",
-    url,
-    protocol: textInputValue("security-ldap-protocol") || "ldap",
-    host,
-    port: numberInputValue("security-ldap-port"),
-    useTrustStore: document.getElementById("security-ldap-trust-store").checked,
-    searchBase: textInputValue("security-ldap-search-base"),
-    authScheme: textInputValue("security-ldap-auth-scheme"),
-    authRealm: textInputValue("security-ldap-auth-realm"),
-    authUsername: textInputValue("security-ldap-auth-username"),
-    authPassword: textInputValue("security-ldap-auth-password"),
-    connectionTimeout: numberInputValue("security-ldap-connection-timeout"),
-    connectionRetryDelay: numberInputValue("security-ldap-retry-delay"),
-    maxIncidentsCount: numberInputValue("security-ldap-max-incidents"),
-    userBaseDn: textInputValue("security-ldap-user-base-dn"),
-    userSubtree: document.getElementById("security-ldap-user-subtree").checked,
-    userObjectClass: textInputValue("security-ldap-user-object-class"),
-    userLdapFilter: textInputValue("security-ldap-user-filter"),
-    userIdAttribute: textInputValue("security-ldap-user-id-attribute"),
-    userRealNameAttribute: textInputValue("security-ldap-user-real-name-attribute"),
-    userMemberOfAttribute: textInputValue("security-ldap-user-member-of-attribute"),
-    userEmailAddressAttribute: textInputValue("security-ldap-user-email-attribute"),
-    userPasswordAttribute: textInputValue("security-ldap-user-password-attribute"),
-    ldapGroupsAsRoles: document.getElementById("security-ldap-groups-as-roles").checked,
-    groupType: textInputValue("security-ldap-group-type"),
-    groupBaseDn: textInputValue("security-ldap-group-base-dn"),
-    groupSubtree: document.getElementById("security-ldap-group-subtree").checked,
-    groupIdAttribute: textInputValue("security-ldap-group-id-attribute"),
-    groupMemberAttribute: textInputValue("security-ldap-group-member-attribute"),
-    groupMemberFormat: textInputValue("security-ldap-group-member-format"),
-    groupObjectClass: textInputValue("security-ldap-group-object-class"),
-    attributes
-  };
+  const payload = securityLdapFormValue({ maskSecrets: false });
   try {
     const response = await fetch("/internal/security/ldap", {
       method: "PUT",
@@ -3580,7 +4050,6 @@ function renderSecurityOidc() {
   });
   document.getElementById("security-oidc-enabled").checked = Boolean(settings.enabled);
   document.getElementById("security-oidc-priority").value = Number(settings.priority ?? 20);
-  document.getElementById("security-oidc-source").value = settings.source || "OIDC";
   document.getElementById("security-oidc-issuer").value = settings.issuerUri || settings.issuer || "";
   document.getElementById("security-oidc-jwks-uri").value = settings.jwksUri || "";
   document.getElementById("security-oidc-audience").value = settings.audience || "";
@@ -3598,8 +4067,9 @@ function renderSecurityOidc() {
   document.getElementById("security-oidc-roles-claim").value = settings.rolesClaim || "roles";
   document.getElementById("security-oidc-clock-skew").value = Number(settings.clockSkewSeconds ?? 60);
   document.getElementById("security-oidc-jwks-cache").value = Number(settings.jwksCacheSeconds ?? 300);
-  document.getElementById("security-oidc-attributes").value = JSON.stringify(settings.attributes || {}, null, 2);
+  securityProviderAttributes.oidc = editableSecurityProviderAttributes(settings.attributes);
   refreshSecurityOidcRequiredMarkers();
+  syncSecurityProviderJsonFromForm("oidc", { force: true });
 }
 
 function refreshSecurityOidcRequiredMarkers() {
@@ -3644,37 +4114,8 @@ async function saveSecurityOidc() {
   if (!validateSecurityOidcRequiredFields()) {
     return;
   }
-  let attributes;
-  try {
-    attributes = parseJsonObject("security-oidc-attributes");
-  } catch (_) {
-    return;
-  }
-  const jwksUri = document.getElementById("security-oidc-jwks-uri").value.trim();
-  const payload = {
-    enabled: document.getElementById("security-oidc-enabled").checked,
-    priority: Number(document.getElementById("security-oidc-priority").value || 20),
-    source: document.getElementById("security-oidc-source").value.trim() || "OIDC",
-    issuer: document.getElementById("security-oidc-issuer").value.trim() || null,
-    issuerUri: document.getElementById("security-oidc-issuer").value.trim() || null,
-    jwksUri: jwksUri || null,
-    audience: document.getElementById("security-oidc-audience").value.trim() || null,
-    clientId: document.getElementById("security-oidc-client-id").value.trim() || null,
-    clientSecret: document.getElementById("security-oidc-client-secret").value.trim() || null,
-    authorizationEndpoint: document.getElementById("security-oidc-authorization-endpoint").value.trim() || null,
-    tokenEndpoint: document.getElementById("security-oidc-token-endpoint").value.trim() || null,
-    redirectUri: document.getElementById("security-oidc-redirect-uri").value.trim() || null,
-    scopes: document.getElementById("security-oidc-scopes").value.trim() || null,
-    userIdClaim: document.getElementById("security-oidc-user-id-claim").value.trim() || null,
-    firstNameClaim: document.getElementById("security-oidc-first-name-claim").value.trim() || null,
-    lastNameClaim: document.getElementById("security-oidc-last-name-claim").value.trim() || null,
-    emailClaim: document.getElementById("security-oidc-email-claim").value.trim() || null,
-    groupsClaim: document.getElementById("security-oidc-groups-claim").value.trim() || null,
-    rolesClaim: document.getElementById("security-oidc-roles-claim").value.trim() || null,
-    clockSkewSeconds: Number(document.getElementById("security-oidc-clock-skew").value || 60),
-    jwksCacheSeconds: Number(document.getElementById("security-oidc-jwks-cache").value || 300),
-    attributes
-  };
+  const payload = securityOidcFormValue({ maskSecrets: false });
+  payload.issuerUri = payload.issuer;
   try {
     const response = await fetch("/internal/security/oidc", {
       method: "PUT",
@@ -7053,6 +7494,10 @@ document.getElementById("user-menu-trigger").addEventListener("click", (event) =
   event.stopPropagation();
   toggleUserMenu();
 });
+document.getElementById("my-token-menu-item").addEventListener("click", () => {
+  closeUserMenu();
+  window.location.href = "/browse/#browse/my-token";
+});
 document.getElementById("signout-button").addEventListener("click", () => {
   closeUserMenu();
   sessionStorage.removeItem(AUTH_SNAPSHOT_KEY);
@@ -7115,6 +7560,12 @@ document.getElementById("repository-apt-refresh-status").addEventListener("click
 document.getElementById("repository-apt-rebuild").addEventListener("click", rebuildAptMetadata);
 document.getElementById("repository-apt-rotate-key").addEventListener("click", rotateAptSigningKey);
 document.getElementById("repository-apt-generate-key").addEventListener("click", generateAptSigningKey);
+document.getElementById("repository-alpine-metadata-mode").addEventListener("change", refreshAlpineControls);
+document.getElementById("repository-alpine-refresh-status").addEventListener("click", () => loadAlpineStatus());
+document.getElementById("repository-alpine-rebuild").addEventListener("click", rebuildAlpineMetadata);
+document.getElementById("repository-alpine-rotate-key").addEventListener("click", () => rotateAlpineSigningKey(false));
+document.getElementById("repository-alpine-generate-key").addEventListener("click", () => rotateAlpineSigningKey(true));
+document.getElementById("repository-alpine-download-key").addEventListener("click", downloadAlpinePublicKey);
 bindRequiredFieldErrors(repositoryRequiredFields);
 bindMemberTransferEvents();
 bindSecurityTransfers();
@@ -7396,6 +7847,7 @@ ldapRequiredFields.forEach((field) => {
   input.addEventListener("input", clearSecurityLdapRequiredErrors);
   input.addEventListener("change", clearSecurityLdapRequiredErrors);
 });
+bindSecurityProviderJson("ldap");
 document.getElementById("save-security-oidc-button").addEventListener("click", saveSecurityOidc);
 document.getElementById("security-oidc-form").addEventListener("submit", (event) => {
   event.preventDefault();
@@ -7407,6 +7859,7 @@ oidcRequiredFields.forEach((field) => {
     markInputValidity(event.target, false);
   });
 });
+bindSecurityProviderJson("oidc");
 document.getElementById("save-security-anonymous-button").addEventListener("click", saveSecurityAnonymous);
 document.getElementById("security-anonymous-form").addEventListener("submit", (event) => {
   event.preventDefault();
@@ -7418,6 +7871,7 @@ document.getElementById("ui-settings-form").addEventListener("submit", (event) =
   event.preventDefault();
   saveUiSettings();
 });
+document.getElementById("ui-default-theme").addEventListener("change", previewUiTheme);
 bindRequiredFieldErrors(uiSettingsRequiredFields);
 window.addEventListener("kkrepo:i18n-change", syncUiSettingsForm);
 

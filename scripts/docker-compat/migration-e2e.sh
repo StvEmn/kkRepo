@@ -6,6 +6,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 NEXUS_URL="${NEXUS_COMPAT_BASE_URL:-http://localhost:28090}"
 NEXUS_REPOSITORY="${DOCKER_MIGRATION_NEXUS_REPOSITORY:-docker-hosted}"
+GO_NEXUS_REPOSITORY="${GO_MIGRATION_NEXUS_REPOSITORY:-go-hosted}"
 CARGO_NEXUS_REPOSITORY="${CARGO_MIGRATION_NEXUS_REPOSITORY:-cargo-hosted}"
 PUB_NEXUS_REPOSITORY="${PUB_MIGRATION_NEXUS_REPOSITORY:-pub-hosted}"
 COMPOSER_NEXUS_REPOSITORY="${COMPOSER_MIGRATION_NEXUS_REPOSITORY:-composer-proxy}"
@@ -22,6 +23,12 @@ CONDA_NEXUS_REPOSITORY="${CONDA_MIGRATION_NEXUS_REPOSITORY:-conda-hosted}"
 CONDA_PROXY_NEXUS_REPOSITORY="${CONDA_PROXY_MIGRATION_NEXUS_REPOSITORY:-conda-proxy}"
 CONDA_GROUP_NEXUS_REPOSITORY="${CONDA_GROUP_MIGRATION_NEXUS_REPOSITORY:-conda-group}"
 APT_NEXUS_REPOSITORY="${APT_MIGRATION_NEXUS_REPOSITORY:-apt-hosted}"
+ALPINE_NEXUS_REPOSITORY="${ALPINE_MIGRATION_NEXUS_REPOSITORY:-alpine-migration-hosted}"
+ALPINE_PROXY_NEXUS_REPOSITORY="${ALPINE_PROXY_MIGRATION_NEXUS_REPOSITORY:-alpine-migration-proxy}"
+ALPINE_GROUP_NEXUS_REPOSITORY="${ALPINE_GROUP_MIGRATION_NEXUS_REPOSITORY:-alpine-migration-group}"
+R_NEXUS_REPOSITORY="${R_MIGRATION_NEXUS_REPOSITORY:-r-migration-hosted}"
+R_PROXY_NEXUS_REPOSITORY="${R_PROXY_MIGRATION_NEXUS_REPOSITORY:-r-migration-proxy}"
+R_GROUP_NEXUS_REPOSITORY="${R_GROUP_MIGRATION_NEXUS_REPOSITORY:-r-migration-group}"
 NEXUS_USER="${NEXUS_COMPAT_USERNAME:-admin}"
 NEXUS_PASSWORD="${NEXUS_COMPAT_PASSWORD:-Admin1234}"
 
@@ -29,6 +36,7 @@ KKREPO_URL="${KKREPO_COMPAT_BASE_URL:-http://127.0.0.1:18090}"
 KKREPO_HEALTH_URL="${KKREPO_MANAGEMENT_URL:-http://127.0.0.1:18091}/actuator/health"
 KKREPO_DOCKER_REGISTRY="${DOCKER_MIGRATION_KKREPO_REGISTRY:-127.0.0.1:18183}"
 KKREPO_REPOSITORY="${DOCKER_MIGRATION_KKREPO_REPOSITORY:-docker-hosted}"
+GO_KKREPO_REPOSITORY="${GO_MIGRATION_KKREPO_REPOSITORY:-go-hosted}"
 CARGO_KKREPO_REPOSITORY="${CARGO_MIGRATION_KKREPO_REPOSITORY:-cargo-hosted}"
 PUB_KKREPO_REPOSITORY="${PUB_MIGRATION_KKREPO_REPOSITORY:-pub-hosted}"
 COMPOSER_KKREPO_REPOSITORY="${COMPOSER_MIGRATION_KKREPO_REPOSITORY:-composer-proxy}"
@@ -45,6 +53,12 @@ CONDA_KKREPO_REPOSITORY="${CONDA_MIGRATION_KKREPO_REPOSITORY:-conda-hosted}"
 CONDA_PROXY_KKREPO_REPOSITORY="${CONDA_PROXY_MIGRATION_KKREPO_REPOSITORY:-conda-proxy}"
 CONDA_GROUP_KKREPO_REPOSITORY="${CONDA_GROUP_MIGRATION_KKREPO_REPOSITORY:-conda-group}"
 APT_KKREPO_REPOSITORY="${APT_MIGRATION_KKREPO_REPOSITORY:-apt-hosted}"
+ALPINE_KKREPO_REPOSITORY="${ALPINE_MIGRATION_KKREPO_REPOSITORY:-alpine-migration-hosted}"
+ALPINE_PROXY_KKREPO_REPOSITORY="${ALPINE_PROXY_MIGRATION_KKREPO_REPOSITORY:-alpine-migration-proxy}"
+ALPINE_GROUP_KKREPO_REPOSITORY="${ALPINE_GROUP_MIGRATION_KKREPO_REPOSITORY:-alpine-migration-group}"
+R_KKREPO_REPOSITORY="${R_MIGRATION_KKREPO_REPOSITORY:-r-migration-hosted}"
+R_PROXY_KKREPO_REPOSITORY="${R_PROXY_MIGRATION_KKREPO_REPOSITORY:-r-migration-proxy}"
+R_GROUP_KKREPO_REPOSITORY="${R_GROUP_MIGRATION_KKREPO_REPOSITORY:-r-migration-group}"
 KKREPO_SECONDARY_URL="${KKREPO_MIGRATION_SECONDARY_URL:-}"
 KKREPO_TARGET_DATABASE="${KKREPO_MIGRATION_TARGET_DATABASE:-mysql}"
 KKREPO_TARGET_DATABASE_SERVICE="${KKREPO_MIGRATION_TARGET_DATABASE_SERVICE:-mysql}"
@@ -63,6 +77,13 @@ IMAGE="${DOCKER_MIGRATION_IMAGE:-kkrepo-migration/e2e}"
 TAG="${DOCKER_MIGRATION_TAG:-$(date +%Y%m%d%H%M%S)}"
 TAG_SAFE="${TAG//[^A-Za-z0-9_]/_}"
 TAG_SAFE_LC="$(printf '%s' "$TAG_SAFE" | tr '[:upper:]' '[:lower:]')"
+GO_MIGRATION_ENABLED="${GO_MIGRATION_ENABLED:-false}"
+GO_MODULE="${GO_MIGRATION_MODULE:-example.com/kkrepo/migration-${TAG_SAFE_LC}}"
+GO_VERSION="${GO_MIGRATION_VERSION:-v1.2.3}"
+GO_FIXTURE_WORKDIR=""
+GO_FIXTURE_ARCHIVE=""
+GO_FIXTURE_SHA256=""
+GO_FIXTURE_MARKER="kkRepo Go Nexus migration E2E $TAG_SAFE_LC"
 CARGO_CRATE="${CARGO_MIGRATION_CRATE:-kkrepo_migration_e2e_${TAG_SAFE}}"
 CARGO_VERSION="${CARGO_MIGRATION_VERSION:-0.1.0}"
 PUB_PACKAGE="${PUB_MIGRATION_PACKAGE:-kkrepo_migration_e2e_${TAG_SAFE_LC}}"
@@ -126,6 +147,41 @@ APT_FIXTURE_PRIVATE_KEY="$APT_FIXTURE_WORKDIR/private.asc"
 APT_FIXTURE_PUBLIC_KEY="$APT_FIXTURE_WORKDIR/public.asc"
 APT_FIXTURE_SHA256=""
 APT_FIXTURE_PACKAGE_PATH=""
+ALPINE_MIGRATION_ENABLED="${ALPINE_MIGRATION_ENABLED:-false}"
+ALPINE_BASE_PACKAGE="${ALPINE_MIGRATION_BASE_PACKAGE:-kkrepo-alpine-migration-base-${TAG_SAFE_LC}}"
+ALPINE_APP_PACKAGE="${ALPINE_MIGRATION_APP_PACKAGE:-kkrepo-alpine-migration-app-${TAG_SAFE_LC}}"
+ALPINE_VERSION="${ALPINE_MIGRATION_VERSION:-1.2.3-r0}"
+ALPINE_DISTRIBUTION="${ALPINE_MIGRATION_DISTRIBUTION:-v3.23}"
+ALPINE_CHANNEL="${ALPINE_MIGRATION_CHANNEL:-main}"
+ALPINE_ARCHITECTURE="${ALPINE_MIGRATION_ARCHITECTURE:-x86_64}"
+ALPINE_CLIENT_IMAGE="${ALPINE_MIGRATION_CLIENT_IMAGE:-alpine:3.23}"
+ALPINE_FIXTURE_WORKDIR=""
+ALPINE_FIXTURE_PRIVATE_KEY=""
+ALPINE_FIXTURE_PUBLIC_KEY=""
+ALPINE_FIXTURE_KEY_FILENAME=""
+ALPINE_PACKAGE_KEY_FILENAME="kkrepo-alpine-migration.rsa.pub"
+ALPINE_BASE_ARCHIVE=""
+ALPINE_APP_ARCHIVE=""
+ALPINE_BASE_SHA256=""
+ALPINE_APP_SHA256=""
+ALPINE_BASE_MESSAGE="kkRepo Alpine migration dependency $TAG_SAFE_LC"
+ALPINE_APP_MESSAGE="kkRepo Alpine migration application $TAG_SAFE_LC"
+R_MIGRATION_ENABLED="${R_MIGRATION_ENABLED:-false}"
+R_MIGRATION_UPSTREAM_CONTAINER="${R_MIGRATION_UPSTREAM_CONTAINER:-${COMPOSE_PROJECT_NAME:-kkrepo-compat}-r-upstream}"
+R_MIGRATION_UPSTREAM_URL="${R_MIGRATION_UPSTREAM_URL:-http://${R_MIGRATION_UPSTREAM_CONTAINER}:8080/}"
+R_TAG_ALNUM="$(printf '%s' "$TAG_SAFE" | tr -cd 'A-Za-z0-9' | cut -c1-24)"
+R_BASE_PACKAGE="${R_MIGRATION_BASE_PACKAGE:-kkrepoRmigrationbase${R_TAG_ALNUM}}"
+R_APP_PACKAGE="${R_MIGRATION_APP_PACKAGE:-kkrepoRmigrationapp${R_TAG_ALNUM}}"
+R_BASE_VERSION="${R_MIGRATION_BASE_VERSION:-1.0.0}"
+R_APP_OLD_VERSION="${R_MIGRATION_APP_OLD_VERSION:-1.0.0}"
+R_APP_VERSION="${R_MIGRATION_APP_VERSION:-1.1.0}"
+R_CLIENT_IMAGES="${R_MIGRATION_CLIENT_IMAGES:-4.5.3=r-base:4.5.3,4.6.1=r-base:4.6.1}"
+R_FIXTURE_WORKDIR=""
+R_BASE_ARCHIVE=""
+R_APP_OLD_ARCHIVE=""
+R_APP_ARCHIVE=""
+R_APP_SHA256=""
+R_APP_MESSAGE="kkRepo R migration application $TAG_SAFE_LC"
 TERRAFORM_PROXY_PROVIDER_NAMESPACE="${TERRAFORM_PROXY_PROVIDER_NAMESPACE:-hashicorp}"
 TERRAFORM_PROXY_PROVIDER_NAME="${TERRAFORM_PROXY_PROVIDER_NAME:-null}"
 TERRAFORM_PROXY_PROVIDER_VERSION="${TERRAFORM_PROXY_PROVIDER_VERSION:-3.2.4}"
@@ -265,6 +321,9 @@ header_value() {
 }
 
 cleanup() {
+  if [[ -n "$GO_FIXTURE_WORKDIR" ]]; then
+    rm -rf "$GO_FIXTURE_WORKDIR"
+  fi
   if [[ -n "$SWIFT_FIXTURE_WORKDIR" ]]; then
     rm -rf "$SWIFT_FIXTURE_WORKDIR"
   fi
@@ -290,6 +349,15 @@ cleanup() {
       rm -f "$APT_FIXTURE_ARCHIVE"
     fi
     rmdir "$APT_FIXTURE_WORKDIR" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$ALPINE_FIXTURE_WORKDIR" ]]; then
+    rm -rf "$ALPINE_FIXTURE_WORKDIR"
+  fi
+  if [[ -n "$R_FIXTURE_WORKDIR" ]]; then
+    rm -rf "$R_FIXTURE_WORKDIR"
+  fi
+  if [[ "$R_MIGRATION_ENABLED" == "true" ]]; then
+    docker rm -f "$R_MIGRATION_UPSTREAM_CONTAINER" >/dev/null 2>&1 || true
   fi
 }
 
@@ -383,6 +451,16 @@ cargo_migration_enabled() {
     || "${NEXUS_COMPAT_IMAGE:-}" == *3.77* ]]
 }
 
+go_migration_enabled() {
+  [[ "$GO_MIGRATION_ENABLED" == "true" ]]
+}
+
+source_go_available() {
+  curl -m 20 -fsS \
+    -u "$NEXUS_USER:$NEXUS_PASSWORD" \
+    "$NEXUS_URL/service/rest/v1/repositories/go/hosted/$GO_NEXUS_REPOSITORY" >/dev/null 2>&1
+}
+
 cargo_index_path() {
   local crate="$1"
   python3 - "$crate" <<'PY'
@@ -456,6 +534,14 @@ conda_migration_enabled() {
 
 apt_migration_enabled() {
   [[ "$APT_MIGRATION_ENABLED" == "true" ]]
+}
+
+alpine_migration_enabled() {
+  [[ "$ALPINE_MIGRATION_ENABLED" == "true" ]]
+}
+
+r_migration_enabled() {
+  [[ "$R_MIGRATION_ENABLED" == "true" ]]
 }
 
 source_apt_available() {
@@ -819,6 +905,1069 @@ if wrong:
     raise SystemExit(f"APT migration row counts are invalid for {wrong}: {raw!r}")
 print(" ".join(f"{name}={value}" for name, value in zip(names, values)))
 PY
+}
+
+source_alpine_available() {
+  local endpoint
+  for endpoint in \
+      "hosted/$ALPINE_NEXUS_REPOSITORY" \
+      "proxy/$ALPINE_PROXY_NEXUS_REPOSITORY" \
+      "group/$ALPINE_GROUP_NEXUS_REPOSITORY"; do
+    if ! curl -m 20 -fsS \
+        -u "$NEXUS_USER:$NEXUS_PASSWORD" \
+        "$NEXUS_URL/service/rest/v1/repositories/alpine/$endpoint" \
+        >/dev/null 2>&1; then
+      return 1
+    fi
+  done
+}
+
+create_nexus_alpine_repository() {
+  local type="$1"
+  local payload="$2"
+  local status
+  status="$(curl -m 60 -sS -o /dev/null -w '%{http_code}' \
+    -u "$NEXUS_USER:$NEXUS_PASSWORD" \
+    -H 'Content-Type: application/json' \
+    --data-binary "@$payload" \
+    "$NEXUS_URL/service/rest/v1/repositories/alpine/$type")"
+  expect_status "$status" "201" "create Nexus Alpine $type repository"
+}
+
+prepare_alpine_fixture() {
+  ALPINE_FIXTURE_WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/kkrepo-alpine-migration.XXXXXX")"
+  ALPINE_FIXTURE_PRIVATE_KEY="$ALPINE_FIXTURE_WORKDIR/private.pem"
+  ALPINE_FIXTURE_KEY_FILENAME="$ALPINE_PACKAGE_KEY_FILENAME"
+  ALPINE_FIXTURE_PUBLIC_KEY="$ALPINE_FIXTURE_WORKDIR/$ALPINE_PACKAGE_KEY_FILENAME"
+  ALPINE_BASE_ARCHIVE="$ALPINE_FIXTURE_WORKDIR/$ALPINE_BASE_PACKAGE-$ALPINE_VERSION.apk"
+  ALPINE_APP_ARCHIVE="$ALPINE_FIXTURE_WORKDIR/$ALPINE_APP_PACKAGE-$ALPINE_VERSION.apk"
+
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+    -out "$ALPINE_FIXTURE_PRIVATE_KEY" >/dev/null 2>&1
+  openssl pkey -in "$ALPINE_FIXTURE_PRIVATE_KEY" -pubout \
+    -out "$ALPINE_FIXTURE_PUBLIC_KEY" >/dev/null 2>&1
+
+  python3 "$PROJECT_ROOT/scripts/ci/create-alpine-e2e-fixture.py" \
+    --output "$ALPINE_BASE_ARCHIVE" \
+    --package "$ALPINE_BASE_PACKAGE" \
+    --version "$ALPINE_VERSION" \
+    --architecture noarch \
+    --message "$ALPINE_BASE_MESSAGE" \
+    --signing-key "$ALPINE_FIXTURE_PRIVATE_KEY" \
+    --signature-key-name "$ALPINE_PACKAGE_KEY_FILENAME" \
+    >"$ALPINE_FIXTURE_WORKDIR/base.json"
+  python3 "$PROJECT_ROOT/scripts/ci/create-alpine-e2e-fixture.py" \
+    --output "$ALPINE_APP_ARCHIVE" \
+    --package "$ALPINE_APP_PACKAGE" \
+    --version "$ALPINE_VERSION" \
+    --architecture noarch \
+    --message "$ALPINE_APP_MESSAGE" \
+    --depends "$ALPINE_BASE_PACKAGE=$ALPINE_VERSION" \
+    --signing-key "$ALPINE_FIXTURE_PRIVATE_KEY" \
+    --signature-key-name "$ALPINE_PACKAGE_KEY_FILENAME" \
+    >"$ALPINE_FIXTURE_WORKDIR/app.json"
+  ALPINE_BASE_SHA256="$(file_sha256 "$ALPINE_BASE_ARCHIVE")"
+  ALPINE_APP_SHA256="$(file_sha256 "$ALPINE_APP_ARCHIVE")"
+
+  python3 - \
+    "$ALPINE_FIXTURE_PRIVATE_KEY" \
+    "$ALPINE_FIXTURE_WORKDIR/hosted.json" \
+    "$ALPINE_FIXTURE_WORKDIR/proxy.json" \
+    "$ALPINE_FIXTURE_WORKDIR/group.json" \
+    "$ALPINE_NEXUS_REPOSITORY" \
+    "$ALPINE_PROXY_NEXUS_REPOSITORY" \
+    "$ALPINE_GROUP_NEXUS_REPOSITORY" <<'PY'
+import json
+import pathlib
+import sys
+
+private_path, hosted_path, proxy_path, group_path, hosted, proxy, group = sys.argv[1:8]
+keypair = pathlib.Path(private_path).read_text(encoding="utf-8")
+storage = {"blobStoreName": "default", "strictContentTypeValidation": True}
+signing = {"keypair": keypair, "passphrase": ""}
+pathlib.Path(hosted_path).write_text(json.dumps({
+    "name": hosted,
+    "online": True,
+    "storage": {**storage, "writePolicy": "ALLOW"},
+    "alpineSigning": signing,
+    "component": {"proprietaryComponents": False},
+}), encoding="utf-8")
+pathlib.Path(proxy_path).write_text(json.dumps({
+    "name": proxy,
+    "online": True,
+    "storage": storage,
+    "proxy": {
+        "remoteUrl": "https://dl-cdn.alpinelinux.org/alpine/",
+        "contentMaxAge": 1440,
+        "metadataMaxAge": 60,
+    },
+    "negativeCache": {"enabled": True, "timeToLive": 5},
+    "httpClient": {"blocked": False, "autoBlock": True},
+    "alpineSigning": signing,
+}), encoding="utf-8")
+pathlib.Path(group_path).write_text(json.dumps({
+    "name": group,
+    "online": True,
+    "storage": storage,
+    "group": {"memberNames": [hosted, proxy]},
+    "alpineSigning": signing,
+}), encoding="utf-8")
+PY
+
+  # Migration E2E runs in a disposable Nexus. Remove only the exact fixture names so a retried
+  # local run cannot retain a previous signing identity or package set.
+  for repository in \
+      "$ALPINE_GROUP_NEXUS_REPOSITORY" \
+      "$ALPINE_PROXY_NEXUS_REPOSITORY" \
+      "$ALPINE_NEXUS_REPOSITORY"; do
+    curl -m 30 -fsS -u "$NEXUS_USER:$NEXUS_PASSWORD" -X DELETE \
+      "$NEXUS_URL/service/rest/v1/repositories/$repository" >/dev/null 2>&1 || true
+  done
+  create_nexus_alpine_repository hosted "$ALPINE_FIXTURE_WORKDIR/hosted.json"
+  create_nexus_alpine_repository proxy "$ALPINE_FIXTURE_WORKDIR/proxy.json"
+  create_nexus_alpine_repository group "$ALPINE_FIXTURE_WORKDIR/group.json"
+
+  local archive status
+  for archive in "$ALPINE_BASE_ARCHIVE" "$ALPINE_APP_ARCHIVE"; do
+    status="$(curl -m 90 -sS -o /dev/null -w '%{http_code}' \
+      -u "$NEXUS_USER:$NEXUS_PASSWORD" \
+      -X PUT -H 'Content-Type: application/vnd.alpine.apk' \
+      --data-binary "@$archive" \
+      "$NEXUS_URL/repository/$ALPINE_NEXUS_REPOSITORY/$ALPINE_DISTRIBUTION/$ALPINE_CHANNEL/$ALPINE_ARCHITECTURE/$(basename "$archive")")"
+    expect_status "$status" "200" "upload Nexus Alpine migration package"
+  done
+  log "prepared Nexus Alpine hosted/proxy/group definitions and signed dependency fixtures"
+}
+
+wait_for_alpine_index() {
+  local target_url="$1"
+  local repository="$2"
+  local username="$3"
+  local password="$4"
+  local output="$5"
+  local index_url="$target_url/repository/$repository/$ALPINE_DISTRIBUTION/$ALPINE_CHANNEL/$ALPINE_ARCHITECTURE/APKINDEX.tar.gz"
+  for ((i = 1; i <= WAIT_TIMEOUT_SECONDS; i++)); do
+    if curl -m 30 -fsS -u "$username:$password" "$index_url" -o "$output" 2>/dev/null \
+        && python3 - "$output" "$ALPINE_BASE_PACKAGE" "$ALPINE_APP_PACKAGE" <<'PY'
+import gzip
+import io
+import pathlib
+import sys
+import tarfile
+
+raw = gzip.decompress(pathlib.Path(sys.argv[1]).read_bytes())
+with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
+    member = archive.extractfile("APKINDEX")
+    if member is None:
+        raise SystemExit(1)
+    text = member.read().decode("utf-8")
+names = {line[2:] for line in text.splitlines() if line.startswith("P:")}
+raise SystemExit(0 if set(sys.argv[2:4]) <= names else 1)
+PY
+    then
+      return 0
+    fi
+    sleep 1
+  done
+  log "timed out waiting for Alpine migration index through $target_url/$repository"
+  exit 1
+}
+
+alpine_index_key_filename() {
+  python3 - "$1" <<'PY'
+import gzip
+import io
+import pathlib
+import tarfile
+import sys
+
+raw = gzip.decompress(pathlib.Path(sys.argv[1]).read_bytes())
+with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
+    names = [item.name for item in archive if item.name.startswith(".SIGN.")]
+if len(names) != 1:
+    raise SystemExit(f"expected one Alpine index signature entry, got {names}")
+print(names[0].split(".", 3)[-1])
+PY
+}
+
+alpine_client_base_url() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import sys
+from urllib.parse import quote, urlsplit, urlunsplit
+
+parts = urlsplit(sys.argv[1])
+host = parts.hostname or ""
+if host in {"127.0.0.1", "localhost", "::1"}:
+    host = "host.docker.internal"
+port = f":{parts.port}" if parts.port else ""
+auth = quote(sys.argv[2], safe="") + ":" + quote(sys.argv[3], safe="") + "@"
+print(urlunsplit((parts.scheme, auth + host + port, parts.path.rstrip("/"), "", "")))
+PY
+}
+
+run_alpine_migration_client_acceptance() {
+  local target_url="$1"
+  local repository="$2"
+  local username="$3"
+  local password="$4"
+  local label="$5"
+  local workdir client_url
+  workdir="$(mktemp -d "${TMPDIR:-/tmp}/kkrepo-alpine-migration-client.XXXXXX")"
+  client_url="$(alpine_client_base_url "$target_url" "$username" "$password")"
+  mkdir -p "$workdir/keys"
+  cp "$ALPINE_FIXTURE_PUBLIC_KEY" "$workdir/keys/$ALPINE_FIXTURE_KEY_FILENAME"
+  if [[ "$ALPINE_FIXTURE_KEY_FILENAME" != "$ALPINE_PACKAGE_KEY_FILENAME" ]]; then
+    cp "$ALPINE_FIXTURE_PUBLIC_KEY" "$workdir/keys/$ALPINE_PACKAGE_KEY_FILENAME"
+  fi
+  printf '%s/repository/%s/%s/%s\n' \
+    "$client_url" "$repository" "$ALPINE_DISTRIBUTION" "$ALPINE_CHANNEL" \
+    >"$workdir/repositories"
+  log "running real apk-tools dependency install through $label"
+  docker run --rm --pull=missing \
+    --add-host host.docker.internal:host-gateway \
+    --volume "$workdir/repositories:/etc/apk/repositories:ro" \
+    --volume "$workdir/keys:/etc/apk/keys:ro" \
+    -e ALPINE_BASE_PACKAGE="$ALPINE_BASE_PACKAGE" \
+    -e ALPINE_APP_PACKAGE="$ALPINE_APP_PACKAGE" \
+    -e ALPINE_VERSION="$ALPINE_VERSION" \
+    -e ALPINE_APP_SHA256="$ALPINE_APP_SHA256" \
+    -e ALPINE_BASE_MESSAGE="$ALPINE_BASE_MESSAGE" \
+    -e ALPINE_APP_MESSAGE="$ALPINE_APP_MESSAGE" \
+    "$ALPINE_CLIENT_IMAGE" sh -euxc '
+      rm -rf /var/cache/apk/* /tmp/*.apk
+      apk update
+      apk search -x "$ALPINE_APP_PACKAGE" | grep -Fx "$ALPINE_APP_PACKAGE-$ALPINE_VERSION"
+      apk policy "$ALPINE_APP_PACKAGE" | grep -F "$ALPINE_VERSION"
+      cd /tmp
+      apk fetch "$ALPINE_APP_PACKAGE"
+      archive="$(find /tmp -maxdepth 1 -type f -name "${ALPINE_APP_PACKAGE}-${ALPINE_VERSION}.apk" -print -quit)"
+      test -n "$archive"
+      test "$(sha256sum "$archive" | cut -d " " -f 1)" = "$ALPINE_APP_SHA256"
+      apk add "$ALPINE_APP_PACKAGE=$ALPINE_VERSION"
+      apk info -e "$ALPINE_BASE_PACKAGE=$ALPINE_VERSION"
+      apk info -e "$ALPINE_APP_PACKAGE=$ALPINE_VERSION"
+      test "$(cat "/usr/share/kkrepo-alpine-e2e/$ALPINE_BASE_PACKAGE.txt")" = "$ALPINE_BASE_MESSAGE"
+      test "$(cat "/usr/share/kkrepo-alpine-e2e/$ALPINE_APP_PACKAGE.txt")" = "$ALPINE_APP_MESSAGE"
+    '
+  rm -rf "$workdir"
+}
+
+verify_source_alpine_fixture() {
+  local index="$ALPINE_FIXTURE_WORKDIR/source-APKINDEX.tar.gz"
+  local downloaded="$ALPINE_FIXTURE_WORKDIR/source-app.apk"
+  wait_for_alpine_index \
+    "$NEXUS_URL" "$ALPINE_NEXUS_REPOSITORY" "$NEXUS_USER" "$NEXUS_PASSWORD" "$index"
+  local index_key_filename
+  index_key_filename="$(alpine_index_key_filename "$index")"
+  if [[ "$index_key_filename" != "$ALPINE_FIXTURE_KEY_FILENAME" ]]; then
+    cp "$ALPINE_FIXTURE_PUBLIC_KEY" "$ALPINE_FIXTURE_WORKDIR/$index_key_filename"
+    ALPINE_FIXTURE_KEY_FILENAME="$index_key_filename"
+  fi
+  curl -m 60 -fsS -u "$NEXUS_USER:$NEXUS_PASSWORD" \
+    "$NEXUS_URL/repository/$ALPINE_NEXUS_REPOSITORY/$ALPINE_DISTRIBUTION/$ALPINE_CHANNEL/$ALPINE_ARCHITECTURE/$(basename "$ALPINE_APP_ARCHIVE")" \
+    -o "$downloaded"
+  cmp "$ALPINE_APP_ARCHIVE" "$downloaded"
+  run_alpine_migration_client_acceptance \
+    "$NEXUS_URL" "$ALPINE_GROUP_NEXUS_REPOSITORY" \
+    "$NEXUS_USER" "$NEXUS_PASSWORD" "source Nexus group"
+  rm -f "$downloaded"
+  log "source Nexus Alpine signed index, package bytes, and dependency install verified"
+}
+
+verify_alpine_repository_definitions() {
+  local target_url="$1"
+  local label="$2"
+  local expected_online="$3"
+  local workdir hosted proxy group
+  workdir="$(mktemp -d "${TMPDIR:-/tmp}/kkrepo-alpine-definitions.XXXXXX")"
+  hosted="$workdir/hosted.json"
+  proxy="$workdir/proxy.json"
+  group="$workdir/group.json"
+  curl -m 30 -fsS -u "$(auth)" \
+    "$target_url/internal/repositories/$ALPINE_KKREPO_REPOSITORY" >"$hosted"
+  curl -m 30 -fsS -u "$(auth)" \
+    "$target_url/internal/repositories/$ALPINE_PROXY_KKREPO_REPOSITORY" >"$proxy"
+  curl -m 30 -fsS -u "$(auth)" \
+    "$target_url/internal/repositories/$ALPINE_GROUP_KKREPO_REPOSITORY" >"$group"
+  python3 - \
+    "$hosted" "$proxy" "$group" "$expected_online" \
+    "$ALPINE_KKREPO_REPOSITORY" "$ALPINE_PROXY_KKREPO_REPOSITORY" \
+    "$ALPINE_GROUP_KKREPO_REPOSITORY" <<'PY'
+import json
+import pathlib
+import sys
+
+hosted_path, proxy_path, group_path, online_text, hosted_name, proxy_name, group_name = sys.argv[1:8]
+hosted = json.loads(pathlib.Path(hosted_path).read_text(encoding="utf-8"))
+proxy = json.loads(pathlib.Path(proxy_path).read_text(encoding="utf-8"))
+group = json.loads(pathlib.Path(group_path).read_text(encoding="utf-8"))
+expected_online = online_text == "true"
+for repository, recipe in (
+    (hosted, "alpine-hosted"),
+    (proxy, "alpine-proxy"),
+    (group, "alpine-group"),
+):
+    if repository.get("recipe") != recipe:
+        raise SystemExit(f"migrated Alpine definition is invalid: {repository}")
+    if repository.get("online") is not expected_online:
+        raise SystemExit(
+            f"migrated Alpine online state is {repository.get('online')!r}, "
+            f"expected {expected_online}: {repository}"
+        )
+    if (repository.get("alpine") or {}).get("metadataMode") != "RESIGN":
+        raise SystemExit(f"migrated Alpine signing mode is invalid: {repository}")
+if (proxy.get("proxy") or {}).get("remoteUrl", "").rstrip("/") != \
+        "https://dl-cdn.alpinelinux.org/alpine":
+    raise SystemExit(f"migrated Alpine proxy remote URL changed: {proxy}")
+upstream_keys = (proxy.get("alpine") or {}).get("upstreamPublicKeys") or []
+if expected_online and not upstream_keys:
+    raise SystemExit(f"online migrated Alpine re-sign proxy has no upstream trust key: {proxy}")
+if not expected_online and upstream_keys:
+    raise SystemExit(f"fail-closed migrated Alpine proxy unexpectedly has trust keys: {proxy}")
+members = (group.get("group") or {}).get("memberNames") or []
+if members != [hosted_name, proxy_name]:
+    raise SystemExit(f"migrated Alpine group members changed for {group_name}: {members!r}")
+PY
+  rm -rf "$workdir"
+  log "Alpine hosted/proxy/group definitions verified through $label (online=$expected_online)"
+}
+
+alpine_signing_key_count() {
+  local hosted proxy group
+  hosted="$(sql_literal "$ALPINE_KKREPO_REPOSITORY")"
+  proxy="$(sql_literal "$ALPINE_PROXY_KKREPO_REPOSITORY")"
+  group="$(sql_literal "$ALPINE_GROUP_KKREPO_REPOSITORY")"
+  target_db_query "
+    SELECT COUNT(*) FROM alpine_signing_key k
+    JOIN repository r ON r.id = k.repository_id
+    WHERE r.name IN ($hosted, $proxy, $group)"
+}
+
+import_alpine_signing_key() {
+  local repository="$1"
+  local payload="$ALPINE_FIXTURE_WORKDIR/key-$repository.json"
+  python3 - \
+    "$ALPINE_FIXTURE_PRIVATE_KEY" "$payload" "$ALPINE_FIXTURE_KEY_FILENAME" <<'PY'
+import json
+import pathlib
+import sys
+
+private_key = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+pathlib.Path(sys.argv[2]).write_text(json.dumps({
+    "privateKey": private_key,
+    "keyFilename": sys.argv[3],
+    "signatureType": "RSA",
+}), encoding="utf-8")
+PY
+  curl -m 90 -fsS -u "$(auth)" \
+    -X PUT -H 'Content-Type: application/json' --data-binary "@$payload" \
+    "$KKREPO_URL/internal/repositories/$repository/alpine/signing-key" >/dev/null
+  if [[ "$repository" == "$ALPINE_PROXY_KKREPO_REPOSITORY" ]]; then
+    python3 - "$ALPINE_FIXTURE_PUBLIC_KEY" "$payload" <<'PY'
+import json
+import pathlib
+import sys
+
+public_key = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+pathlib.Path(sys.argv[2]).write_text(json.dumps({
+    "alpine": {"upstreamPublicKeys": [public_key]},
+    "online": True,
+}), encoding="utf-8")
+PY
+  else
+    printf '%s\n' '{"online":true}' >"$payload"
+  fi
+  curl -m 30 -fsS -u "$(auth)" \
+    -X PUT -H 'Content-Type: application/json' --data-binary "@$payload" \
+    "$KKREPO_URL/internal/repositories/$repository" >/dev/null
+}
+
+activate_migrated_alpine_repositories() {
+  import_alpine_signing_key "$ALPINE_KKREPO_REPOSITORY"
+  import_alpine_signing_key "$ALPINE_PROXY_KKREPO_REPOSITORY"
+  import_alpine_signing_key "$ALPINE_GROUP_KKREPO_REPOSITORY"
+  local namespace="$ALPINE_DISTRIBUTION/$ALPINE_CHANNEL/$ALPINE_ARCHITECTURE"
+  local repository
+  for repository in "$ALPINE_KKREPO_REPOSITORY" "$ALPINE_GROUP_KKREPO_REPOSITORY"; do
+    curl -m 60 -fsS -u "$(auth)" \
+      -X POST -H 'Content-Type: application/json' \
+      --data "{\"namespace\":\"$(json_escape "$namespace")\"}" \
+      "$KKREPO_URL/internal/repositories/$repository/alpine/rebuild" >/dev/null
+  done
+  log "Alpine signing keys were explicitly imported and migrated repositories enabled"
+}
+
+verify_migrated_alpine_fixture() {
+  local job_id="$1"
+  local target_url="${2:-$KKREPO_URL}"
+  local label="${3:-primary}"
+  local activate="${4:-false}"
+  local workdir job index downloaded
+  workdir="$(mktemp -d "${TMPDIR:-/tmp}/kkrepo-alpine-migrated.XXXXXX")"
+  job="$workdir/job.json"
+  index="$workdir/APKINDEX.tar.gz"
+  downloaded="$workdir/app.apk"
+  curl -m 30 -fsS -u "$(auth)" \
+    "$target_url/internal/migration/nexus/repository-data/jobs/$job_id" >"$job"
+  python3 - "$job" "$ALPINE_NEXUS_REPOSITORY" <<'PY'
+import json
+import pathlib
+import sys
+
+payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+repository = sys.argv[2]
+rows = (payload.get("repositoryJobs") or payload.get("repositoryStatuses")
+        or payload.get("repositoryDetails") or [])
+matches = [row for row in rows
+           if (row.get("sourceRepositoryName") or row.get("repositoryName")
+               or row.get("name")) == repository]
+if not matches:
+    raise SystemExit(f"Alpine migration repository status not found: {repository}")
+row = matches[0]
+if int(row.get("migratedAssets") or 0) < 2 or int(row.get("failedAssets") or 0) != 0:
+    raise SystemExit(f"Alpine migration package result is invalid: {row}")
+PY
+  if [[ "$activate" == "true" ]]; then
+    if [[ "$(alpine_signing_key_count | tr -d '[:space:]')" != "0" ]]; then
+      log "Alpine signing key was imported before explicit migration acceptance"
+      exit 1
+    fi
+    activate_migrated_alpine_repositories
+  fi
+  wait_for_alpine_index \
+    "$target_url" "$ALPINE_GROUP_KKREPO_REPOSITORY" "$KKREPO_USER" "$KKREPO_PASSWORD" "$index"
+  curl -m 60 -fsS -u "$(auth)" \
+    "$target_url/repository/$ALPINE_KKREPO_REPOSITORY/$ALPINE_DISTRIBUTION/$ALPINE_CHANNEL/$ALPINE_ARCHITECTURE/$(basename "$ALPINE_APP_ARCHIVE")" \
+    -o "$downloaded"
+  cmp "$ALPINE_APP_ARCHIVE" "$downloaded"
+  run_alpine_migration_client_acceptance \
+    "$target_url" "$ALPINE_GROUP_KKREPO_REPOSITORY" \
+    "$KKREPO_USER" "$KKREPO_PASSWORD" "$label target group"
+  curl -m 30 -fsS -u "$(auth)" \
+    "$target_url/internal/search/components?format=alpine&q=$ALPINE_APP_PACKAGE" \
+    | python3 -c 'import json,sys; p=json.load(sys.stdin); assert any(i.get("name") == sys.argv[1] for i in p.get("items", []))' \
+      "$ALPINE_APP_PACKAGE"
+  rm -rf "$workdir"
+  log "migrated Alpine package, index, Search, and real-client install verified through $label"
+}
+
+alpine_fixture_row_counts() {
+  local repository_name group_name base_name app_name version
+  repository_name="$(sql_literal "$ALPINE_KKREPO_REPOSITORY")"
+  group_name="$(sql_literal "$ALPINE_GROUP_KKREPO_REPOSITORY")"
+  base_name="$(sql_literal "$ALPINE_BASE_PACKAGE")"
+  app_name="$(sql_literal "$ALPINE_APP_PACKAGE")"
+  version="$(sql_literal "$ALPINE_VERSION")"
+  target_db_query "
+    SELECT
+      (SELECT COUNT(*) FROM alpine_package_record p JOIN repository r ON r.id = p.repository_id
+        WHERE r.name = $repository_name AND p.package_name IN ($base_name, $app_name)
+          AND p.package_version = $version),
+      (SELECT COUNT(*) FROM component c JOIN repository r ON r.id = c.repository_id
+        WHERE r.name = $repository_name AND c.format = 'alpine'
+          AND c.name IN ($base_name, $app_name) AND c.version = $version),
+      (SELECT COUNT(*) FROM asset a JOIN component c ON c.id = a.component_id
+        JOIN repository r ON r.id = c.repository_id
+        WHERE r.name = $repository_name AND c.format = 'alpine'
+          AND c.name IN ($base_name, $app_name) AND c.version = $version),
+      (SELECT COUNT(DISTINCT ab.id) FROM asset_blob ab JOIN asset a ON a.asset_blob_id = ab.id
+        JOIN component c ON c.id = a.component_id JOIN repository r ON r.id = c.repository_id
+        WHERE r.name = $repository_name AND c.format = 'alpine'
+          AND c.name IN ($base_name, $app_name) AND c.version = $version),
+      (SELECT COUNT(*) FROM alpine_package_relation relation_row
+        JOIN alpine_package_record p ON p.id = relation_row.package_id
+        JOIN repository r ON r.id = p.repository_id
+        WHERE r.name = $repository_name AND p.package_name = $app_name
+          AND relation_row.relation_kind = 'DEPEND'),
+      (SELECT COUNT(*) FROM alpine_suite_state s JOIN repository r ON r.id = s.repository_id
+        WHERE r.name = $repository_name),
+      (SELECT COUNT(*) FROM alpine_snapshot s JOIN repository r ON r.id = s.repository_id
+        WHERE r.name = $repository_name AND s.published_at IS NOT NULL),
+      (SELECT COUNT(*) FROM alpine_signing_key k JOIN repository r ON r.id = k.repository_id
+        WHERE r.name IN ($repository_name, $group_name) AND k.active = TRUE),
+      (SELECT COUNT(*) FROM alpine_group_binding binding_row
+        JOIN repository r ON r.id = binding_row.group_repository_id
+        WHERE r.name = $group_name)"
+}
+
+wait_for_alpine_publication_idle() {
+  local repository_name pending
+  repository_name="$(sql_literal "$ALPINE_KKREPO_REPOSITORY")"
+  for ((i = 1; i <= WAIT_TIMEOUT_SECONDS; i++)); do
+    pending="$(target_db_query "
+      SELECT COUNT(*)
+      FROM alpine_suite_state state_row
+      JOIN repository r ON r.id = state_row.repository_id
+      WHERE r.name = $repository_name
+        AND (
+          state_row.desired_revision <> state_row.published_revision
+          OR state_row.published_revision = 0
+          OR NOT EXISTS (
+            SELECT 1
+            FROM alpine_snapshot snapshot_row
+            WHERE snapshot_row.repository_id = state_row.repository_id
+              AND snapshot_row.distribution_name = state_row.distribution_name
+              AND snapshot_row.revision = state_row.published_revision
+              AND snapshot_row.published_at IS NOT NULL))")"
+    pending="$(printf '%s' "$pending" | tr -d '[:space:]')"
+    if [[ "$pending" == "0" ]]; then
+      log "Alpine hosted suite publication is idle"
+      return 0
+    fi
+    sleep 1
+  done
+  log "timed out waiting for Alpine hosted suite publication; pending=$pending"
+  exit 1
+}
+
+assert_alpine_fixture_counts() {
+  local counts="$1"
+  python3 - "$counts" <<'PY'
+import sys
+
+raw = sys.argv[1]
+values = [int(value) for value in raw.split()]
+names = [
+    "packages", "components", "assets", "blobs", "dependencies",
+    "suite", "snapshots", "active_keys", "group_bindings",
+]
+if len(values) != len(names):
+    raise SystemExit(f"unexpected Alpine row-count snapshot: {raw!r}")
+wrong = []
+for name, value, expected in zip(names[:6], values[:6], [2, 2, 2, 2, 1, 2]):
+    if value != expected:
+        wrong.append(name)
+if values[6] < 1:
+    wrong.append("snapshots")
+if values[7] != 2:
+    wrong.append("active_keys")
+if values[8] < 2:
+    wrong.append("group_bindings")
+if wrong:
+    raise SystemExit(f"Alpine migration row counts are invalid for {wrong}: {raw!r}")
+print(" ".join(f"{name}={value}" for name, value in zip(names, values)))
+PY
+}
+
+run_alpine_idempotency_migration() {
+  local payload start_body job_id
+  payload="{
+    \"sourceBaseUrl\":\"$(json_escape "$NEXUS_URL")\",
+    \"sourceUsername\":\"$(json_escape "$NEXUS_USER")\",
+    \"sourcePassword\":\"$(json_escape "$NEXUS_PASSWORD")\",
+    \"repositories\":[\"$(json_escape "$ALPINE_NEXUS_REPOSITORY")\"],
+    \"pageSize\":$PAGE_SIZE,
+    \"concurrency\":$CONCURRENCY,
+    \"checksumValidation\":true
+  }"
+  start_body="$(curl -m 60 -fsS \
+    -u "$(auth)" -H 'Content-Type: application/json' --data "$payload" \
+    "$KKREPO_URL/internal/migration/nexus/repository-data/start")"
+  job_id="$(printf '%s' "$start_body" | json_field jobId)"
+  if [[ -z "$job_id" ]]; then
+    log "could not parse Alpine idempotency migration job id from: $start_body"
+    exit 1
+  fi
+  wait_for_discovery_ready "$job_id"
+  curl -m 30 -fsS -u "$(auth)" -X POST \
+    "$KKREPO_URL/internal/migration/nexus/repository-data/jobs/$job_id/packages/start" \
+    >/dev/null
+  wait_for_migration_idle "$job_id"
+  log "Alpine idempotency migration completed: job=$job_id"
+}
+
+source_r_available() {
+  local endpoint
+  for endpoint in \
+      "hosted/$R_NEXUS_REPOSITORY" \
+      "proxy/$R_PROXY_NEXUS_REPOSITORY" \
+      "group/$R_GROUP_NEXUS_REPOSITORY"; do
+    curl -m 20 -fsS \
+      -u "$NEXUS_USER:$NEXUS_PASSWORD" \
+      "$NEXUS_URL/service/rest/v1/repositories/r/$endpoint" >/dev/null 2>&1 \
+      || return 1
+  done
+}
+
+prepare_r_fixture() {
+  R_FIXTURE_WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/kkrepo-r-migration.XXXXXX")"
+  R_BASE_ARCHIVE="$R_FIXTURE_WORKDIR/${R_BASE_PACKAGE}_${R_BASE_VERSION}.tar.gz"
+  R_APP_OLD_ARCHIVE="$R_FIXTURE_WORKDIR/${R_APP_PACKAGE}_${R_APP_OLD_VERSION}.tar.gz"
+  R_APP_ARCHIVE="$R_FIXTURE_WORKDIR/${R_APP_PACKAGE}_${R_APP_VERSION}.tar.gz"
+  python3 "$PROJECT_ROOT/scripts/ci/create-r-e2e-fixture.py" \
+    --output "$R_BASE_ARCHIVE" \
+    --package "$R_BASE_PACKAGE" \
+    --version "$R_BASE_VERSION" \
+    --message "kkRepo R migration dependency $TAG_SAFE_LC" >/dev/null
+  python3 "$PROJECT_ROOT/scripts/ci/create-r-e2e-fixture.py" \
+    --output "$R_APP_OLD_ARCHIVE" \
+    --package "$R_APP_PACKAGE" \
+    --version "$R_APP_OLD_VERSION" \
+    --imports "$R_BASE_PACKAGE" \
+    --message "kkRepo R migration old application $TAG_SAFE_LC" >/dev/null
+  python3 "$PROJECT_ROOT/scripts/ci/create-r-e2e-fixture.py" \
+    --output "$R_APP_ARCHIVE" \
+    --package "$R_APP_PACKAGE" \
+    --version "$R_APP_VERSION" \
+    --imports "$R_BASE_PACKAGE" \
+    --message "$R_APP_MESSAGE" >/dev/null
+  R_APP_SHA256="$(file_sha256 "$R_APP_ARCHIVE")"
+}
+
+publish_r_fixture_to_source_nexus() {
+  local archive status
+  for archive in "$R_BASE_ARCHIVE" "$R_APP_OLD_ARCHIVE" "$R_APP_ARCHIVE"; do
+    status="$(curl -m 90 -sS -o /dev/null -w '%{http_code}' \
+      -u "$NEXUS_USER:$NEXUS_PASSWORD" \
+      -X PUT -H 'Content-Type: application/gzip' --data-binary "@$archive" \
+      "$NEXUS_URL/repository/$R_NEXUS_REPOSITORY/src/contrib/$(basename "$archive")")"
+    expect_status "$status" "200" "publish source Nexus R package $(basename "$archive")"
+  done
+  log "published Nexus R dependency and two application versions"
+}
+
+assert_r_packages_index() {
+  local index="$1"
+  local require_md5="$2"
+  python3 - \
+    "$index" "$R_BASE_PACKAGE" "$R_BASE_VERSION" "$R_BASE_ARCHIVE" \
+    "$R_APP_PACKAGE" "$R_APP_VERSION" "$R_APP_ARCHIVE" "$require_md5" <<'PY'
+import gzip
+import hashlib
+import pathlib
+import sys
+
+(
+    index_path,
+    base_name,
+    base_version,
+    base_archive,
+    app_name,
+    app_version,
+    app_archive,
+    require_md5,
+) = sys.argv[1:9]
+
+def records(payload):
+    parsed = []
+    current = {}
+    last = None
+    for raw in payload.decode("utf-8").splitlines():
+        if not raw.strip():
+            if current:
+                parsed.append(current)
+                current = {}
+                last = None
+            continue
+        if raw[:1].isspace() and last is not None:
+            current[last] += "\n" + raw[1:]
+            continue
+        if ":" not in raw:
+            raise SystemExit(f"invalid R DCF line: {raw!r}")
+        last, value = raw.split(":", 1)
+        current[last] = value.lstrip()
+    if current:
+        parsed.append(current)
+    return parsed
+
+with gzip.open(index_path, "rb") as source:
+    rows = records(source.read())
+base = [row for row in rows if row.get("Package") == base_name]
+app = [row for row in rows if row.get("Package") == app_name]
+if len(base) != 1 or base[0].get("Version") != base_version:
+    raise SystemExit(f"R base record is invalid: {base!r}")
+if len(app) != 1 or app[0].get("Version") != app_version:
+    raise SystemExit(f"R application latest record is invalid: {app!r}")
+imports = app[0].get("Imports", "")
+if base_name not in imports:
+    raise SystemExit(f"R application dependency was lost: {imports!r}")
+if require_md5 == "true":
+    for row, archive in ((base[0], base_archive), (app[0], app_archive)):
+        expected = hashlib.md5(pathlib.Path(archive).read_bytes()).hexdigest()
+        if row.get("MD5sum", "").lower() != expected:
+            raise SystemExit(
+                f"R MD5sum changed for {row.get('Package')}: {row.get('MD5sum')} != {expected}"
+            )
+PY
+}
+
+wait_for_r_index() {
+  local target_url="$1"
+  local repository="$2"
+  local username="$3"
+  local password="$4"
+  local output="$5"
+  local require_md5="$6"
+  for ((i = 1; i <= WAIT_TIMEOUT_SECONDS; i++)); do
+    if curl -m 30 -fsS -u "$username:$password" \
+        "$target_url/repository/$repository/src/contrib/PACKAGES.gz" \
+        -o "$output" 2>/dev/null \
+        && assert_r_packages_index "$output" "$require_md5" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  log "timed out waiting for R PACKAGES.gz through $target_url/$repository"
+  exit 1
+}
+
+verify_source_r_fixture() {
+  local index="$R_FIXTURE_WORKDIR/source-PACKAGES.gz"
+  local archive downloaded expected
+  wait_for_r_index \
+    "$NEXUS_URL" "$R_NEXUS_REPOSITORY" "$NEXUS_USER" "$NEXUS_PASSWORD" \
+    "$index" false
+  for archive in "$R_BASE_ARCHIVE" "$R_APP_OLD_ARCHIVE" "$R_APP_ARCHIVE"; do
+    downloaded="$R_FIXTURE_WORKDIR/source-$(basename "$archive")"
+    curl -m 90 -fsS -u "$NEXUS_USER:$NEXUS_PASSWORD" \
+      "$NEXUS_URL/repository/$R_NEXUS_REPOSITORY/src/contrib/$(basename "$archive")" \
+      -o "$downloaded"
+    expected="$(file_sha256 "$archive")"
+    if [[ "$(file_sha256 "$downloaded")" != "$expected" ]]; then
+      log "source Nexus R package checksum changed: $(basename "$archive")"
+      exit 1
+    fi
+  done
+  rm -f "$index" "$R_FIXTURE_WORKDIR"/source-*.tar.gz
+  log "source Nexus R index, dependency graph, versions, and package bytes verified"
+}
+
+verify_r_repository_definitions() {
+  local target_url="$1"
+  local label="$2"
+  local workdir hosted proxy group proxy_attributes
+  workdir="$(mktemp -d "${TMPDIR:-/tmp}/kkrepo-r-definitions.XXXXXX")"
+  hosted="$workdir/hosted.json"
+  proxy="$workdir/proxy.json"
+  group="$workdir/group.json"
+  proxy_attributes="$workdir/proxy-attributes.json"
+  curl -m 30 -fsS -u "$(auth)" \
+    "$target_url/internal/repositories/$R_KKREPO_REPOSITORY" >"$hosted"
+  curl -m 30 -fsS -u "$(auth)" \
+    "$target_url/internal/repositories/$R_PROXY_KKREPO_REPOSITORY" >"$proxy"
+  curl -m 30 -fsS -u "$(auth)" \
+    "$target_url/internal/repositories/$R_GROUP_KKREPO_REPOSITORY" >"$group"
+  target_db_query \
+    "SELECT attributes_json FROM repository WHERE name = $(sql_literal "$R_PROXY_KKREPO_REPOSITORY")" \
+    >"$proxy_attributes"
+  python3 - \
+    "$hosted" "$proxy" "$group" "$proxy_attributes" \
+    "$R_KKREPO_REPOSITORY" "$R_PROXY_KKREPO_REPOSITORY" \
+    "$R_GROUP_KKREPO_REPOSITORY" "$R_MIGRATION_UPSTREAM_URL" <<'PY'
+import json
+import pathlib
+import sys
+
+(
+    hosted_path,
+    proxy_path,
+    group_path,
+    attributes_path,
+    hosted_name,
+    proxy_name,
+    group_name,
+    remote_url,
+) = sys.argv[1:9]
+hosted = json.loads(pathlib.Path(hosted_path).read_text(encoding="utf-8"))
+proxy = json.loads(pathlib.Path(proxy_path).read_text(encoding="utf-8"))
+group = json.loads(pathlib.Path(group_path).read_text(encoding="utf-8"))
+attributes = json.loads(pathlib.Path(attributes_path).read_text(encoding="utf-8").strip())
+if hosted.get("recipe") != "r-hosted" or hosted.get("type") != "HOSTED":
+    raise SystemExit(f"migrated R hosted definition is invalid: {hosted}")
+if (hosted.get("hosted") or {}).get("writePolicy") != "ALLOW":
+    raise SystemExit(f"migrated R hosted write policy changed: {hosted}")
+if proxy.get("recipe") != "r-proxy" or proxy.get("type") != "PROXY":
+    raise SystemExit(f"migrated R proxy definition is invalid: {proxy}")
+settings = proxy.get("proxy") or {}
+if settings.get("remoteUrl", "").rstrip("/") != remote_url.rstrip("/"):
+    raise SystemExit(f"migrated R proxy remote changed: {settings}")
+if settings.get("contentMaxAgeMinutes") != 37 or settings.get("metadataMaxAgeMinutes") != 19:
+    raise SystemExit(f"migrated R proxy TTLs changed: {settings}")
+if settings.get("autoBlock") is not False:
+    raise SystemExit(f"migrated R proxy autoBlock changed: {settings}")
+negative = ((attributes.get("proxy") or {}).get("negativeCache") or {})
+if negative.get("enabled") is not True or negative.get("timeToLive") != 11:
+    raise SystemExit(f"migrated R negative-cache settings changed: {attributes}")
+if group.get("recipe") != "r-group" or group.get("type") != "GROUP":
+    raise SystemExit(f"migrated R group definition is invalid: {group}")
+members = (group.get("group") or {}).get("memberNames") or []
+if members != [hosted_name, proxy_name]:
+    raise SystemExit(f"migrated R group member order changed for {group_name}: {members!r}")
+PY
+  rm -rf "$workdir"
+  log "R hosted/proxy/group definitions verified through $label"
+}
+
+wait_for_r_publication_idle() {
+  local repository_name pending
+  repository_name="$(sql_literal "$R_KKREPO_REPOSITORY")"
+  for ((i = 1; i <= WAIT_TIMEOUT_SECONDS; i++)); do
+    pending="$(target_db_query "
+      SELECT COUNT(*)
+      FROM r_suite_state state_row
+      JOIN repository r ON r.id = state_row.repository_id
+      WHERE r.name = $repository_name
+        AND (
+          state_row.desired_revision <> state_row.published_revision
+          OR state_row.published_revision = 0
+          OR NOT EXISTS (
+            SELECT 1 FROM r_snapshot snapshot_row
+            WHERE snapshot_row.repository_id = state_row.repository_id
+              AND snapshot_row.distribution_name = state_row.distribution_name
+              AND snapshot_row.revision = state_row.published_revision
+              AND snapshot_row.published_at IS NOT NULL))")"
+    pending="$(printf '%s' "$pending" | tr -d '[:space:]')"
+    if [[ "$pending" == "0" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  log "timed out waiting for R hosted publication; pending=$pending"
+  exit 1
+}
+
+r_client_repository_url() {
+  python3 - "$1" "$2" "$KKREPO_USER" "$KKREPO_PASSWORD" <<'PY'
+import sys
+from urllib.parse import quote, urlsplit, urlunsplit
+
+base, repository, username, password = sys.argv[1:5]
+parts = urlsplit(base)
+host = parts.hostname or ""
+if host in {"127.0.0.1", "localhost", "::1"}:
+    host = "host.docker.internal"
+port = f":{parts.port}" if parts.port else ""
+authority = f"{quote(username, safe='')}:{quote(password, safe='')}@{host}{port}"
+path = f"{parts.path.rstrip('/')}/repository/{repository}"
+print(urlunsplit((parts.scheme, authority, path, "", "")))
+PY
+}
+
+run_r_migration_client_acceptance() {
+  local target_url="$1"
+  local repository="$2"
+  local label="$3"
+  local repository_url pair version image
+  repository_url="$(r_client_repository_url "$target_url" "$repository")"
+  IFS=',' read -r -a r_images <<<"$R_CLIENT_IMAGES"
+  for pair in "${r_images[@]}"; do
+    version="${pair%%=*}"
+    image="${pair#*=}"
+    if [[ -z "$version" || -z "$image" || "$version" == "$image" ]]; then
+      log "invalid R migration client image entry: $pair"
+      exit 1
+    fi
+    log "running R $version migration install through $label"
+    docker run --rm --pull=missing \
+      --add-host host.docker.internal:host-gateway \
+      -e R_REPOSITORY_URL="$repository_url" \
+      -e R_BASE_PACKAGE="$R_BASE_PACKAGE" \
+      -e R_BASE_VERSION="$R_BASE_VERSION" \
+      -e R_APP_PACKAGE="$R_APP_PACKAGE" \
+      -e R_APP_VERSION="$R_APP_VERSION" \
+      -e R_APP_MESSAGE="$R_APP_MESSAGE" \
+      "$image" Rscript --vanilla -e '
+        repository <- Sys.getenv("R_REPOSITORY_URL")
+        base <- Sys.getenv("R_BASE_PACKAGE")
+        app <- Sys.getenv("R_APP_PACKAGE")
+        available <- available.packages(repos = repository, type = "source", filters = list())
+        stopifnot(base %in% rownames(available), app %in% rownames(available))
+        stopifnot(available[base, "Version"] == Sys.getenv("R_BASE_VERSION"))
+        stopifnot(available[app, "Version"] == Sys.getenv("R_APP_VERSION"))
+        library_path <- "/tmp/kkrepo-r-migration-library"
+        dir.create(library_path, recursive = TRUE, showWarnings = FALSE)
+        .libPaths(c(library_path, .libPaths()))
+        install.packages(app, repos = repository, lib = library_path,
+                         dependencies = TRUE, type = "source", quiet = FALSE)
+        stopifnot(as.character(packageVersion(app, lib.loc = library_path)) ==
+                  Sys.getenv("R_APP_VERSION"))
+        loadNamespace(app, lib.loc = library_path)
+        stopifnot(identical(getExportedValue(app, "kkrepo_marker")(),
+                            Sys.getenv("R_APP_MESSAGE")))
+      '
+  done
+}
+
+verify_migrated_r_fixture() {
+  local job_id="$1"
+  local target_url="${2:-$KKREPO_URL}"
+  local label="${3:-primary}"
+  local run_clients="${4:-false}"
+  local workdir job hosted_index group_index browse archive expected
+  workdir="$(mktemp -d "${TMPDIR:-/tmp}/kkrepo-r-migrated.XXXXXX")"
+  job="$workdir/job.json"
+  hosted_index="$workdir/hosted-PACKAGES.gz"
+  group_index="$workdir/group-PACKAGES.gz"
+  browse="$workdir/browse.json"
+  curl -m 30 -fsS -u "$(auth)" \
+    "$target_url/internal/migration/nexus/repository-data/jobs/$job_id" >"$job"
+  python3 - "$job" "$R_NEXUS_REPOSITORY" <<'PY'
+import json
+import pathlib
+import sys
+
+payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+repository = sys.argv[2]
+rows = (payload.get("repositoryJobs") or payload.get("repositoryStatuses")
+        or payload.get("repositoryDetails") or [])
+matches = [row for row in rows
+           if (row.get("sourceRepositoryName") or row.get("repositoryName")
+               or row.get("name")) == repository]
+if not matches:
+    raise SystemExit(f"R migration repository status not found: {repository}")
+row = matches[0]
+if int(row.get("migratedAssets") or 0) < 3 or int(row.get("failedAssets") or 0) != 0:
+    raise SystemExit(f"R migration package result is invalid: {row}")
+PY
+  wait_for_r_publication_idle
+  wait_for_r_index \
+    "$target_url" "$R_KKREPO_REPOSITORY" "$KKREPO_USER" "$KKREPO_PASSWORD" \
+    "$hosted_index" true
+  wait_for_r_index \
+    "$target_url" "$R_GROUP_KKREPO_REPOSITORY" "$KKREPO_USER" "$KKREPO_PASSWORD" \
+    "$group_index" true
+  for archive in "$R_BASE_ARCHIVE" "$R_APP_OLD_ARCHIVE" "$R_APP_ARCHIVE"; do
+    expected="$(file_sha256 "$archive")"
+    curl -m 90 -fsS -u "$(auth)" \
+      "$target_url/repository/$R_KKREPO_REPOSITORY/src/contrib/$(basename "$archive")" \
+      -o "$workdir/$(basename "$archive")"
+    if [[ "$(file_sha256 "$workdir/$(basename "$archive")")" != "$expected" ]]; then
+      log "migrated R package checksum changed through $label: $(basename "$archive")"
+      rm -rf "$workdir"
+      exit 1
+    fi
+  done
+  curl -m 90 -fsS -u "$(auth)" \
+    "$target_url/repository/$R_GROUP_KKREPO_REPOSITORY/src/contrib/$(basename "$R_APP_ARCHIVE")" \
+    -o "$workdir/group-$(basename "$R_APP_ARCHIVE")"
+  if [[ "$(file_sha256 "$workdir/group-$(basename "$R_APP_ARCHIVE")")" != "$R_APP_SHA256" ]]; then
+    log "migrated R group binding returned different application bytes through $label"
+    rm -rf "$workdir"
+    exit 1
+  fi
+  curl -m 30 -fsS -u "$(auth)" \
+    "$target_url/internal/search/components?format=r&q=$R_APP_PACKAGE" \
+    | python3 -c 'import json,sys; p=json.load(sys.stdin); assert any(i.get("name") == sys.argv[1] and i.get("version") == sys.argv[2] for i in p.get("items", []))' \
+      "$R_APP_PACKAGE" "$R_APP_VERSION"
+  curl -m 30 -fsS -u "$(auth)" --get \
+    --data-urlencode "path=src/contrib/$R_APP_PACKAGE/$R_APP_VERSION" \
+    "$target_url/internal/browse/$R_KKREPO_REPOSITORY" >"$browse"
+  python3 - \
+    "$browse" \
+    "$(basename "$R_APP_ARCHIVE")" \
+    "src/contrib/$R_APP_PACKAGE/$R_APP_VERSION/$(basename "$R_APP_ARCHIVE")" \
+    "/repository/$R_KKREPO_REPOSITORY/src/contrib/$(basename "$R_APP_ARCHIVE")" <<'PY'
+import json
+import pathlib
+import sys
+
+path, filename, expected_path, expected_download_url = sys.argv[1:5]
+payload = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+matches = [entry for entry in payload.get("entries", [])
+           if entry.get("name") == filename and entry.get("leaf") is True]
+if len(matches) != 1:
+    raise SystemExit(f"migrated R Browse leaf is missing: {filename}; payload={payload}")
+entry = matches[0]
+if entry.get("path") != expected_path:
+    raise SystemExit(
+        f"migrated R Browse projection changed: {entry.get('path')!r} != {expected_path!r}"
+    )
+if entry.get("downloadUrl") != expected_download_url:
+    raise SystemExit(
+        "migrated R Browse download URL changed: "
+        f"{entry.get('downloadUrl')!r} != {expected_download_url!r}"
+    )
+PY
+  if [[ "$run_clients" == "true" ]]; then
+    run_r_migration_client_acceptance \
+      "$target_url" "$R_GROUP_KKREPO_REPOSITORY" "$label group"
+  fi
+  rm -rf "$workdir"
+  log "migrated R packages, index, Browse/Search, group binding, and client result verified through $label"
+}
+
+r_fixture_row_counts() {
+  local repository_name group_name base_name app_name
+  repository_name="$(sql_literal "$R_KKREPO_REPOSITORY")"
+  group_name="$(sql_literal "$R_GROUP_KKREPO_REPOSITORY")"
+  base_name="$(sql_literal "$R_BASE_PACKAGE")"
+  app_name="$(sql_literal "$R_APP_PACKAGE")"
+  target_db_query "
+    SELECT
+      (SELECT COUNT(*) FROM r_package_record p JOIN repository r ON r.id = p.repository_id
+        WHERE r.name = $repository_name AND p.package_name IN ($base_name, $app_name)),
+      (SELECT COUNT(*) FROM component c JOIN repository r ON r.id = c.repository_id
+        WHERE r.name = $repository_name AND c.format = 'r'
+          AND c.name IN ($base_name, $app_name)),
+      (SELECT COUNT(*) FROM asset a JOIN component c ON c.id = a.component_id
+        JOIN repository r ON r.id = c.repository_id
+        WHERE r.name = $repository_name AND c.format = 'r'
+          AND c.name IN ($base_name, $app_name)),
+      (SELECT COUNT(DISTINCT ab.id) FROM asset_blob ab JOIN asset a ON a.asset_blob_id = ab.id
+        JOIN component c ON c.id = a.component_id JOIN repository r ON r.id = c.repository_id
+        WHERE r.name = $repository_name AND c.format = 'r'
+          AND c.name IN ($base_name, $app_name)),
+      (SELECT COUNT(*) FROM r_package_relation relation_row
+        JOIN r_package_record p ON p.id = relation_row.package_id
+        JOIN repository r ON r.id = p.repository_id
+        WHERE r.name = $repository_name AND p.package_name = $app_name
+          AND relation_row.relation_kind = 'IMPORTS'),
+      (SELECT COUNT(*) FROM r_suite_state s JOIN repository r ON r.id = s.repository_id
+        WHERE r.name = $repository_name),
+      (SELECT COUNT(*) FROM r_snapshot s JOIN repository r ON r.id = s.repository_id
+        WHERE r.name = $repository_name AND s.published_at IS NOT NULL),
+      (SELECT COUNT(*) FROM r_group_binding binding_row
+        JOIN repository r ON r.id = binding_row.group_repository_id
+        WHERE r.name = $group_name)"
+}
+
+assert_r_fixture_counts() {
+  local counts="$1"
+  python3 - "$counts" <<'PY'
+import sys
+
+raw = sys.argv[1]
+values = [int(value) for value in raw.split()]
+names = ["packages", "components", "assets", "blobs", "imports", "suites", "snapshots", "bindings"]
+if len(values) != len(names):
+    raise SystemExit(f"unexpected R row-count snapshot: {raw!r}")
+expected = [3, 3, 3, 3, 2, 1]
+wrong = [name for name, value, wanted in zip(names[:6], values[:6], expected) if value != wanted]
+if values[6] < 1:
+    wrong.append("snapshots")
+if values[7] < 2:
+    wrong.append("bindings")
+if wrong:
+    raise SystemExit(f"R migration row counts are invalid for {wrong}: {raw!r}")
+print(" ".join(f"{name}={value}" for name, value in zip(names, values)))
+PY
+}
+
+run_r_idempotency_migration() {
+  local payload start_body job_id
+  payload="{
+    \"sourceBaseUrl\":\"$(json_escape "$NEXUS_URL")\",
+    \"sourceUsername\":\"$(json_escape "$NEXUS_USER")\",
+    \"sourcePassword\":\"$(json_escape "$NEXUS_PASSWORD")\",
+    \"repositories\":[\"$(json_escape "$R_NEXUS_REPOSITORY")\"],
+    \"pageSize\":$PAGE_SIZE,
+    \"concurrency\":$CONCURRENCY,
+    \"checksumValidation\":true
+  }"
+  start_body="$(curl -m 60 -fsS \
+    -u "$(auth)" -H 'Content-Type: application/json' --data "$payload" \
+    "$KKREPO_URL/internal/migration/nexus/repository-data/start")"
+  job_id="$(printf '%s' "$start_body" | json_field jobId)"
+  if [[ -z "$job_id" ]]; then
+    log "could not parse R idempotency migration job id from: $start_body"
+    exit 1
+  fi
+  wait_for_discovery_ready "$job_id"
+  curl -m 30 -fsS -u "$(auth)" -X POST \
+    "$KKREPO_URL/internal/migration/nexus/repository-data/jobs/$job_id/packages/start" \
+    >/dev/null
+  wait_for_migration_idle "$job_id"
+  log "R idempotency migration completed: job=$job_id"
 }
 
 source_conda_available() {
@@ -1835,6 +2984,218 @@ PY
   COMPOSER_DIST_SHA1="$actual_sha1"
   rm -f "$metadata_file" "$dist_file"
   log "Composer proxy fixture warmed: $COMPOSER_PACKAGE $COMPOSER_VERSION path=$COMPOSER_DIST_PATH"
+}
+
+prepare_go_fixture() {
+  local archive_root
+  GO_FIXTURE_WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/kkrepo-go-migration.XXXXXX")"
+  archive_root="$GO_FIXTURE_WORKDIR/archive/$GO_MODULE@$GO_VERSION"
+  GO_FIXTURE_ARCHIVE="$GO_FIXTURE_WORKDIR/$GO_VERSION.zip"
+  mkdir -p "$archive_root"
+  cat >"$archive_root/go.mod" <<EOF
+module $GO_MODULE
+
+go 1.22
+EOF
+  cat >"$archive_root/migration.go" <<EOF
+package migrationfixture
+
+const Marker = "$GO_FIXTURE_MARKER"
+EOF
+  (
+    cd "$GO_FIXTURE_WORKDIR/archive"
+    zip -q -r "$GO_FIXTURE_ARCHIVE" "$GO_MODULE@$GO_VERSION"
+  )
+  GO_FIXTURE_SHA256="$(file_sha256 "$GO_FIXTURE_ARCHIVE")"
+}
+
+publish_go_fixture_to_source_nexus() {
+  local response status
+  response="$GO_FIXTURE_WORKDIR/publish-response.txt"
+  status="$(curl -m 60 -sS -o "$response" -w '%{http_code}' \
+    -u "$NEXUS_USER:$NEXUS_PASSWORD" \
+    -H "Content-Type: application/zip" \
+    --upload-file "$GO_FIXTURE_ARCHIVE" \
+    "$NEXUS_URL/repository/$GO_NEXUS_REPOSITORY/$GO_VERSION.zip")"
+  if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
+    log "publish Go fixture returned HTTP $status"
+    cat "$response" >&2 || true
+    exit 1
+  fi
+  wait_for_http \
+    "source Nexus Go module" \
+    "$NEXUS_URL/repository/$GO_NEXUS_REPOSITORY/$GO_MODULE/@v/$GO_VERSION.zip" \
+    "$NEXUS_USER:$NEXUS_PASSWORD"
+}
+
+verify_source_go_fixture() {
+  local workdir list_file info_file latest_file mod_file archive_file downloaded_sha
+  workdir="$(mktemp -d "${TMPDIR:-/tmp}/kkrepo-go-source.XXXXXX")"
+  list_file="$workdir/list"
+  info_file="$workdir/version.info"
+  latest_file="$workdir/latest.info"
+  mod_file="$workdir/version.mod"
+  archive_file="$workdir/version.zip"
+  curl -m 30 -fsS -u "$NEXUS_USER:$NEXUS_PASSWORD" \
+    "$NEXUS_URL/repository/$GO_NEXUS_REPOSITORY/$GO_MODULE/@v/list" >"$list_file"
+  curl -m 30 -fsS -u "$NEXUS_USER:$NEXUS_PASSWORD" \
+    "$NEXUS_URL/repository/$GO_NEXUS_REPOSITORY/$GO_MODULE/@v/$GO_VERSION.info" >"$info_file"
+  curl -m 30 -fsS -u "$NEXUS_USER:$NEXUS_PASSWORD" \
+    "$NEXUS_URL/repository/$GO_NEXUS_REPOSITORY/$GO_MODULE/@latest" >"$latest_file"
+  curl -m 30 -fsS -u "$NEXUS_USER:$NEXUS_PASSWORD" \
+    "$NEXUS_URL/repository/$GO_NEXUS_REPOSITORY/$GO_MODULE/@v/$GO_VERSION.mod" >"$mod_file"
+  curl -m 60 -fsS -u "$NEXUS_USER:$NEXUS_PASSWORD" \
+    "$NEXUS_URL/repository/$GO_NEXUS_REPOSITORY/$GO_MODULE/@v/$GO_VERSION.zip" >"$archive_file"
+  python3 - \
+    "$list_file" "$info_file" "$latest_file" "$mod_file" "$GO_MODULE" "$GO_VERSION" <<'PY'
+import json
+import pathlib
+import sys
+
+list_path, info_path, latest_path, mod_path, module, version = sys.argv[1:7]
+versions = pathlib.Path(list_path).read_text(encoding="utf-8").split()
+if version not in versions:
+    raise SystemExit(f"source Nexus Go list omitted {version}: {versions}")
+for label, path in [("info", info_path), ("latest", latest_path)]:
+    payload = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    if payload.get("Version") != version or not payload.get("Time"):
+        raise SystemExit(f"source Nexus Go {label} metadata is invalid: {payload}")
+mod = pathlib.Path(mod_path).read_text(encoding="utf-8")
+if f"module {module}" not in mod:
+    raise SystemExit(f"source Nexus Go mod omitted module identity: {mod!r}")
+PY
+  downloaded_sha="$(file_sha256 "$archive_file")"
+  if [[ "$downloaded_sha" != "$GO_FIXTURE_SHA256" ]]; then
+    log "source Nexus Go archive checksum changed: $downloaded_sha != $GO_FIXTURE_SHA256"
+    rm -rf "$workdir"
+    exit 1
+  fi
+  rm -rf "$workdir"
+  log "source Nexus Go fixture verified: $GO_MODULE $GO_VERSION sha256=$GO_FIXTURE_SHA256"
+}
+
+verify_go_repository_definition() {
+  local target_url="$1"
+  local label="$2"
+  local repository_file
+  repository_file="$(mktemp)"
+  curl -m 30 -fsS -u "$(auth)" \
+    "$target_url/internal/repositories/$GO_KKREPO_REPOSITORY" >"$repository_file"
+  python3 - "$repository_file" <<'PY'
+import json
+import pathlib
+import sys
+
+repository = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if repository.get("recipe") != "go-hosted" or repository.get("type") != "HOSTED":
+    raise SystemExit(f"migrated Go hosted definition is invalid: {repository}")
+if (repository.get("hosted") or {}).get("writePolicy") != "ALLOW":
+    raise SystemExit(f"migrated Go hosted write policy changed: {repository}")
+PY
+  rm -f "$repository_file"
+  log "Go hosted definition verified through $label"
+}
+
+verify_migrated_go_fixture() {
+  local job_id="$1"
+  local target_url="${2:-$KKREPO_URL}"
+  local label="${3:-primary}"
+  local workdir job_file list_file info_file latest_file mod_file archive_file downloaded_sha
+  local gomodcache gocache client_dir
+  workdir="$(mktemp -d "${TMPDIR:-/tmp}/kkrepo-go-migrated.XXXXXX")"
+  job_file="$workdir/job.json"
+  list_file="$workdir/list"
+  info_file="$workdir/version.info"
+  latest_file="$workdir/latest.info"
+  mod_file="$workdir/version.mod"
+  archive_file="$workdir/version.zip"
+  gomodcache="$workdir/gomodcache"
+  gocache="$workdir/gocache"
+  client_dir="$workdir/client"
+  mkdir -p "$client_dir"
+
+  curl -m 30 -fsS -u "$(auth)" \
+    "$target_url/internal/migration/nexus/repository-data/jobs/$job_id" >"$job_file"
+  python3 - "$job_file" "$GO_NEXUS_REPOSITORY" <<'PY'
+import json
+import pathlib
+import sys
+
+path, repository = sys.argv[1:3]
+payload = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+rows = payload.get("repositoryJobs") or payload.get("repositoryStatuses") or payload.get("repositoryDetails") or []
+matches = [
+    row for row in rows
+    if (row.get("sourceRepositoryName") or row.get("repositoryName") or row.get("name")) == repository
+]
+if not matches:
+    raise SystemExit(f"Go migration repository status not found: {repository}")
+row = matches[0]
+if int(row.get("migratedAssets") or 0) < 1:
+    raise SystemExit(f"Go migration did not restore module assets: {row}")
+if int(row.get("failedAssets") or 0) != 0:
+    raise SystemExit(f"Go migration has failed assets: {row}")
+PY
+
+  curl -m 30 -fsS -u "$(auth)" \
+    "$target_url/repository/$GO_KKREPO_REPOSITORY/$GO_MODULE/@v/list" >"$list_file"
+  curl -m 30 -fsS -u "$(auth)" \
+    "$target_url/repository/$GO_KKREPO_REPOSITORY/$GO_MODULE/@v/$GO_VERSION.info" >"$info_file"
+  curl -m 30 -fsS -u "$(auth)" \
+    "$target_url/repository/$GO_KKREPO_REPOSITORY/$GO_MODULE/@latest" >"$latest_file"
+  curl -m 30 -fsS -u "$(auth)" \
+    "$target_url/repository/$GO_KKREPO_REPOSITORY/$GO_MODULE/@v/$GO_VERSION.mod" >"$mod_file"
+  curl -m 60 -fsS -u "$(auth)" \
+    "$target_url/repository/$GO_KKREPO_REPOSITORY/$GO_MODULE/@v/$GO_VERSION.zip" >"$archive_file"
+  python3 - \
+    "$list_file" "$info_file" "$latest_file" "$mod_file" "$GO_MODULE" "$GO_VERSION" <<'PY'
+import json
+import pathlib
+import sys
+
+list_path, info_path, latest_path, mod_path, module, version = sys.argv[1:7]
+versions = pathlib.Path(list_path).read_text(encoding="utf-8").split()
+if version not in versions:
+    raise SystemExit(f"migrated Go list omitted {version}: {versions}")
+for label, path in [("info", info_path), ("latest", latest_path)]:
+    payload = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    if payload.get("Version") != version or not payload.get("Time"):
+        raise SystemExit(f"migrated Go {label} metadata is invalid: {payload}")
+mod = pathlib.Path(mod_path).read_text(encoding="utf-8")
+if f"module {module}" not in mod:
+    raise SystemExit(f"migrated Go mod omitted module identity: {mod!r}")
+PY
+  downloaded_sha="$(file_sha256 "$archive_file")"
+  if [[ "$downloaded_sha" != "$GO_FIXTURE_SHA256" ]]; then
+    log "migrated Go archive checksum changed through $label: $downloaded_sha != $GO_FIXTURE_SHA256"
+    rm -rf "$workdir"
+    exit 1
+  fi
+
+  cat >"$client_dir/go.mod" <<'EOF'
+module kkrepo-migration-e2e.local/client
+
+go 1.22
+EOF
+  (
+    cd "$client_dir"
+    env \
+      GOPROXY="$target_url/repository/$GO_KKREPO_REPOSITORY/" \
+      GONOPROXY=none \
+      GONOSUMDB="$GO_MODULE" \
+      GOSUMDB=off \
+      GOFLAGS=-modcacherw \
+      GOMODCACHE="$gomodcache" \
+      GOCACHE="$gocache" \
+      go mod download -json "$GO_MODULE@$GO_VERSION" >"$workdir/go-download.json"
+  )
+  test -f "$gomodcache/cache/download/$GO_MODULE/@v/$GO_VERSION.info"
+  test -f "$gomodcache/cache/download/$GO_MODULE/@v/$GO_VERSION.mod"
+  test -f "$gomodcache/cache/download/$GO_MODULE/@v/$GO_VERSION.zip"
+  grep -F "$GO_FIXTURE_MARKER" \
+    "$gomodcache/$GO_MODULE@$GO_VERSION/migration.go" >/dev/null
+  rm -rf "$workdir"
+  log "migrated Go fixture and real client verified through $label: $GO_MODULE $GO_VERSION"
 }
 
 publish_cargo_fixture_to_source_nexus() {
@@ -3667,6 +5028,8 @@ run_config_metadata_migration() {
     "$expected_adapter" \
     "$NEXUS_REPOSITORY" \
     "$EXPECTED_CONNECTOR_PORT" \
+    "$GO_MIGRATION_ENABLED" \
+    "$GO_NEXUS_REPOSITORY" \
     "$SWIFT_MIGRATION_ENABLED" \
     "$SWIFT_NEXUS_REPOSITORY" \
     "$SWIFT_PROXY_NEXUS_REPOSITORY" \
@@ -3677,7 +5040,15 @@ run_config_metadata_migration() {
     "$CONDA_MIGRATION_ENABLED" \
     "$CONDA_NEXUS_REPOSITORY" \
     "$APT_MIGRATION_ENABLED" \
-    "$APT_NEXUS_REPOSITORY" <<'PY'
+    "$APT_NEXUS_REPOSITORY" \
+    "$ALPINE_MIGRATION_ENABLED" \
+    "$ALPINE_NEXUS_REPOSITORY" \
+    "$ALPINE_PROXY_NEXUS_REPOSITORY" \
+    "$ALPINE_GROUP_NEXUS_REPOSITORY" \
+    "$R_MIGRATION_ENABLED" \
+    "$R_NEXUS_REPOSITORY" \
+    "$R_PROXY_NEXUS_REPOSITORY" \
+    "$R_GROUP_NEXUS_REPOSITORY" <<'PY'
 import json
 import sys
 
@@ -3686,6 +5057,8 @@ import sys
     expected_adapter,
     repository,
     expected_connector_port,
+    go_enabled,
+    go_repository,
     swift_enabled,
     swift_repository,
     swift_proxy_repository,
@@ -3697,7 +5070,15 @@ import sys
     conda_repository,
     apt_enabled,
     apt_repository,
-) = sys.argv[1:16]
+    alpine_enabled,
+    alpine_repository,
+    alpine_proxy_repository,
+    alpine_group_repository,
+    r_enabled,
+    r_repository,
+    r_proxy_repository,
+    r_group_repository,
+) = sys.argv[1:26]
 with open(path, "r", encoding="utf-8") as source:
     payload = json.load(source)
 plan = payload.get("migrationPlan") or {}
@@ -3751,6 +5132,18 @@ if expected_adapter in {"DatastoreH2NexusAdapter", "DatastorePostgresqlNexusAdap
         raise SystemExit(f"cargo-hosted plan status is {cargo[0].get('status')!r}, expected FULL")
     if cargo[0].get("readMode") != "script-datastore":
         raise SystemExit(f"cargo-hosted readMode is {cargo[0].get('readMode')!r}")
+if go_enabled == "true":
+    capability = ((profile.get("formatCapabilities") or {}).get("go") or {})
+    if capability.get("contentMigration") is not True:
+        raise SystemExit(f"Go datastore content model was not proven: {capability}")
+    go = [
+        item for item in items
+        if item.get("area") == "repository" and item.get("name") == go_repository
+    ]
+    if not go:
+        raise SystemExit(f"Go hosted plan item not found: {go_repository}")
+    if go[0].get("status") != "FULL" or go[0].get("readMode") != "script-datastore":
+        raise SystemExit(f"Go hosted migration is not fail-closed FULL: {go[0]}")
 if swift_enabled == "true":
     capability = ((profile.get("formatCapabilities") or {}).get("swift") or {})
     if capability.get("contentMigration") is not True:
@@ -3880,6 +5273,57 @@ if apt_enabled == "true":
         for warning in (payload.get("warnings") or [])
     ):
         raise SystemExit("APT preflight omitted the explicit signing-key warning")
+if alpine_enabled == "true":
+    capability = ((profile.get("formatCapabilities") or {}).get("alpine") or {})
+    if capability.get("contentMigration") is not True:
+        raise SystemExit(f"Alpine datastore content model was not proven: {capability}")
+    repositories = [alpine_repository, alpine_proxy_repository, alpine_group_repository]
+    for name in repositories:
+        matches = [
+            item for item in items
+            if item.get("area") == "repository" and item.get("name") == name
+        ]
+        if not matches:
+            raise SystemExit(f"Alpine repository plan item not found: {name}")
+        if matches[0].get("status") != "NEEDS_MANUAL_ACTION":
+            raise SystemExit(
+                f"Alpine repository did not fail closed for signing-key import: {matches[0]}"
+            )
+        expected_action = "repository:" + name
+        if expected_action not in (plan.get("manualActions") or []):
+            raise SystemExit(
+                f"Alpine preflight omitted manual action {expected_action}: "
+                f"{plan.get('manualActions')}"
+            )
+    hosted = next(item for item in items if item.get("name") == alpine_repository)
+    if hosted.get("readMode") != "script-datastore":
+        raise SystemExit(f"Alpine hosted read mode is not datastore-backed: {hosted}")
+    if not any(
+        f"Alpine repository {alpine_repository} requires manual signing-key import" in warning
+        for warning in (payload.get("warnings") or [])
+    ):
+        raise SystemExit("Alpine preflight omitted the explicit signing-key warning")
+if r_enabled == "true":
+    capability = ((profile.get("formatCapabilities") or {}).get("r") or {})
+    if capability.get("contentMigration") is not True:
+        raise SystemExit(f"R datastore content model was not proven: {capability}")
+    repositories = {
+        r_repository: ("FULL", "script-datastore"),
+        r_proxy_repository: ("CONFIG_ONLY", "repository-config-rest"),
+        r_group_repository: ("CONFIG_ONLY", "repository-config-rest"),
+    }
+    for name, expected in repositories.items():
+        matches = [
+            item for item in items
+            if item.get("area") == "repository" and item.get("name") == name
+        ]
+        if not matches:
+            raise SystemExit(f"R repository plan item not found: {name}")
+        actual = (matches[0].get("status"), matches[0].get("readMode"))
+        if actual != expected:
+            raise SystemExit(
+                f"R repository plan is not fail-closed for {name}: {actual!r} != {expected!r}"
+            )
 print(
     "preflight adapter="
     + str(adapter)
@@ -3900,7 +5344,9 @@ PY
     "$run_file" "$expected_adapter" "$NEXUS_REPOSITORY" \
     "$SWIFT_MIGRATION_ENABLED" "$SWIFT_PROXY_NEXUS_REPOSITORY" \
     "$ANSIBLE_MIGRATION_ENABLED" "$ANSIBLE_SECRET_PROXY_NEXUS_REPOSITORY" \
-    "$APT_MIGRATION_ENABLED" "$APT_NEXUS_REPOSITORY" <<'PY'
+    "$APT_MIGRATION_ENABLED" "$APT_NEXUS_REPOSITORY" \
+    "$ALPINE_MIGRATION_ENABLED" "$ALPINE_NEXUS_REPOSITORY" \
+    "$ALPINE_PROXY_NEXUS_REPOSITORY" "$ALPINE_GROUP_NEXUS_REPOSITORY" <<'PY'
 import json
 import sys
 
@@ -3914,13 +5360,18 @@ import sys
     ansible_secret_proxy_repository,
     apt_enabled,
     apt_repository,
-) = sys.argv[1:10]
+    alpine_enabled,
+    alpine_repository,
+    alpine_proxy_repository,
+    alpine_group_repository,
+) = sys.argv[1:14]
 with open(path, "r", encoding="utf-8") as source:
     payload = json.load(source)
 status = payload.get("status")
 has_unavailable_proxy = swift_enabled == "true" or ansible_enabled == "true"
 has_apt_signing = apt_enabled == "true"
-has_manual_repository = has_unavailable_proxy or has_apt_signing
+has_alpine_signing = alpine_enabled == "true"
+has_manual_repository = has_unavailable_proxy or has_apt_signing or has_alpine_signing
 if has_manual_repository:
     if status != "finished_with_manual_actions":
         raise SystemExit(
@@ -3942,6 +5393,11 @@ if has_manual_repository:
     if has_apt_signing and "repository/APT signing keys" not in manual:
         raise SystemExit(
             "metadata migration did not require explicit APT signing-key import: "
+            f"{manual}"
+        )
+    if has_alpine_signing and "repository/Alpine signing keys" not in manual:
+        raise SystemExit(
+            "metadata migration did not require explicit Alpine signing-key import: "
             f"{manual}"
         )
 elif manual:
@@ -3971,17 +5427,26 @@ if has_manual_repository:
         for check in manual_checks
         if check.get("scope") == "repository" and check.get("name") == "APT signing keys"
     ]
+    alpine_checks = [
+        check
+        for check in manual_checks
+        if check.get("scope") == "repository" and check.get("name") == "Alpine signing keys"
+    ]
     expected_proxy_checks = 1 if has_unavailable_proxy else 0
     expected_apt_checks = 1 if has_apt_signing else 0
+    expected_alpine_checks = 1 if has_alpine_signing else 0
     other_manual_checks = [
-        check for check in manual_checks if check not in proxy_checks and check not in apt_checks
+        check for check in manual_checks
+        if check not in proxy_checks and check not in apt_checks and check not in alpine_checks
     ]
     if (len(proxy_checks) != expected_proxy_checks
             or len(apt_checks) != expected_apt_checks
+            or len(alpine_checks) != expected_alpine_checks
             or other_manual_checks):
         raise SystemExit(
             "metadata migration manual checks differ from the expected fail-closed "
-            f"repositories: proxy={proxy_checks} apt={apt_checks} other={other_manual_checks}"
+            f"repositories: proxy={proxy_checks} apt={apt_checks} "
+            f"alpine={alpine_checks} other={other_manual_checks}"
         )
     plan_manual = plan.get("manualActions") or []
     expected_actions = []
@@ -3991,6 +5456,12 @@ if has_manual_repository:
         expected_actions.append("repository:" + ansible_secret_proxy_repository)
     if apt_enabled == "true":
         expected_actions.append("repository:" + apt_repository)
+    if alpine_enabled == "true":
+        expected_actions.extend([
+            "repository:" + alpine_repository,
+            "repository:" + alpine_proxy_repository,
+            "repository:" + alpine_group_repository,
+        ])
     missing_actions = [action for action in expected_actions if action not in plan_manual]
     if missing_actions:
         raise SystemExit(
@@ -4055,6 +5526,18 @@ wait_for_http "kkrepo repositories endpoint" "$KKREPO_URL/internal/repositories?
 
 ensure_kkrepo_blob_store
 ensure_kkrepo_docker_repository
+if go_migration_enabled; then
+  need python3
+  need zip
+  need go
+  if ! source_go_available; then
+    log "required Go hosted repository $GO_NEXUS_REPOSITORY is not available on the Nexus 3.94 source"
+    exit 1
+  fi
+  prepare_go_fixture
+  publish_go_fixture_to_source_nexus
+  verify_source_go_fixture
+fi
 if terraform_migration_enabled; then
   if ! source_terraform_available; then
     log "required Terraform repository $TERRAFORM_NEXUS_REPOSITORY is not available on the Nexus 3.92 source"
@@ -4131,7 +5614,32 @@ if apt_migration_enabled; then
   load_apt_fixture
   verify_source_apt_fixture
 fi
+if alpine_migration_enabled; then
+  need python3
+  need openssl
+  need cmp
+  prepare_alpine_fixture
+  if ! source_alpine_available; then
+    log "required Alpine hosted/proxy/group repositories are not available on the Nexus 3.94 source"
+    exit 1
+  fi
+  verify_source_alpine_fixture
+fi
+if r_migration_enabled; then
+  need python3
+  need cmp
+  prepare_r_fixture
+  if ! source_r_available; then
+    log "required R hosted/proxy/group repositories are not available on the Nexus 3.94 source"
+    exit 1
+  fi
+  publish_r_fixture_to_source_nexus
+  verify_source_r_fixture
+fi
 run_config_metadata_migration
+if go_migration_enabled; then
+  verify_go_repository_definition "$KKREPO_URL" "primary"
+fi
 if composer_migration_enabled; then
   verify_composer_requires_explicit_proxy_selection
 fi
@@ -4154,6 +5662,17 @@ if apt_migration_enabled; then
     exit 1
   fi
 fi
+if alpine_migration_enabled; then
+  verify_alpine_repository_definitions \
+    "$KKREPO_URL" "primary fail-closed migration" false
+  if [[ "$(alpine_signing_key_count | tr -d '[:space:]')" != "0" ]]; then
+    log "Alpine private signing material was migrated without explicit approval"
+    exit 1
+  fi
+fi
+if r_migration_enabled; then
+  verify_r_repository_definitions "$KKREPO_URL" "primary"
+fi
 
 kkrepo_ref="${KKREPO_DOCKER_REGISTRY}/${IMAGE}:${TAG}"
 
@@ -4165,6 +5684,9 @@ pub_sha256_value=""
 migration_repositories_json="\"$(json_escape "$NEXUS_REPOSITORY")\""
 backup_proxy_repositories_json=""
 backup_proxy_repository_values=""
+if go_migration_enabled; then
+  migration_repositories_json="$migration_repositories_json,\"$(json_escape "$GO_NEXUS_REPOSITORY")\""
+fi
 if cargo_migration_enabled; then
   if ! source_cargo_available; then
     log "expected Cargo repository $CARGO_NEXUS_REPOSITORY is not available on datastore source"
@@ -4198,6 +5720,12 @@ if conda_migration_enabled; then
 fi
 if apt_migration_enabled; then
   migration_repositories_json="$migration_repositories_json,\"$(json_escape "$APT_NEXUS_REPOSITORY")\""
+fi
+if alpine_migration_enabled; then
+  migration_repositories_json="$migration_repositories_json,\"$(json_escape "$ALPINE_NEXUS_REPOSITORY")\""
+fi
+if r_migration_enabled; then
+  migration_repositories_json="$migration_repositories_json,\"$(json_escape "$R_NEXUS_REPOSITORY")\""
 fi
 if terraform_migration_enabled; then
   migration_repositories_json="$migration_repositories_json,\"$(json_escape "$TERRAFORM_NEXUS_REPOSITORY")\""
@@ -4278,6 +5806,19 @@ fi
 
 if [[ -n "$pub_sha256_value" ]]; then
   verify_migrated_pub_fixture "$PUB_PACKAGE" "$PUB_VERSION" "$pub_sha256_value"
+fi
+
+if go_migration_enabled; then
+  verify_migrated_go_fixture "$job_id" "$KKREPO_URL" "primary"
+  if [[ -n "$KKREPO_SECONDARY_URL" ]]; then
+    wait_for_http "kkrepo Go migration read replica" \
+      "$KKREPO_SECONDARY_URL/internal/repositories?purpose=admin" "$(auth)"
+    verify_go_repository_definition "$KKREPO_SECONDARY_URL" "secondary"
+    verify_migrated_go_fixture "$job_id" "$KKREPO_SECONDARY_URL" "secondary"
+  else
+    log "GO_MIGRATION_ENABLED requires KKREPO_MIGRATION_SECONDARY_URL"
+    exit 1
+  fi
 fi
 
 if terraform_migration_enabled; then
@@ -4361,4 +5902,70 @@ if apt_migration_enabled; then
   fi
 fi
 
-log "Docker/Cargo/Pub/Composer/Terraform/Swift/Ansible/Conda/APT migration E2E completed: job=$job_id source=${NEXUS_URL%/}/repository/${NEXUS_REPOSITORY}/v2/${IMAGE}:${TAG} target=$kkrepo_ref"
+if alpine_migration_enabled; then
+  verify_migrated_alpine_fixture "$job_id" "$KKREPO_URL" "primary" true
+  wait_for_alpine_publication_idle
+  alpine_counts_before="$(alpine_fixture_row_counts)"
+  alpine_counts_summary="$(assert_alpine_fixture_counts "$alpine_counts_before")"
+  log "Alpine migration row counts: $alpine_counts_summary"
+  run_alpine_idempotency_migration
+  wait_for_alpine_publication_idle
+  alpine_counts_after="$(alpine_fixture_row_counts)"
+  alpine_counts_summary="$(assert_alpine_fixture_counts "$alpine_counts_after")"
+  log "Alpine idempotency row counts: $alpine_counts_summary"
+  if [[ "$alpine_counts_before" != "$alpine_counts_after" ]]; then
+    log "Alpine idempotency row counts changed: before=$alpine_counts_before after=$alpine_counts_after"
+    exit 1
+  fi
+  if [[ -n "$KKREPO_SECONDARY_URL" ]]; then
+    verify_alpine_repository_definitions "$KKREPO_SECONDARY_URL" "secondary" true
+    verify_migrated_alpine_fixture "$job_id" "$KKREPO_SECONDARY_URL" "secondary" false
+    primary_index="$ALPINE_FIXTURE_WORKDIR/primary-APKINDEX.tar.gz"
+    secondary_index="$ALPINE_FIXTURE_WORKDIR/secondary-APKINDEX.tar.gz"
+    wait_for_alpine_index \
+      "$KKREPO_URL" "$ALPINE_GROUP_KKREPO_REPOSITORY" \
+      "$KKREPO_USER" "$KKREPO_PASSWORD" "$primary_index"
+    wait_for_alpine_index \
+      "$KKREPO_SECONDARY_URL" "$ALPINE_GROUP_KKREPO_REPOSITORY" \
+      "$KKREPO_USER" "$KKREPO_PASSWORD" "$secondary_index"
+    cmp "$primary_index" "$secondary_index"
+    log "Alpine signed group index is byte-identical across migration replicas"
+  else
+    log "ALPINE_MIGRATION_ENABLED requires KKREPO_MIGRATION_SECONDARY_URL"
+    exit 1
+  fi
+fi
+
+if r_migration_enabled; then
+  verify_migrated_r_fixture "$job_id" "$KKREPO_URL" "primary" true
+  wait_for_r_publication_idle
+  r_counts_before="$(r_fixture_row_counts)"
+  log "R migration row counts: $(assert_r_fixture_counts "$r_counts_before")"
+  run_r_idempotency_migration
+  wait_for_r_publication_idle
+  r_counts_after="$(r_fixture_row_counts)"
+  log "R idempotency row counts: $(assert_r_fixture_counts "$r_counts_after")"
+  if [[ "$r_counts_before" != "$r_counts_after" ]]; then
+    log "R idempotency row counts changed: before=$r_counts_before after=$r_counts_after"
+    exit 1
+  fi
+  if [[ -n "$KKREPO_SECONDARY_URL" ]]; then
+    verify_r_repository_definitions "$KKREPO_SECONDARY_URL" "secondary"
+    verify_migrated_r_fixture "$job_id" "$KKREPO_SECONDARY_URL" "secondary" false
+    primary_r_index="$R_FIXTURE_WORKDIR/primary-PACKAGES.gz"
+    secondary_r_index="$R_FIXTURE_WORKDIR/secondary-PACKAGES.gz"
+    wait_for_r_index \
+      "$KKREPO_URL" "$R_GROUP_KKREPO_REPOSITORY" "$KKREPO_USER" "$KKREPO_PASSWORD" \
+      "$primary_r_index" true
+    wait_for_r_index \
+      "$KKREPO_SECONDARY_URL" "$R_GROUP_KKREPO_REPOSITORY" \
+      "$KKREPO_USER" "$KKREPO_PASSWORD" "$secondary_r_index" true
+    cmp "$primary_r_index" "$secondary_r_index"
+    log "R group PACKAGES.gz is byte-identical across migration replicas"
+  else
+    log "R_MIGRATION_ENABLED requires KKREPO_MIGRATION_SECONDARY_URL"
+    exit 1
+  fi
+fi
+
+log "Docker/Go/Cargo/Pub/Composer/Terraform/Swift/Ansible/Conda/APT/Alpine/R migration E2E completed: job=$job_id source=${NEXUS_URL%/}/repository/${NEXUS_REPOSITORY}/v2/${IMAGE}:${TAG} target=$kkrepo_ref"

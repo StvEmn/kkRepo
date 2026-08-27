@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.startsWith;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -17,12 +18,14 @@ import com.github.klboke.kkrepo.core.RepositoryFormat;
 import com.github.klboke.kkrepo.core.RepositoryType;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AnsibleGalaxyRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AptRegistryDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.AlpineRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AssetDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.BrowseNodeDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.ComponentDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.MetadataRebuildDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryIndexRebuildDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.RRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.SwiftRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.TerraformRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.AssetRecord;
@@ -33,12 +36,14 @@ import com.github.klboke.kkrepo.server.cache.GroupMemberAssetCache;
 import com.github.klboke.kkrepo.server.cache.NexusCacheType;
 import com.github.klboke.kkrepo.server.cache.NexusLikeCacheController;
 import com.github.klboke.kkrepo.server.apt.AptService;
+import com.github.klboke.kkrepo.server.alpine.AlpineService;
 import com.github.klboke.kkrepo.server.conda.CondaService;
 import com.github.klboke.kkrepo.server.maven.MavenResponse;
 import com.github.klboke.kkrepo.server.maven.RepositoryRuntime;
 import com.github.klboke.kkrepo.server.maven.RepositoryRuntimeRegistry;
 import com.github.klboke.kkrepo.server.npm.NpmGroupPackumentCache;
 import com.github.klboke.kkrepo.server.pypi.PypiGroupSimpleIndexCache;
+import com.github.klboke.kkrepo.server.r.RService;
 import com.github.klboke.kkrepo.server.security.AuthenticatedSubject;
 import com.github.klboke.kkrepo.server.security.SecurityAuthenticationService;
 import com.github.klboke.kkrepo.server.security.SecurityManagementService;
@@ -53,6 +58,218 @@ import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.web.server.ResponseStatusException;
 
 class BrowseContentDeleteControllerTest {
+  @Test
+  void rHostedDeletionResolvesBrowseCoordinateAndDelegatesToProtocolService() {
+    Fixture fixture = fixture(true, AccessDecision.allow());
+    RepositoryRecord repository =
+        repository(1L, "r-hosted", RepositoryFormat.R, RepositoryType.HOSTED);
+    RepositoryRuntime runtime = new RepositoryRuntime(
+        1L, repository.name(), RepositoryFormat.R, RepositoryType.HOSTED, "r-hosted",
+        true, 7L, "ALLOW", null, null, true, null, null, null, null, null, List.of());
+    String browsePath = "demo/1.0.0/demo_1.0.0.tar.gz";
+    String storagePath = "src/contrib/demo_1.0.0.tar.gz";
+    RRegistryDao.PackageRecord row = rPackage(repository.id(), storagePath);
+    when(fixture.repositoryDao.findByName(repository.name())).thenReturn(Optional.of(repository));
+    when(fixture.rRegistry.findPackageByPath(repository.id(), browsePath))
+        .thenReturn(Optional.empty());
+    when(fixture.rRegistry.findPackage(
+        repository.id(), "src/contrib", "source", "demo", "1.0.0", "source"))
+        .thenReturn(Optional.of(row));
+    when(fixture.runtimeRegistry.resolveById(repository.id())).thenReturn(Optional.of(runtime));
+    when(fixture.rService.delete(
+        runtime, storagePath, "administrative delete by admin", false))
+        .thenReturn(MavenResponse.noBody(204));
+
+    BrowseContentDeleteController.BrowseDeleteResult result = fixture.controller.delete(
+        repository.name(), browsePath, null, new MockHttpServletRequest());
+
+    assertEquals(1, result.deletedAssets());
+    assertEquals(browsePath, result.path());
+    verify(fixture.rService).delete(
+        runtime, storagePath, "administrative delete by admin", false);
+    verify(fixture.assetDao, never()).deleteAssetById(anyLong());
+  }
+
+  @Test
+  void rDeletionFailsClosedAndCleanupUsesProtocolPath() {
+    Fixture fixture = fixture(true, AccessDecision.allow());
+    RepositoryRecord repository =
+        repository(1L, "r-hosted", RepositoryFormat.R, RepositoryType.HOSTED);
+    RepositoryRuntime runtime = new RepositoryRuntime(
+        1L, repository.name(), RepositoryFormat.R, RepositoryType.HOSTED, "r-hosted",
+        true, 7L, "ALLOW", null, null, true, null, null, null, null, null, List.of());
+    String path = "src/contrib/demo_1.0.0.tar.gz";
+    ComponentRecord component = new ComponentRecord(
+        21L, repository.id(), RepositoryFormat.R, "src/contrib", "demo", "1.0.0",
+        "r-source-package", new byte[] {1}, Map.of("assetPath", path), Instant.EPOCH);
+    when(fixture.repositoryDao.findByName(repository.name())).thenReturn(Optional.of(repository));
+    when(fixture.rRegistry.findPackageByPath(repository.id(), path))
+        .thenReturn(Optional.of(rPackage(repository.id(), path)));
+    when(fixture.componentDao.findById(component.id())).thenReturn(Optional.of(component));
+
+    fixture.controller.setRDeleteSupport(null, fixture.rRegistry, null);
+    assertStatus(HttpStatus.SERVICE_UNAVAILABLE, () -> fixture.controller.deleteForCleanup(
+        repository.name(), "COMPONENT", component.id(), null, "cleanup-run:1"));
+
+    fixture.controller.setRDeleteSupport(
+        fixture.runtimeRegistry, fixture.rRegistry, fixture.rService);
+    assertStatus(HttpStatus.CONFLICT, () -> fixture.controller.deleteForCleanup(
+        repository.name(), "COMPONENT", component.id(), null, "cleanup-run:2"));
+
+    when(fixture.runtimeRegistry.resolveById(repository.id())).thenReturn(Optional.of(runtime));
+    when(fixture.rService.delete(eq(runtime), eq(path), any(), eq(false)))
+        .thenReturn(MavenResponse.noBody(404), MavenResponse.noBody(500), MavenResponse.noBody(204));
+    assertStatus(HttpStatus.NOT_FOUND, () -> fixture.controller.deleteForCleanup(
+        repository.name(), "COMPONENT", component.id(), null, "cleanup-run:3"));
+    assertStatus(HttpStatus.CONFLICT, () -> fixture.controller.deleteForCleanup(
+        repository.name(), "COMPONENT", component.id(), null, "cleanup-run:4"));
+    assertEquals(1, fixture.controller.deleteForCleanup(
+        repository.name(), "COMPONENT", component.id(), null, "cleanup-run:5"));
+
+    ComponentRecord fallback = new ComponentRecord(
+        22L, repository.id(), RepositoryFormat.R, "src/contrib", "other", "2.0",
+        "r-source-package", new byte[] {2}, Map.of(), Instant.EPOCH);
+    AssetRecord fallbackAsset = asset(
+        23L, fallback.id(), 24L, RepositoryFormat.R,
+        "src/contrib/other_2.0.tar.gz", "r-source-package", Map.of());
+    when(fixture.componentDao.findById(fallback.id())).thenReturn(Optional.of(fallback));
+    when(fixture.assetDao.listAssetsByComponent(fallback.id())).thenReturn(List.of(fallbackAsset));
+    when(fixture.rRegistry.findPackageByPath(repository.id(), fallbackAsset.path()))
+        .thenReturn(Optional.of(rPackage(repository.id(), fallbackAsset.path())));
+    when(fixture.rService.delete(eq(runtime), eq(fallbackAsset.path()), any(), eq(false)))
+        .thenReturn(MavenResponse.noBody(204));
+    assertEquals(1, fixture.controller.deleteForCleanup(
+        repository.name(), "COMPONENT", fallback.id(), " ", "cleanup-run:6"));
+
+    ComponentRecord empty = new ComponentRecord(
+        25L, repository.id(), RepositoryFormat.R, "src/contrib", "empty", "1.0",
+        "r-source-package", new byte[] {3}, null, Instant.EPOCH);
+    when(fixture.componentDao.findById(empty.id())).thenReturn(Optional.of(empty));
+    when(fixture.assetDao.listAssetsByComponent(empty.id())).thenReturn(List.of());
+    assertStatus(HttpStatus.NOT_FOUND, () -> fixture.controller.deleteForCleanup(
+        repository.name(), "COMPONENT", empty.id(), null, "cleanup-run:7"));
+  }
+
+  @Test
+  void alpineHostedDeletionResolvesBrowseCoordinateAndDelegatesToProtocolService() {
+    Fixture fixture = fixture(true, AccessDecision.allow());
+    RepositoryRecord repository =
+        repository(1L, "alpine-hosted", RepositoryFormat.ALPINE, RepositoryType.HOSTED);
+    RepositoryRuntime runtime = new RepositoryRuntime(
+        1L, repository.name(), RepositoryFormat.ALPINE, RepositoryType.HOSTED, "alpine-hosted",
+        true, 7L, "ALLOW", null, null, true, null, null, null, null, null, List.of());
+    String browsePath = "v3.23/main/x86_64/demo/1-r0/demo-1-r0.apk";
+    String storagePath = "v3.23/main/x86_64/demo-1-r0.apk";
+    AlpineRegistryDao.PackageRecord row = alpinePackage(repository.id(), storagePath);
+    when(fixture.repositoryDao.findByName(repository.name())).thenReturn(Optional.of(repository));
+    when(fixture.alpineRegistry.findPackageByPath(repository.id(), browsePath))
+        .thenReturn(Optional.empty());
+    when(fixture.alpineRegistry.findPackage(
+        repository.id(), "v3.23/main/x86_64", "main", "demo", "1-r0", "x86_64"))
+        .thenReturn(Optional.of(row));
+    when(fixture.runtimeRegistry.resolveById(repository.id())).thenReturn(Optional.of(runtime));
+    when(fixture.alpineService.delete(
+        runtime, storagePath, "administrative delete by admin", false))
+        .thenReturn(MavenResponse.noBody(204));
+
+    BrowseContentDeleteController.BrowseDeleteResult result = fixture.controller.delete(
+        repository.name(), browsePath, null, new MockHttpServletRequest());
+
+    assertEquals(1, result.deletedAssets());
+    assertEquals(browsePath, result.path());
+    verify(fixture.alpineService).delete(
+        runtime, storagePath, "administrative delete by admin", false);
+    verify(fixture.assetDao, never()).deleteAssetById(anyLong());
+  }
+
+  @Test
+  void alpineDeletionSupportsDirectPathsAndFailsClosedForUnavailableState() {
+    Fixture fixture = fixture(true, AccessDecision.allow());
+    RepositoryRecord repository =
+        repository(1L, "alpine-hosted", RepositoryFormat.ALPINE, RepositoryType.HOSTED);
+    RepositoryRuntime runtime = new RepositoryRuntime(
+        1L, repository.name(), RepositoryFormat.ALPINE, RepositoryType.HOSTED, "alpine-hosted",
+        true, 7L, "ALLOW", null, null, true, null, null, null, null, null, List.of());
+    String path = "v3.23/main/x86_64/demo-1-r0.apk";
+    when(fixture.repositoryDao.findByName(repository.name())).thenReturn(Optional.of(repository));
+    when(fixture.alpineRegistry.findPackageByPath(repository.id(), path))
+        .thenReturn(Optional.of(alpinePackage(repository.id(), path)));
+
+    fixture.controller.setAlpineDeleteSupport(null, fixture.alpineRegistry, null);
+    assertStatus(HttpStatus.SERVICE_UNAVAILABLE, () -> fixture.controller.delete(
+        repository.name(), path, null, new MockHttpServletRequest()));
+
+    fixture.controller.setAlpineDeleteSupport(
+        fixture.runtimeRegistry, fixture.alpineRegistry, fixture.alpineService);
+    assertStatus(HttpStatus.CONFLICT, () -> fixture.controller.delete(
+        repository.name(), path, null, new MockHttpServletRequest()));
+
+    when(fixture.runtimeRegistry.resolveById(repository.id())).thenReturn(Optional.of(runtime));
+    when(fixture.alpineService.delete(eq(runtime), eq(path), any(), eq(false)))
+        .thenReturn(MavenResponse.noBody(404), MavenResponse.noBody(500));
+    assertStatus(HttpStatus.NOT_FOUND, () -> fixture.controller.delete(
+        repository.name(), path, null, new MockHttpServletRequest()));
+    assertStatus(HttpStatus.CONFLICT, () -> fixture.controller.delete(
+        repository.name(), path, null, new MockHttpServletRequest()));
+
+    fixture.controller.setAlpineDeleteSupport(
+        fixture.runtimeRegistry, null, fixture.alpineService);
+    when(fixture.alpineService.delete(eq(runtime), eq(path), any(), eq(false)))
+        .thenReturn(MavenResponse.noBody(204));
+    assertEquals(1, fixture.controller.delete(
+        repository.name(), path, null, new MockHttpServletRequest()).deletedAssets());
+  }
+
+  @Test
+  void alpineCleanupUsesComponentPathAndAssetFallback() {
+    Fixture fixture = fixture(true, AccessDecision.allow());
+    RepositoryRecord repository =
+        repository(1L, "alpine-hosted", RepositoryFormat.ALPINE, RepositoryType.HOSTED);
+    RepositoryRuntime runtime = new RepositoryRuntime(
+        1L, repository.name(), RepositoryFormat.ALPINE, RepositoryType.HOSTED, "alpine-hosted",
+        true, 7L, "ALLOW", null, null, true, null, null, null, null, null, List.of());
+    String path = "v3.23/main/x86_64/demo-1-r0.apk";
+    ComponentRecord component = new ComponentRecord(
+        21L, repository.id(), RepositoryFormat.ALPINE, "v3.23/main/x86_64", "demo", "1-r0",
+        "alpine-apk-v2", new byte[] {1}, Map.of("assetPath", path), Instant.EPOCH);
+    when(fixture.repositoryDao.findByName(repository.name())).thenReturn(Optional.of(repository));
+    when(fixture.componentDao.findById(component.id())).thenReturn(Optional.of(component));
+    when(fixture.alpineRegistry.findPackageByPath(repository.id(), path))
+        .thenReturn(Optional.of(alpinePackage(repository.id(), path)));
+    when(fixture.runtimeRegistry.resolveById(repository.id())).thenReturn(Optional.of(runtime));
+    when(fixture.alpineService.delete(eq(runtime), any(), any(), eq(false)))
+        .thenReturn(MavenResponse.noBody(204));
+
+    assertEquals(1, fixture.controller.deleteForCleanup(
+        repository.name(), "COMPONENT", component.id(), null, "cleanup-run:1"));
+
+    ComponentRecord fallback = new ComponentRecord(
+        22L, repository.id(), RepositoryFormat.ALPINE, "v3.23/main/x86_64", "other", "2-r0",
+        "alpine-apk-v2", new byte[] {2}, Map.of(), Instant.EPOCH);
+    AssetRecord fallbackAsset = asset(
+        23L, fallback.id(), 24L, RepositoryFormat.ALPINE,
+        "v3.23/main/x86_64/other-2-r0.apk", "alpine-apk-v2", Map.of());
+    when(fixture.componentDao.findById(fallback.id())).thenReturn(Optional.of(fallback));
+    when(fixture.assetDao.listAssetsByComponent(fallback.id())).thenReturn(List.of(fallbackAsset));
+    when(fixture.alpineRegistry.findPackageByPath(repository.id(), fallbackAsset.path()))
+        .thenReturn(Optional.of(alpinePackage(repository.id(), fallbackAsset.path())));
+    assertEquals(1, fixture.controller.deleteForCleanup(
+        repository.name(), "COMPONENT", fallback.id(), " ", "cleanup-run:2"));
+
+    when(fixture.assetDao.findAssetById(fallbackAsset.id()))
+        .thenReturn(Optional.of(fallbackAsset));
+    assertEquals(1, fixture.controller.deleteForCleanup(
+        repository.name(), "ASSET", fallbackAsset.id(), null, "cleanup-run:3"));
+
+    ComponentRecord empty = new ComponentRecord(
+        25L, repository.id(), RepositoryFormat.ALPINE, "v3.23/main/x86_64", "empty", "1-r0",
+        "alpine-apk-v2", new byte[] {3}, null, Instant.EPOCH);
+    when(fixture.componentDao.findById(empty.id())).thenReturn(Optional.of(empty));
+    when(fixture.assetDao.listAssetsByComponent(empty.id())).thenReturn(List.of());
+    assertStatus(HttpStatus.NOT_FOUND, () -> fixture.controller.deleteForCleanup(
+        repository.name(), "COMPONENT", empty.id(), null, "cleanup-run:4"));
+  }
+
   @Test
   void aptHostedDeletionResolvesBrowseCoordinateAndDelegatesToProtocolService() {
     Fixture fixture = fixture(true, AccessDecision.allow());
@@ -333,6 +550,172 @@ class BrowseContentDeleteControllerTest {
     verify(fixture.componentDao).deleteIfNoAssets(21L);
     verify(fixture.metadataRebuildDao).enqueue(1L, "ga:com.acme/app");
     verify(fixture.metadataRebuildDao).enqueue(1L, "gav:com.acme/app/1.0-SNAPSHOT");
+  }
+
+  @Test
+  void deletesTimestampedMavenSnapshotAssetAndEnqueuesMetadataRebuilds() {
+    Fixture fixture = fixture(true, AccessDecision.allow());
+    RepositoryRecord repository =
+        repository(1L, "maven", RepositoryFormat.MAVEN2, RepositoryType.HOSTED);
+    String path = "com/acme/app/1.0-SNAPSHOT/app-1.0-20260623.055437-2.jar";
+    AssetRecord jar = asset(11L, 21L, 31L, RepositoryFormat.MAVEN2, path, "artifact", Map.of());
+    AssetRecord sha1 = asset(
+        12L, null, 32L, RepositoryFormat.MAVEN2, path + ".sha1", "checksum", Map.of());
+    when(fixture.repositoryDao.findByName("maven")).thenReturn(Optional.of(repository));
+    when(fixture.assetDao.findAssetByPath(1L, path)).thenReturn(Optional.of(jar));
+    when(fixture.assetDao.findAssetByPath(1L, path + ".sha1")).thenReturn(Optional.of(sha1));
+    when(fixture.assetDao.listAssetsByPrefix(1L, path + "/")).thenReturn(List.of());
+
+    BrowseContentDeleteController.BrowseDeleteResult result = fixture.controller.delete(
+        "maven", "/" + path, null, new MockHttpServletRequest());
+
+    assertEquals(2, result.deletedAssets());
+    verify(fixture.assetDao).deleteAssetById(11L);
+    verify(fixture.assetDao).deleteAssetById(12L);
+    verify(fixture.metadataRebuildDao).enqueue(1L, "ga:com.acme/app");
+    verify(fixture.metadataRebuildDao).enqueue(1L, "gav:com.acme/app/1.0-SNAPSHOT");
+  }
+
+  @Test
+  void deletesMavenSnapshotMetadataAndEnqueuesGaGavRebuilds() {
+    Fixture fixture = fixture(true, AccessDecision.allow());
+    RepositoryRecord repository =
+        repository(1L, "maven", RepositoryFormat.MAVEN2, RepositoryType.HOSTED);
+    String path = "com/acme/app/1.0-SNAPSHOT/maven-metadata.xml";
+    AssetRecord metadata =
+        asset(11L, null, 31L, RepositoryFormat.MAVEN2, path, "metadata", Map.of());
+    AssetRecord sha1 = asset(
+        12L, null, 32L, RepositoryFormat.MAVEN2, path + ".sha1", "checksum", Map.of());
+    when(fixture.repositoryDao.findByName("maven")).thenReturn(Optional.of(repository));
+    when(fixture.assetDao.findAssetByPath(1L, path)).thenReturn(Optional.of(metadata));
+    when(fixture.assetDao.findAssetByPath(1L, path + ".sha1")).thenReturn(Optional.of(sha1));
+    when(fixture.assetDao.listAssetsByPrefix(1L, path + "/")).thenReturn(List.of());
+    when(fixture.componentDao.listByGa(1L, "com.acme.app", "1.0-SNAPSHOT"))
+        .thenReturn(List.of());
+
+    BrowseContentDeleteController.BrowseDeleteResult result = fixture.controller.delete(
+        "maven", "/" + path, null, new MockHttpServletRequest());
+
+    assertEquals(2, result.deletedAssets());
+    verify(fixture.assetDao).deleteAssetById(11L);
+    verify(fixture.assetDao).deleteAssetById(12L);
+    verify(fixture.metadataRebuildDao).enqueue(1L, "ga:com.acme/app");
+    verify(fixture.metadataRebuildDao).enqueue(1L, "gav:com.acme/app/1.0-SNAPSHOT");
+    verify(fixture.metadataRebuildDao, never())
+        .enqueue(1L, "ga:com.acme.app/1.0-SNAPSHOT");
+  }
+
+  @Test
+  void keepsArtifactLevelMavenMetadataWhenArtifactIdEndsWithSnapshot() {
+    Fixture fixture = fixture(true, AccessDecision.allow());
+    RepositoryRecord repository =
+        repository(1L, "maven", RepositoryFormat.MAVEN2, RepositoryType.HOSTED);
+    String path = "com/acme/app-SNAPSHOT/maven-metadata.xml";
+    AssetRecord metadata =
+        asset(11L, null, 31L, RepositoryFormat.MAVEN2, path, "metadata", Map.of());
+    ComponentRecord component = new ComponentRecord(
+        21L, repository.id(), RepositoryFormat.MAVEN2, "com.acme", "app-SNAPSHOT", "1.0",
+        "maven", new byte[] {1}, Map.of(), Instant.EPOCH);
+    when(fixture.repositoryDao.findByName("maven")).thenReturn(Optional.of(repository));
+    when(fixture.assetDao.findAssetByPath(1L, path)).thenReturn(Optional.of(metadata));
+    when(fixture.assetDao.listAssetsByPrefix(1L, path + "/")).thenReturn(List.of());
+    when(fixture.componentDao.listByGa(1L, "com.acme", "app-SNAPSHOT"))
+        .thenReturn(List.of(component));
+
+    BrowseContentDeleteController.BrowseDeleteResult result = fixture.controller.delete(
+        "maven", "/" + path, null, new MockHttpServletRequest());
+
+    assertEquals(1, result.deletedAssets());
+    verify(fixture.metadataRebuildDao).enqueue(1L, "ga:com.acme/app-SNAPSHOT");
+    verify(fixture.metadataRebuildDao, never()).enqueue(eq(1L), startsWith("gav:"));
+  }
+
+  @Test
+  void keepsArtifactLevelMavenMetadataAtDifferentGroupDepths() {
+    Fixture fixture = fixture(true, AccessDecision.allow());
+    RepositoryRecord repository =
+        repository(1L, "maven", RepositoryFormat.MAVEN2, RepositoryType.HOSTED);
+    String nestedGroupPath = "com/acme/app/maven-metadata.xml";
+    String singleGroupPath = "com/app/maven-metadata.xml";
+    AssetRecord nestedGroupMetadata = asset(
+        11L, null, 31L, RepositoryFormat.MAVEN2, nestedGroupPath, "metadata", Map.of());
+    AssetRecord singleGroupMetadata = asset(
+        12L, null, 32L, RepositoryFormat.MAVEN2, singleGroupPath, "metadata", Map.of());
+    when(fixture.repositoryDao.findByName("maven")).thenReturn(Optional.of(repository));
+    when(fixture.assetDao.findAssetByPath(1L, nestedGroupPath))
+        .thenReturn(Optional.of(nestedGroupMetadata));
+    when(fixture.assetDao.findAssetByPath(1L, singleGroupPath))
+        .thenReturn(Optional.of(singleGroupMetadata));
+    when(fixture.assetDao.listAssetsByPrefix(1L, nestedGroupPath + "/"))
+        .thenReturn(List.of());
+    when(fixture.assetDao.listAssetsByPrefix(1L, singleGroupPath + "/"))
+        .thenReturn(List.of());
+
+    assertEquals(1, fixture.controller.delete(
+        "maven", "/" + nestedGroupPath, null, new MockHttpServletRequest()).deletedAssets());
+    assertEquals(1, fixture.controller.delete(
+        "maven", "/" + singleGroupPath, null, new MockHttpServletRequest()).deletedAssets());
+
+    verify(fixture.metadataRebuildDao).enqueue(1L, "ga:com.acme/app");
+    verify(fixture.metadataRebuildDao).enqueue(1L, "ga:com/app");
+    verify(fixture.metadataRebuildDao, never()).enqueue(eq(1L), startsWith("gav:"));
+  }
+
+  @Test
+  void deletesReleaseMavenAssetAndEnqueuesGaRebuild() {
+    Fixture fixture = fixture(true, AccessDecision.allow());
+    RepositoryRecord repository =
+        repository(1L, "maven", RepositoryFormat.MAVEN2, RepositoryType.HOSTED);
+    String path = "com/acme/app/1.0/app-1.0.jar";
+    AssetRecord jar = asset(11L, 21L, 31L, RepositoryFormat.MAVEN2, path, "artifact", Map.of());
+    when(fixture.repositoryDao.findByName("maven")).thenReturn(Optional.of(repository));
+    when(fixture.assetDao.findAssetByPath(1L, path)).thenReturn(Optional.of(jar));
+    when(fixture.assetDao.listAssetsByPrefix(1L, path + "/")).thenReturn(List.of());
+
+    BrowseContentDeleteController.BrowseDeleteResult result = fixture.controller.delete(
+        "maven", "/" + path, null, new MockHttpServletRequest());
+
+    assertEquals(1, result.deletedAssets());
+    verify(fixture.metadataRebuildDao).enqueue(1L, "ga:com.acme/app");
+    verify(fixture.metadataRebuildDao, never()).enqueue(eq(1L), startsWith("gav:"));
+  }
+
+  @Test
+  void deletesSnapshotVersionDirectoryAndEnqueuesGaGavRebuild() {
+    Fixture fixture = fixture(true, AccessDecision.allow());
+    RepositoryRecord repository =
+        repository(1L, "maven", RepositoryFormat.MAVEN2, RepositoryType.HOSTED);
+    String dir = "com/acme/app/1.0-SNAPSHOT";
+    String jarPath = dir + "/app-1.0-20260623.055437-2.jar";
+    AssetRecord jar = asset(11L, 21L, 31L, RepositoryFormat.MAVEN2, jarPath, "artifact", Map.of());
+    when(fixture.repositoryDao.findByName("maven")).thenReturn(Optional.of(repository));
+    when(fixture.assetDao.listAssetsByPrefix(1L, dir + "/")).thenReturn(List.of(jar));
+
+    BrowseContentDeleteController.BrowseDeleteResult result = fixture.controller.delete(
+        "maven", "/" + dir, null, new MockHttpServletRequest());
+
+    assertEquals(1, result.deletedAssets());
+    verify(fixture.metadataRebuildDao).enqueue(1L, "ga:com.acme/app");
+    verify(fixture.metadataRebuildDao).enqueue(1L, "gav:com.acme/app/1.0-SNAPSHOT");
+  }
+
+  @Test
+  void deletesReleaseVersionDirectoryAndEnqueuesGaRebuild() {
+    Fixture fixture = fixture(true, AccessDecision.allow());
+    RepositoryRecord repository =
+        repository(1L, "maven", RepositoryFormat.MAVEN2, RepositoryType.HOSTED);
+    String dir = "com/acme/app/1.0";
+    String jarPath = dir + "/app-1.0.jar";
+    AssetRecord jar = asset(11L, 21L, 31L, RepositoryFormat.MAVEN2, jarPath, "artifact", Map.of());
+    when(fixture.repositoryDao.findByName("maven")).thenReturn(Optional.of(repository));
+    when(fixture.assetDao.listAssetsByPrefix(1L, dir + "/")).thenReturn(List.of(jar));
+
+    BrowseContentDeleteController.BrowseDeleteResult result = fixture.controller.delete(
+        "maven", "/" + dir, null, new MockHttpServletRequest());
+
+    assertEquals(1, result.deletedAssets());
+    verify(fixture.metadataRebuildDao).enqueue(1L, "ga:com.acme/app");
+    verify(fixture.metadataRebuildDao, never()).enqueue(eq(1L), startsWith("gav:"));
   }
 
   @Test
@@ -864,6 +1247,10 @@ class BrowseContentDeleteControllerTest {
     CondaService condaService = mock(CondaService.class);
     AptRegistryDao aptRegistry = mock(AptRegistryDao.class);
     AptService aptService = mock(AptService.class);
+    AlpineRegistryDao alpineRegistry = mock(AlpineRegistryDao.class);
+    AlpineService alpineService = mock(AlpineService.class);
+    RRegistryDao rRegistry = mock(RRegistryDao.class);
+    RService rService = mock(RService.class);
     PermissionSubject permissionSubject = mock(PermissionSubject.class);
     AuthenticatedSubject subject =
         new AuthenticatedSubject("test", "admin", "local", null, permissionSubject);
@@ -877,11 +1264,15 @@ class BrowseContentDeleteControllerTest {
         groupMemberAssetCache, cacheController);
     controller.setCondaDeleteSupport(runtimeRegistry, condaService);
     controller.setAptDeleteSupport(runtimeRegistry, aptRegistry, aptService);
+    controller.setAlpineDeleteSupport(runtimeRegistry, alpineRegistry, alpineService);
+    controller.setRDeleteSupport(runtimeRegistry, rRegistry, rService);
     return new Fixture(
         repositoryDao, assetDao, terraformRegistryDao, swiftRegistryDao, ansibleRegistryDao,
         browseNodeDao, componentDao, metadataRebuildDao,
         indexRebuildDao, npmCache, pypiCache, groupMemberAssetCache, cacheController,
-        runtimeRegistry, condaService, aptRegistry, aptService, controller);
+        runtimeRegistry, condaService, aptRegistry, aptService, alpineRegistry, alpineService,
+        rRegistry, rService,
+        controller);
   }
 
   private static RepositoryRecord repository(
@@ -924,6 +1315,26 @@ class BrowseContentDeleteControllerTest {
         Instant.EPOCH, Instant.EPOCH, Instant.EPOCH);
   }
 
+  private static AlpineRegistryDao.PackageRecord alpinePackage(
+      long repositoryId, String path) {
+    return new AlpineRegistryDao.PackageRecord(
+        1L, repositoryId, "v3.23/main/x86_64", "main", "x86_64", "demo", "1-r0",
+        "x86_64", path.substring(path.lastIndexOf('/') + 1), path,
+        Map.of("P", "demo", "V", "1-r0", "A", "x86_64", "I", "4"),
+        "identity", "a".repeat(64), "b".repeat(64), 4L,
+        2L, 3L, AlpineRegistryDao.SOURCE_HOSTED, 1L,
+        Instant.EPOCH, Instant.EPOCH, Instant.EPOCH);
+  }
+
+  private static RRegistryDao.PackageRecord rPackage(long repositoryId, String path) {
+    return new RRegistryDao.PackageRecord(
+        1L, repositoryId, "src/contrib", "source", "source", "demo", "1.0.0",
+        new byte[] {1}, "source", path.substring(path.lastIndexOf('/') + 1), path,
+        Map.of("Package", "demo", "Version", "1.0.0"), "a".repeat(32),
+        "b".repeat(64), "b".repeat(64), 4L, 2L, 3L, RRegistryDao.SOURCE_HOSTED, 1L,
+        Instant.EPOCH, Instant.EPOCH, Instant.EPOCH);
+  }
+
   private record Fixture(
       RepositoryDao repositoryDao,
       AssetDao assetDao,
@@ -942,6 +1353,10 @@ class BrowseContentDeleteControllerTest {
       CondaService condaService,
       AptRegistryDao aptRegistry,
       AptService aptService,
+      AlpineRegistryDao alpineRegistry,
+      AlpineService alpineService,
+      RRegistryDao rRegistry,
+      RService rService,
       BrowseContentDeleteController controller) {
   }
 }

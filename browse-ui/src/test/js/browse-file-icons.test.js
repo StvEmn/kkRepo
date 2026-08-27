@@ -43,8 +43,13 @@ test("maps supported repository artifacts to precise file icons", () => {
     ["package-1.0.0.gem", "rubygems", "file-box"],
     ["package-1.0.0.gemspec.rz", "rubygems", "file-archive"],
     ["package-1.0.0.rpm", "yum", "file-box"],
+    ["kkrepo-alpine-demo-11-1.0.0-r0.apk", "alpine", "file-apk"],
     ["primary.xml.gz", "yum", "file-archive"],
     ["package-1.0.0.tar.gz", "pub", "file-archive"],
+    ["pytorch_model.bin", "huggingface", "binary"],
+    ["model.safetensors", "huggingface", "layers"],
+    ["model-00001-of-00002.safetensors", "huggingface", "layers"],
+    ["model.safetensors.index.json", "huggingface", "file-json"],
     ["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "docker", "binary"],
     ["unknown.asset", "raw", "file"],
   ];
@@ -57,4 +62,8 @@ test("matches file extensions case-insensitively", () => {
   const fileIconName = loadFileIconName();
   assert.equal(fileIconName("DEMO.JAR", "maven2"), "file-java-archive");
   assert.equal(fileIconName("PACKAGE.NUPKG", "nuget"), "file-box");
+  assert.equal(fileIconName("PACKAGE.APK", "alpine"), "file-apk");
+  assert.equal(fileIconName("MODEL.SAFETENSORS", "huggingface"), "layers");
+  assert.equal(fileIconName("PYTORCH_MODEL.BIN", "huggingface"), "binary");
+  assert.equal(fileIconName("PACKAGE.APK", "raw"), "file");
 });

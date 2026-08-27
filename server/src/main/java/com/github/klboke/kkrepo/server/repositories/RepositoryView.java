@@ -9,6 +9,8 @@ import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.HostedSet
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.ProxySettings;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.RawSettings;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.AptSettings;
+import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.AlpineSettings;
+import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.PypiSettings;
 
 public record RepositoryView(
     Long id,
@@ -26,7 +28,9 @@ public record RepositoryView(
     DockerSettings docker,
     CargoSettings cargo,
     GroupSettings group,
-    AptSettings apt) {
+    AptSettings apt,
+    AlpineSettings alpine,
+    PypiSettings pypi) {
   public RepositoryView(
       Long id,
       String name,
@@ -44,6 +48,53 @@ public record RepositoryView(
       CargoSettings cargo,
       GroupSettings group) {
     this(id, name, recipe, format, type, online, blobStoreName,
-        strictContentTypeValidation, url, hosted, proxy, raw, docker, cargo, group, null);
+        strictContentTypeValidation, url, hosted, proxy, raw, docker, cargo, group,
+        null, null, null);
+  }
+
+  public RepositoryView(
+      Long id,
+      String name,
+      String recipe,
+      RepositoryFormat format,
+      RepositoryType type,
+      boolean online,
+      String blobStoreName,
+      boolean strictContentTypeValidation,
+      String url,
+      HostedSettings hosted,
+      ProxySettings proxy,
+      RawSettings raw,
+      DockerSettings docker,
+      CargoSettings cargo,
+      GroupSettings group,
+      AptSettings apt) {
+    this(id, name, recipe, format, type, online, blobStoreName,
+        strictContentTypeValidation, url, hosted, proxy, raw, docker, cargo, group,
+        apt, null, null);
+  }
+
+  /** Compatibility constructor for callers that predate PyPI proxy index-path settings. */
+  public RepositoryView(
+      Long id,
+      String name,
+      String recipe,
+      RepositoryFormat format,
+      RepositoryType type,
+      boolean online,
+      String blobStoreName,
+      boolean strictContentTypeValidation,
+      String url,
+      HostedSettings hosted,
+      ProxySettings proxy,
+      RawSettings raw,
+      DockerSettings docker,
+      CargoSettings cargo,
+      GroupSettings group,
+      AptSettings apt,
+      AlpineSettings alpine) {
+    this(id, name, recipe, format, type, online, blobStoreName,
+        strictContentTypeValidation, url, hosted, proxy, raw, docker, cargo, group,
+        apt, alpine, null);
   }
 }

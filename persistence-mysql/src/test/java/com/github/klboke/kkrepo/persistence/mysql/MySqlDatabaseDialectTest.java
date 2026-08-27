@@ -43,12 +43,48 @@ class MySqlDatabaseDialectTest {
         "MATCH(s.namespace, s.name, s.version, s.keywords) AGAINST (? IN BOOLEAN MODE)",
         dialect.search().componentSearchPredicate("s"));
     assertEquals(
-        "+com* +example* +artifact* +1* +0*",
+        "com* +example* +artifact* 1* 0*",
         dialect.search().prepareComponentQuery("\"".repeat(4096) + "Com.Example artifact-1.0"));
+    assertEquals(
+        "+kkrepo* +alpine* +migration* +app* +datastore_h2_31894582966_1*",
+        dialect.search().prepareComponentQuery(
+            "kkrepo-alpine-migration-app-datastore_h2_31894582966_1"));
+    assertEquals(
+        "c.last_updated_at DESC, c.id DESC",
+        dialect.search().componentSearchOrderBy("c"));
+    assertTrue(dialect.search().supportsAdaptiveComponentSearch());
+    assertEquals(
+        "/*+ JOIN_ORDER(search_order, cs, c, r) "
+            + "INDEX(search_order idx_component_format_last_updated) */",
+        dialect.search().orderedComponentSearchHint(true, false, true));
+    assertEquals(
+        "/*+ JOIN_ORDER(search_order, cs, c, r) "
+            + "INDEX(search_order idx_component_repo_format_updated) */",
+        dialect.search().orderedComponentSearchHint(true, true, true));
+    assertEquals(
+        "/*+ JOIN_ORDER(search_order, c, r) "
+            + "INDEX(search_order idx_component_repo_last_updated) */",
+        dialect.search().orderedComponentSearchHint(false, true, false));
     assertThrows(IllegalArgumentException.class,
         () -> dialect.json().extractText("attributes_json; DROP TABLE asset", "key"));
     assertThrows(IllegalArgumentException.class,
         () -> dialect.search().componentSearchPredicate("s JOIN component"));
+    assertThrows(IllegalArgumentException.class,
+        () -> dialect.search().componentSearchOrderBy("c; DROP TABLE component"));
+  }
+
+  @Test
+  void keepsTermsBelowTheDefaultInnoDbFullTextMinimumOptional() {
+    assertEquals(
+        "qh* +agent* +spec* +agentscope*",
+        dialect.search().prepareComponentQuery("qh-agent-spec-agentscope"));
+  }
+
+  @Test
+  void keepsDefaultInnoDbStopwordsOptional() {
+    assertEquals(
+        "com* +qunhe* +android* +analytics*",
+        dialect.search().prepareComponentQuery("com.qunhe.android.analytics"));
   }
 
   @Test
@@ -69,6 +105,40 @@ class MySqlDatabaseDialectTest {
     assertTrue(dialect.conda().insertChannelStateIfAbsentSql().contains("INSERT IGNORE"));
     assertTrue(dialect.conda().insertCoordinateLeaseIfAbsentSql().contains("INSERT IGNORE"));
     assertEquals(Integer.MIN_VALUE, dialect.conda().streamingFetchSize());
+  }
+
+  @Test
+  void keepsAlpineOptimizerSqlInsideMySqlBackend() {
+    var cursor = dialect.alpine().packageNameIdCursor("busybox", 41L);
+
+    assertEquals(
+        "(package_name > ? OR (package_name = ? AND id > ?))",
+        cursor.predicate());
+    assertEquals(List.of("busybox", "busybox", 41L), cursor.arguments());
+    assertTrue(dialect.alpine().pendingSuitesSql()
+        .contains("FORCE INDEX (idx_alpine_suite_worker)"));
+    assertTrue(dialect.alpine().pendingSuitesSql().contains("STRAIGHT_JOIN repository"));
+    assertTrue(dialect.alpine().snapshotCleanupCandidatesSql()
+        .contains("JOIN alpine_suite_state suite"));
+  }
+
+  @Test
+  void keepsROptimizerSqlInsideMySqlBackend() {
+    var cursor = dialect.r().packageNameIdCursor("demo", 41L);
+
+    assertEquals(
+        "(package_name > ? OR (package_name = ? AND id > ?))",
+        cursor.predicate());
+    assertEquals(List.of("demo", "demo", 41L), cursor.arguments());
+    assertTrue(dialect.r().pendingSuitesSql()
+        .contains("FORCE INDEX (idx_r_suite_worker)"));
+    assertTrue(dialect.r().pendingSuitesSql().contains("STRAIGHT_JOIN repository"));
+    assertTrue(dialect.r().snapshotCleanupCandidatesSql()
+        .contains("JOIN r_suite_state suite"));
+    assertTrue(dialect.r().snapshotCleanupCandidatesSql()
+        .contains("FORCE INDEX (idx_r_snapshot_retention)"));
+    assertTrue(dialect.r().snapshotCleanupCandidatesSql()
+        .contains("newer.publish_complete = TRUE"));
   }
 
   @Test

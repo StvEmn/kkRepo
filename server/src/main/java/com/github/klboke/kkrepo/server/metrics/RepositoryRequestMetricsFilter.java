@@ -304,8 +304,55 @@ public class RepositoryRequestMetricsFilter extends OncePerRequestFilter {
       case CONDA -> condaOperation(path, normalizedMethod);
       case CONAN -> conanOperation(path, normalizedMethod);
       case APT -> aptOperation(path, normalizedMethod);
+      case ALPINE -> alpineOperation(path, normalizedMethod);
+      case R -> rOperation(path, normalizedMethod);
+      case HUGGINGFACE -> huggingFaceOperation(path, normalizedMethod);
       case RAW -> rawOperation(normalizedMethod);
     };
+  }
+
+  private static String rOperation(String path, String method) {
+    if (path.endsWith("/PACKAGES.gz") || path.equals("src/contrib/PACKAGES.gz")) {
+      return "r_packages_index";
+    }
+    if (path.endsWith(".tar.gz")) {
+      return switch (method) {
+        case "PUT", "POST" -> "r_package_publish";
+        case "DELETE" -> "r_package_delete";
+        case "HEAD" -> "r_package_head";
+        default -> "r_package_download";
+      };
+    }
+    return "r_content";
+  }
+
+  private static String huggingFaceOperation(String path, String method) {
+    if (path.startsWith("api/models/") && path.contains("/paths-info/")) {
+      return "huggingface_paths_info";
+    }
+    if (path.startsWith("api/models/") && path.contains("/tree/")) {
+      return "huggingface_tree";
+    }
+    if (path.startsWith("api/models/") && path.endsWith("/refs")) {
+      return "huggingface_refs";
+    }
+    if (path.startsWith("api/models/")) return "huggingface_model_info";
+    if (path.contains("/resolve/")) {
+      return "HEAD".equals(method) ? "huggingface_file_head" : "huggingface_file_download";
+    }
+    return "huggingface_repository";
+  }
+
+  private static String alpineOperation(String path, String method) {
+    if (path.endsWith("/APKINDEX.tar.gz")) return "alpine_package_index";
+    if (path.endsWith(".apk")) {
+      return switch (method) {
+        case "PUT", "POST" -> "alpine_package_upload";
+        case "DELETE" -> "alpine_package_delete";
+        default -> "alpine_package_download";
+      };
+    }
+    return "alpine_repository";
   }
 
   private static String aptOperation(String path, String method) {

@@ -1,5 +1,6 @@
 package com.github.klboke.kkrepo.persistence.postgresql;
 
+import com.github.klboke.kkrepo.persistence.jdbc.spi.AlpinePersistenceDialect;
 import com.github.klboke.kkrepo.persistence.jdbc.spi.ComponentPersistenceDialect;
 import com.github.klboke.kkrepo.persistence.jdbc.spi.CondaPersistenceDialect;
 import com.github.klboke.kkrepo.persistence.jdbc.spi.ConanPersistenceDialect;
@@ -7,7 +8,9 @@ import com.github.klboke.kkrepo.persistence.jdbc.spi.CoordinationPersistenceDial
 import com.github.klboke.kkrepo.persistence.jdbc.spi.DatabaseDialect;
 import com.github.klboke.kkrepo.persistence.jdbc.spi.DatabaseType;
 import com.github.klboke.kkrepo.persistence.jdbc.spi.JsonPersistenceDialect;
+import com.github.klboke.kkrepo.persistence.jdbc.spi.HuggingFacePersistenceDialect;
 import com.github.klboke.kkrepo.persistence.jdbc.spi.MigrationPersistenceDialect;
+import com.github.klboke.kkrepo.persistence.jdbc.spi.RPersistenceDialect;
 import com.github.klboke.kkrepo.persistence.jdbc.spi.SearchPersistenceDialect;
 import com.github.klboke.kkrepo.persistence.jdbc.spi.SecurityPersistenceDialect;
 import java.sql.PreparedStatement;
@@ -23,10 +26,14 @@ import org.springframework.jdbc.core.JdbcOperations;
 /** PostgreSQL 12+ implementation of the shared persistence dialect contracts. */
 public final class PostgreSqlDatabaseDialect implements DatabaseDialect {
   private final PostgreSqlJsonPersistenceDialect json = new PostgreSqlJsonPersistenceDialect();
+  private final AlpinePersistenceDialect alpine = new PostgreSqlAlpinePersistenceDialect();
+  private final RPersistenceDialect r = new PostgreSqlRPersistenceDialect();
   private final ComponentPersistenceDialect components =
       new PostgreSqlComponentPersistenceDialect(json);
   private final CondaPersistenceDialect conda = new PostgreSqlCondaPersistenceDialect();
   private final ConanPersistenceDialect conan = new PostgreSqlConanPersistenceDialect();
+  private final HuggingFacePersistenceDialect huggingFace =
+      new PostgreSqlHuggingFacePersistenceDialect();
   private final CoordinationPersistenceDialect coordination =
       new PostgreSqlCoordinationPersistenceDialect();
   private final SearchPersistenceDialect search = new PostgreSqlSearchPersistenceDialect();
@@ -56,6 +63,16 @@ public final class PostgreSqlDatabaseDialect implements DatabaseDialect {
   }
 
   @Override
+  public AlpinePersistenceDialect alpine() {
+    return alpine;
+  }
+
+  @Override
+  public RPersistenceDialect r() {
+    return r;
+  }
+
+  @Override
   public CondaPersistenceDialect conda() {
     return conda;
   }
@@ -63,6 +80,11 @@ public final class PostgreSqlDatabaseDialect implements DatabaseDialect {
   @Override
   public ConanPersistenceDialect conan() {
     return conan;
+  }
+
+  @Override
+  public HuggingFacePersistenceDialect huggingFace() {
+    return huggingFace;
   }
 
   @Override
@@ -88,6 +110,100 @@ public final class PostgreSqlDatabaseDialect implements DatabaseDialect {
   @Override
   public MigrationPersistenceDialect migrations() {
     return migrations;
+  }
+
+  private static final class PostgreSqlAlpinePersistenceDialect
+      implements AlpinePersistenceDialect {
+    @Override
+    public KeysetCursor packageNameIdCursor(String packageName, long packageId) {
+      return new KeysetCursor(
+          "(package_name, id) > (?, ?)",
+          List.of(packageName, packageId));
+    }
+
+    @Override
+    public String pendingSuitesSql() {
+      return """
+          SELECT suite.* FROM alpine_suite_state suite
+          WHERE suite.publish_pending = TRUE
+            AND (suite.desired_at <= ?
+              OR COALESCE(suite.pending_since, suite.desired_at) <= ?)
+            AND (suite.last_error_at IS NULL OR suite.last_error_at <= ?)
+            AND (SELECT r.online AND r.format = 'alpine'
+                    AND r.type IN ('hosted', 'proxy', 'group')
+                 FROM repository r WHERE r.id = suite.repository_id)
+          ORDER BY suite.desired_at, suite.repository_id, suite.distribution_name
+          LIMIT ?
+          """;
+    }
+
+    @Override
+    public String snapshotCleanupCandidatesSql() {
+      return """
+          SELECT candidate.* FROM alpine_snapshot candidate
+          WHERE candidate.published_at IS NOT NULL AND candidate.created_at < ?
+            AND candidate.revision <> (
+              SELECT suite.published_revision FROM alpine_suite_state suite
+              WHERE suite.repository_id = candidate.repository_id
+                AND suite.distribution_name = candidate.distribution_name)
+            AND EXISTS (
+              SELECT 1 FROM alpine_snapshot newer
+              WHERE newer.repository_id = candidate.repository_id
+                AND newer.distribution_name = candidate.distribution_name
+                AND newer.published_at IS NOT NULL
+                AND newer.revision > candidate.revision
+              ORDER BY newer.revision DESC
+              LIMIT 1 OFFSET ?)
+          ORDER BY candidate.created_at, candidate.repository_id,
+            candidate.distribution_name, candidate.revision
+          LIMIT ?
+          """;
+    }
+  }
+
+  private static final class PostgreSqlRPersistenceDialect implements RPersistenceDialect {
+    @Override
+    public KeysetCursor packageNameIdCursor(String packageName, long packageId) {
+      return new KeysetCursor("(package_name, id) > (?, ?)", List.of(packageName, packageId));
+    }
+
+    @Override
+    public String pendingSuitesSql() {
+      return """
+          SELECT suite.* FROM r_suite_state suite
+          JOIN repository repository_row ON repository_row.id = suite.repository_id
+          WHERE suite.publish_pending = TRUE
+            AND (suite.desired_at <= ?
+              OR COALESCE(suite.pending_since, suite.desired_at) <= ?)
+            AND (suite.last_error_at IS NULL OR suite.last_error_at <= ?)
+            AND repository_row.online = TRUE AND repository_row.format = 'r'
+            AND repository_row.type IN ('hosted', 'proxy', 'group')
+          ORDER BY suite.desired_at, suite.repository_id, suite.distribution_name
+          LIMIT ?
+          """;
+    }
+
+    @Override
+    public String snapshotCleanupCandidatesSql() {
+      return """
+          SELECT candidate.* FROM r_snapshot candidate
+          WHERE candidate.published_at IS NOT NULL AND candidate.created_at < ?
+            AND candidate.revision <> (
+              SELECT suite.published_revision FROM r_suite_state suite
+              WHERE suite.repository_id = candidate.repository_id
+                AND suite.distribution_name = candidate.distribution_name)
+            AND candidate.revision < (
+              SELECT newer.revision FROM r_snapshot newer
+              WHERE newer.repository_id = candidate.repository_id
+                AND newer.distribution_name = candidate.distribution_name
+                AND newer.published_at IS NOT NULL
+              ORDER BY newer.revision DESC
+              LIMIT 1 OFFSET ?)
+          ORDER BY candidate.created_at, candidate.repository_id,
+            candidate.distribution_name, candidate.revision
+          LIMIT ?
+          """;
+    }
   }
 
   private static final class PostgreSqlComponentPersistenceDialect
@@ -238,6 +354,20 @@ public final class PostgreSqlDatabaseDialect implements DatabaseDialect {
     }
   }
 
+  private static final class PostgreSqlHuggingFacePersistenceDialect
+      implements HuggingFacePersistenceDialect {
+    @Override
+    public String insertFetchLeaseIfAbsentSql() {
+      return """
+          INSERT INTO proxy_fetch_lease
+            (repository_id, fetch_key, fetch_key_hash, owner, fencing_token, attempt_count,
+             expires_at, updated_at)
+          VALUES (?, ?, ?, ?, 1, 1, ?, ?)
+          ON CONFLICT (repository_id, fetch_key_hash) DO NOTHING
+          """;
+    }
+  }
+
   private static final class PostgreSqlJsonPersistenceDialect
       implements JsonPersistenceDialect {
     private static final Pattern IDENTIFIER = Pattern.compile("[A-Za-z0-9_.]+");
@@ -331,6 +461,15 @@ public final class PostgreSqlDatabaseDialect implements DatabaseDialect {
       }
       addTerm(terms, token);
       return String.join(" & ", terms);
+    }
+
+    @Override
+    public String componentSearchOrderBy(String componentAlias) {
+      if (componentAlias == null || !ALIAS.matcher(componentAlias).matches()) {
+        throw new IllegalArgumentException("Unsafe component search alias: " + componentAlias);
+      }
+      return componentAlias + ".last_updated_at DESC NULLS LAST, "
+          + componentAlias + ".id DESC";
     }
 
     private static void addTerm(List<String> terms, StringBuilder token) {

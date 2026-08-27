@@ -1,5 +1,6 @@
 package com.github.klboke.kkrepo.persistence.mysql;
 
+import com.github.klboke.kkrepo.persistence.jdbc.spi.AlpinePersistenceDialect;
 import com.github.klboke.kkrepo.persistence.jdbc.spi.ComponentPersistenceDialect;
 import com.github.klboke.kkrepo.persistence.jdbc.spi.CondaPersistenceDialect;
 import com.github.klboke.kkrepo.persistence.jdbc.spi.ConanPersistenceDialect;
@@ -7,7 +8,9 @@ import com.github.klboke.kkrepo.persistence.jdbc.spi.CoordinationPersistenceDial
 import com.github.klboke.kkrepo.persistence.jdbc.spi.DatabaseDialect;
 import com.github.klboke.kkrepo.persistence.jdbc.spi.DatabaseType;
 import com.github.klboke.kkrepo.persistence.jdbc.spi.JsonPersistenceDialect;
+import com.github.klboke.kkrepo.persistence.jdbc.spi.HuggingFacePersistenceDialect;
 import com.github.klboke.kkrepo.persistence.jdbc.spi.MigrationPersistenceDialect;
+import com.github.klboke.kkrepo.persistence.jdbc.spi.RPersistenceDialect;
 import com.github.klboke.kkrepo.persistence.jdbc.spi.SearchPersistenceDialect;
 import com.github.klboke.kkrepo.persistence.jdbc.spi.SecurityPersistenceDialect;
 import java.nio.charset.StandardCharsets;
@@ -18,6 +21,7 @@ import java.sql.SQLException;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.regex.Pattern;
 import org.springframework.jdbc.core.ConnectionCallback;
 import org.springframework.jdbc.core.JdbcOperations;
@@ -25,9 +29,13 @@ import org.springframework.jdbc.core.JdbcOperations;
 /** MySQL 8 implementation of the shared persistence dialect contracts. */
 public final class MySqlDatabaseDialect implements DatabaseDialect {
   private final MySqlJsonPersistenceDialect json = new MySqlJsonPersistenceDialect();
+  private final AlpinePersistenceDialect alpine = new MySqlAlpinePersistenceDialect();
+  private final RPersistenceDialect r = new MySqlRPersistenceDialect();
   private final ComponentPersistenceDialect components = new MySqlComponentPersistenceDialect(json);
   private final CondaPersistenceDialect conda = new MySqlCondaPersistenceDialect();
   private final ConanPersistenceDialect conan = new MySqlConanPersistenceDialect();
+  private final HuggingFacePersistenceDialect huggingFace =
+      new MySqlHuggingFacePersistenceDialect();
   private final CoordinationPersistenceDialect coordination = new MySqlCoordinationPersistenceDialect();
   private final SearchPersistenceDialect search = new MySqlSearchPersistenceDialect();
   private final SecurityPersistenceDialect security = new MySqlSecurityPersistenceDialect(json);
@@ -50,6 +58,16 @@ public final class MySqlDatabaseDialect implements DatabaseDialect {
   }
 
   @Override
+  public AlpinePersistenceDialect alpine() {
+    return alpine;
+  }
+
+  @Override
+  public RPersistenceDialect r() {
+    return r;
+  }
+
+  @Override
   public CondaPersistenceDialect conda() {
     return conda;
   }
@@ -57,6 +75,11 @@ public final class MySqlDatabaseDialect implements DatabaseDialect {
   @Override
   public ConanPersistenceDialect conan() {
     return conan;
+  }
+
+  @Override
+  public HuggingFacePersistenceDialect huggingFace() {
+    return huggingFace;
   }
 
   @Override
@@ -82,6 +105,109 @@ public final class MySqlDatabaseDialect implements DatabaseDialect {
   @Override
   public MigrationPersistenceDialect migrations() {
     return migrations;
+  }
+
+  private static final class MySqlAlpinePersistenceDialect
+      implements AlpinePersistenceDialect {
+    @Override
+    public KeysetCursor packageNameIdCursor(String packageName, long packageId) {
+      return new KeysetCursor(
+          "(package_name > ? OR (package_name = ? AND id > ?))",
+          List.of(packageName, packageName, packageId));
+    }
+
+    @Override
+    public String pendingSuitesSql() {
+      return """
+          SELECT alpine_suite_state.*
+          FROM alpine_suite_state FORCE INDEX (idx_alpine_suite_worker)
+          STRAIGHT_JOIN repository r ON r.id = alpine_suite_state.repository_id
+          WHERE alpine_suite_state.publish_pending = TRUE
+            AND (alpine_suite_state.desired_at <= ?
+              OR COALESCE(alpine_suite_state.pending_since, alpine_suite_state.desired_at) <= ?)
+            AND (alpine_suite_state.last_error_at IS NULL
+              OR alpine_suite_state.last_error_at <= ?)
+            AND r.online = true AND r.format = 'alpine'
+            AND r.type IN ('hosted', 'proxy', 'group')
+          ORDER BY alpine_suite_state.desired_at, alpine_suite_state.repository_id,
+            alpine_suite_state.distribution_name
+          LIMIT ?
+          """;
+    }
+
+    @Override
+    public String snapshotCleanupCandidatesSql() {
+      return """
+          SELECT candidate.* FROM alpine_snapshot candidate
+          JOIN alpine_suite_state suite
+            ON suite.repository_id = candidate.repository_id
+            AND suite.distribution_name = candidate.distribution_name
+          WHERE candidate.published_at IS NOT NULL AND candidate.created_at < ?
+            AND candidate.revision <> suite.published_revision
+            AND EXISTS (
+              SELECT 1 FROM alpine_snapshot newer
+              WHERE newer.repository_id = candidate.repository_id
+                AND newer.distribution_name = candidate.distribution_name
+                AND newer.published_at IS NOT NULL
+                AND newer.revision > candidate.revision
+              ORDER BY newer.revision DESC
+              LIMIT 1 OFFSET ?)
+          ORDER BY candidate.created_at, candidate.repository_id,
+            candidate.distribution_name, candidate.revision
+          LIMIT ?
+          """;
+    }
+  }
+
+  private static final class MySqlRPersistenceDialect implements RPersistenceDialect {
+    @Override
+    public KeysetCursor packageNameIdCursor(String packageName, long packageId) {
+      return new KeysetCursor(
+          "(package_name > ? OR (package_name = ? AND id > ?))",
+          List.of(packageName, packageName, packageId));
+    }
+
+    @Override
+    public String pendingSuitesSql() {
+      return """
+          SELECT r_suite_state.*
+          FROM r_suite_state FORCE INDEX (idx_r_suite_worker)
+          STRAIGHT_JOIN repository repository_row ON repository_row.id = r_suite_state.repository_id
+          WHERE r_suite_state.publish_pending = TRUE
+            AND (r_suite_state.desired_at <= ?
+              OR COALESCE(r_suite_state.pending_since, r_suite_state.desired_at) <= ?)
+            AND (r_suite_state.last_error_at IS NULL OR r_suite_state.last_error_at <= ?)
+            AND repository_row.online = true AND repository_row.format = 'r'
+            AND repository_row.type IN ('hosted', 'proxy', 'group')
+          ORDER BY r_suite_state.desired_at, r_suite_state.repository_id,
+            r_suite_state.distribution_name
+          LIMIT ?
+          """;
+    }
+
+    @Override
+    public String snapshotCleanupCandidatesSql() {
+      return """
+          SELECT candidate.* FROM r_snapshot candidate
+          JOIN r_suite_state suite
+            ON suite.repository_id = candidate.repository_id
+            AND suite.distribution_name = candidate.distribution_name
+          WHERE candidate.published_at IS NOT NULL AND candidate.created_at < ?
+            AND candidate.revision <> suite.published_revision
+            AND candidate.revision < (
+              SELECT newer.revision FROM r_snapshot newer
+                FORCE INDEX (idx_r_snapshot_retention)
+              WHERE newer.repository_id = candidate.repository_id
+                AND newer.distribution_name = candidate.distribution_name
+                AND newer.publish_complete = TRUE
+              ORDER BY newer.repository_id, newer.distribution_name,
+                newer.publish_complete, newer.revision DESC
+              LIMIT 1 OFFSET ?)
+          ORDER BY candidate.created_at, candidate.repository_id,
+            candidate.distribution_name, candidate.revision
+          LIMIT ?
+          """;
+    }
   }
 
   private static final class MySqlComponentPersistenceDialect
@@ -303,6 +429,19 @@ public final class MySqlDatabaseDialect implements DatabaseDialect {
     }
   }
 
+  private static final class MySqlHuggingFacePersistenceDialect
+      implements HuggingFacePersistenceDialect {
+    @Override
+    public String insertFetchLeaseIfAbsentSql() {
+      return """
+          INSERT IGNORE INTO proxy_fetch_lease
+            (repository_id, fetch_key, fetch_key_hash, owner, fencing_token, attempt_count,
+             expires_at, updated_at)
+          VALUES (?, ?, ?, ?, 1, 1, ?, ?)
+          """;
+    }
+  }
+
   private static final class MySqlJsonPersistenceDialect implements JsonPersistenceDialect {
     private static final Pattern IDENTIFIER = Pattern.compile("[A-Za-z0-9_.]+");
     private static final Pattern PATH_PART = Pattern.compile("[A-Za-z0-9_]+");
@@ -361,6 +500,11 @@ public final class MySqlDatabaseDialect implements DatabaseDialect {
   }
 
   private static final class MySqlSearchPersistenceDialect implements SearchPersistenceDialect {
+    private static final int DEFAULT_INNODB_FT_MIN_TOKEN_SIZE = 3;
+    private static final Set<String> DEFAULT_INNODB_FT_STOPWORDS = Set.of(
+        "a", "about", "an", "are", "as", "at", "be", "by", "com", "de", "en", "for",
+        "from", "how", "i", "in", "is", "it", "la", "of", "on", "or", "that", "the",
+        "this", "to", "was", "what", "when", "where", "who", "will", "with", "und", "www");
     private static final Pattern ALIAS = Pattern.compile("[A-Za-z0-9_]+");
 
     @Override
@@ -382,7 +526,10 @@ public final class MySqlDatabaseDialect implements DatabaseDialect {
       StringBuilder token = new StringBuilder();
       for (int index = 0; index < keyword.length(); index++) {
         char value = keyword.charAt(index);
-        if (Character.isLetterOrDigit(value)) {
+        // MySQL's built-in FULLTEXT parser keeps underscores inside a word. Preserve them in the
+        // boolean query as well; splitting them would require short fragments that InnoDB does not
+        // index by default and would make exact package names such as "name_h2_1" unsearchable.
+        if (Character.isLetterOrDigit(value) || value == '_') {
           token.append(Character.toLowerCase(value));
         } else {
           addTerm(terms, token);
@@ -392,9 +539,49 @@ public final class MySqlDatabaseDialect implements DatabaseDialect {
       return String.join(" ", terms);
     }
 
+    @Override
+    public String componentSearchOrderBy(String componentAlias) {
+      requireAlias(componentAlias);
+      // MySQL sorts NULL below non-NULL values, so a descending scan naturally places NULL last.
+      return componentAlias + ".last_updated_at DESC, " + componentAlias + ".id DESC";
+    }
+
+    @Override
+    public boolean supportsAdaptiveComponentSearch() {
+      return true;
+    }
+
+    @Override
+    public String orderedComponentSearchHint(
+        boolean formatScoped, boolean singleRepository, boolean fullText) {
+      String index = singleRepository
+          ? formatScoped
+              ? "idx_component_repo_format_updated"
+              : "idx_component_repo_last_updated"
+          : formatScoped
+              ? "idx_component_format_last_updated"
+              : "idx_component_last_updated";
+      String joinOrder = fullText
+          ? "JOIN_ORDER(search_order, cs, c, r)"
+          : "JOIN_ORDER(search_order, c, r)";
+      return "/*+ " + joinOrder + " INDEX(search_order " + index + ") */";
+    }
+
+    private static void requireAlias(String alias) {
+      if (alias == null || !ALIAS.matcher(alias).matches()) {
+        throw new IllegalArgumentException("Unsafe component search alias: " + alias);
+      }
+    }
+
     private static void addTerm(List<String> terms, StringBuilder token) {
       if (!token.isEmpty()) {
-        terms.add("+" + token + "*");
+        String term = token.toString();
+        // Requiring a term omitted by InnoDB's default FULLTEXT parser makes the whole boolean
+        // query unmatchable. Keep short terms and stopwords optional while retaining AND semantics
+        // for terms indexed by the default configuration.
+        boolean indexedByDefault = term.length() >= DEFAULT_INNODB_FT_MIN_TOKEN_SIZE
+            && !DEFAULT_INNODB_FT_STOPWORDS.contains(term);
+        terms.add((indexedByDefault ? "+" : "") + term + "*");
         token.setLength(0);
       }
     }

@@ -78,7 +78,10 @@ final class NexusMigrationAdapters {
               && ("hosted".equals(normalizedType) || "proxy".equals(normalizedType)))
           || ("conda".equals(normalizedFormat) && "hosted".equals(normalizedType))
           || ("conan".equals(normalizedFormat) && !"group".equals(normalizedType))
-          || ("apt".equals(normalizedFormat) && "hosted".equals(normalizedType));
+          || ("apt".equals(normalizedFormat) && "hosted".equals(normalizedType))
+          || ("alpine".equals(normalizedFormat) && "hosted".equals(normalizedType))
+          || ("r".equals(normalizedFormat) && "hosted".equals(normalizedType))
+          || ("huggingface".equals(normalizedFormat) && "proxy".equals(normalizedType));
     }
 
     @Override
@@ -145,7 +148,9 @@ final class NexusMigrationAdapters {
       String normalized = lower(format);
       return !"cargo".equals(normalized) && !"pub".equals(normalized)
           && !"swift".equals(normalized) && !"ansiblegalaxy".equals(normalized)
-          && !"conda".equals(normalized) && !"conan".equals(normalized);
+          && !"conda".equals(normalized) && !"conan".equals(normalized)
+          && !"alpine".equals(normalized) && !"r".equals(normalized)
+          && !"huggingface".equals(normalized);
     }
 
     @Override
@@ -171,7 +176,9 @@ final class NexusMigrationAdapters {
           && (!"swift".equals(lower(format)) || "hosted".equals(lower(type)))
           && (!"ansiblegalaxy".equals(lower(format)) || !"group".equals(lower(type)))
           && (!"conda".equals(lower(format)) || "hosted".equals(lower(type)))
-          && (!"conan".equals(lower(format)) || !"group".equals(lower(type)));
+          && (!"conan".equals(lower(format)) || !"group".equals(lower(type)))
+          && (!"alpine".equals(lower(format)) || "hosted".equals(lower(type)))
+          && (!"r".equals(lower(format)) || "hosted".equals(lower(type)));
     }
 
     @Override
@@ -197,7 +204,9 @@ final class NexusMigrationAdapters {
           && (!"swift".equals(lower(format)) || "hosted".equals(lower(type)))
           && (!"ansiblegalaxy".equals(lower(format)) || !"group".equals(lower(type)))
           && (!"conda".equals(lower(format)) || "hosted".equals(lower(type)))
-          && (!"conan".equals(lower(format)) || !"group".equals(lower(type)));
+          && (!"conan".equals(lower(format)) || !"group".equals(lower(type)))
+          && (!"alpine".equals(lower(format)) || "hosted".equals(lower(type)))
+          && (!"r".equals(lower(format)) || "hosted".equals(lower(type)));
     }
 
     @Override

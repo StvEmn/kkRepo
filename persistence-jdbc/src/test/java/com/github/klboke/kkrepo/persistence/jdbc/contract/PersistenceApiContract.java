@@ -15,6 +15,7 @@ import com.github.klboke.kkrepo.core.RepositoryType;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AnsibleGalaxyRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.ArtifactChangeDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.CleanupPolicyDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.ComponentDao.ComponentSearchCursor;
 import com.github.klboke.kkrepo.persistence.jdbc.api.DockerAuthTokenDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.DockerAuthTokenDao.ScannerResourceKind;
 import com.github.klboke.kkrepo.persistence.jdbc.api.DockerAuthTokenDao.ScannerTokenResource;
@@ -100,6 +101,16 @@ public abstract class PersistenceApiContract {
         "ansible_proxy_inventory_version",
         "ansible_proxy_version_state",
         "ansible_registry_lease",
+        "alpine_group_binding",
+        "alpine_group_snapshot_stage",
+        "alpine_package_record",
+        "alpine_package_relation",
+        "alpine_package_tombstone",
+        "alpine_proxy_distribution",
+        "alpine_publish_lease",
+        "alpine_signing_key",
+        "alpine_snapshot",
+        "alpine_suite_state",
         "apt_package_record",
         "apt_package_tombstone",
         "apt_proxy_distribution",
@@ -153,6 +164,11 @@ public abstract class PersistenceApiContract {
         "docker_tag",
         "docker_upload_chunk",
         "docker_upload_session",
+        "huggingface_api_cache",
+        "huggingface_file",
+        "huggingface_model_revision",
+        "huggingface_revision_ref",
+        "huggingface_route_projection",
         "maintenance_cursor",
         "metadata_rebuild_marker",
         "migration_checkpoint",
@@ -160,6 +176,7 @@ public abstract class PersistenceApiContract {
         "migration_validation_result",
         "npm_release_index_entry",
         "npm_release_index_revision",
+        "proxy_fetch_lease",
         "proxy_remote_state",
         "pub_upload_session",
         "qrtz_blob_triggers",
@@ -173,6 +190,15 @@ public abstract class PersistenceApiContract {
         "qrtz_simple_triggers",
         "qrtz_simprop_triggers",
         "qrtz_triggers",
+        "r_group_binding",
+        "r_group_snapshot_stage",
+        "r_package_record",
+        "r_package_relation",
+        "r_package_tombstone",
+        "r_proxy_distribution",
+        "r_publish_lease",
+        "r_snapshot",
+        "r_suite_state",
         "repository",
         "repository_cleanup_policy",
         "repository_data_migration_asset",
@@ -4336,6 +4362,9 @@ public abstract class PersistenceApiContract {
     long mavenRepository = createRepository("maven-search", RepositoryFormat.MAVEN2);
     long otherMavenRepository = createRepository("maven-other", RepositoryFormat.MAVEN2);
     long npmRepository = createRepository("npm-search", RepositoryFormat.NPM);
+    long alpineRepository = createRepository("alpine-search", RepositoryFormat.ALPINE);
+    String migratedAlpinePackage =
+        "kkrepo-alpine-migration-app-datastore_h2_31894582966_1";
 
     stores().components().upsertReturningId(component(
         mavenRepository, RepositoryFormat.MAVEN2, "com.acme.platform", "observability-library",
@@ -4347,8 +4376,15 @@ public abstract class PersistenceApiContract {
         otherMavenRepository, RepositoryFormat.MAVEN2, "org.example", "observability-library",
         "3.0.0", Map.of("keywords", "telemetry tracing"), Instant.parse("2026-07-13T08:00:00Z")));
     stores().components().upsertReturningId(component(
+        otherMavenRepository, RepositoryFormat.MAVEN2, "org.example", "unknown-update",
+        "0.0.0", Map.of("keywords", "unknown timestamp"), null));
+    stores().components().upsertReturningId(component(
         npmRepository, RepositoryFormat.NPM, "@acme", "observability-library",
         "4.0.0", Map.of("keywords", "telemetry tracing"), Instant.parse("2026-07-13T11:00:00Z")));
+    stores().components().upsertReturningId(component(
+        alpineRepository, RepositoryFormat.ALPINE, "v3.23/main/x86_64", migratedAlpinePackage,
+        "1.2.3-r0", Map.of("assetPath", "v3.23/main/x86_64/" + migratedAlpinePackage + ".apk"),
+        Instant.parse("2026-07-13T12:00:00Z")));
 
     var andSearch = stores().components().search("acme library", RepositoryFormat.MAVEN2, 20);
     assertEquals(List.of("2.0.0"), andSearch.stream().map(row -> row.version()).toList());
@@ -4362,7 +4398,49 @@ public abstract class PersistenceApiContract {
     assertEquals(List.of("2.0.0", "3.0.0"),
         stores().components().search("telemetry tracing", RepositoryFormat.MAVEN2, 20)
             .stream().map(row -> row.version()).toList());
+    var firstScopedPage = stores().components().searchPageByRepositoryIds(
+        List.of(mavenRepository, otherMavenRepository),
+        RepositoryFormat.MAVEN2,
+        "telemetry tracing",
+        null,
+        1);
+    var secondScopedPage = stores().components().searchPageByRepositoryIds(
+        List.of(mavenRepository, otherMavenRepository),
+        RepositoryFormat.MAVEN2,
+        "telemetry tracing",
+        ComponentSearchCursor.after(firstScopedPage.getFirst()),
+        1);
+    assertEquals(List.of("2.0.0"),
+        firstScopedPage.stream().map(row -> row.version()).toList());
+    assertEquals(List.of("3.0.0"),
+        secondScopedPage.stream().map(row -> row.version()).toList());
+    var newestMavenRows = stores().components().searchPageByRepositoryIds(
+        List.of(mavenRepository, otherMavenRepository), RepositoryFormat.MAVEN2, null, null, 3);
+    assertEquals(List.of("2.0.0", "1.0.0", "3.0.0"),
+        newestMavenRows.stream().map(row -> row.version()).toList());
+    var nullTimestampPage = stores().components().searchPageByRepositoryIds(
+        List.of(mavenRepository, otherMavenRepository),
+        RepositoryFormat.MAVEN2,
+        null,
+        ComponentSearchCursor.after(newestMavenRows.getLast()),
+        3);
+    assertEquals(List.of("0.0.0"),
+        nullTimestampPage.stream().map(row -> row.version()).toList());
+    assertNull(nullTimestampPage.getFirst().lastUpdatedAt());
+    assertTrue(stores().components().searchPageByRepositoryIds(
+        List.of(mavenRepository, otherMavenRepository),
+        RepositoryFormat.MAVEN2,
+        null,
+        ComponentSearchCursor.after(nullTimestampPage.getFirst()),
+        3).isEmpty());
+    assertEquals(List.of("4.0.0", "2.0.0"),
+        stores().components().searchPageByRepositoryIds(
+                List.of(mavenRepository, npmRepository), null, "telemetry tracing", null, 2)
+            .stream().map(row -> row.version()).toList());
     assertFalse(stores().components().search("telemetry", RepositoryFormat.NPM, 20).isEmpty());
+    assertEquals(migratedAlpinePackage,
+        stores().components().search(migratedAlpinePackage, RepositoryFormat.ALPINE, 20)
+            .getFirst().name());
   }
 
   @Test

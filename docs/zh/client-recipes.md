@@ -138,7 +138,7 @@ twine upload -r kkrepo dist/*
 
 ## Go
 
-配置 Go module proxy 或 group 仓库：
+把 Go module group 配置为客户端统一读取入口：
 
 ```bash
 go env -w GOPROXY=https://nexus.example.com/repository/go-group/,direct
@@ -158,7 +158,19 @@ go list -m github.com/pkg/errors@latest
 go mod download github.com/pkg/errors
 ```
 
-Go 不支持 hosted 上传；当前以 Go proxy/group 读取代理行为为主。
+向 hosted 仓库发布规范 module ZIP。Archive 必须只有一个 `<module>@<version>/` root，
+上传文件名必须为 `<version>.zip`：
+
+```bash
+curl --fail-with-body \
+  -u "$KKREPO_USER:$KKREPO_PASSWORD" \
+  --upload-file v1.2.3.zip \
+  https://nexus.example.com/repository/go-hosted/v1.2.3.zip
+```
+
+建议在 `go-group` 中把 `go-hosted` 放在 `go-proxy` 前，让私有 module 优先于公共上游。
+Archive 校验、write policy、Cleanup 和 Artifact Scanning 语义见
+[Go 仓库使用指南](repository-guides/go.md)。
 
 ## Helm
 
@@ -569,6 +581,91 @@ conan install --requires='demo/1.0.0@team/stable' --remote=kkrepo
 
 Revision 提交语义、Browse 路径、清理、安全扫描、proxy/group、迁移和排障说明见
 [Conan 仓库使用指南](repository-guides/conan-2.md)。
+
+## Alpine / APK
+
+使用 group 配置的精确文件名安装仓库作用域公钥：
+
+```bash
+curl -u alice:"$KKREPO_PASSWORD" \
+  -o kkrepo-alpine-group.rsa.pub \
+  https://nexus.example.com/internal/repositories/alpine-group/alpine/public-key
+sudo install -m 0644 kkrepo-alpine-group.rsa.pub \
+  /etc/apk/keys/kkrepo-alpine-group.rsa.pub
+```
+
+配置 group，然后使用标准客户端更新、查看、下载和安装：
+
+```bash
+echo 'https://nexus.example.com/repository/alpine-group/v3.23/main' \
+  | sudo tee /etc/apk/repositories
+apk update
+apk policy acme-agent
+apk fetch acme-agent=1.2.3-r0
+apk add acme-agent=1.2.3-r0
+apk info -e acme-agent=1.2.3-r0
+```
+
+向 hosted namespace 发布不可变 APK v2 package：
+
+```bash
+curl -u alice:"$KKREPO_PASSWORD" \
+  -H 'Content-Type: application/vnd.alpine.apk' \
+  --upload-file acme-agent-1.2.3-r0.apk \
+  https://nexus.example.com/repository/alpine-hosted/v3.23/main/x86_64/acme-agent-1.2.3-r0.apk
+```
+
+认证 URL 应保存在受保护的客户端配置中。Hosted/group index 由本地 key 签名，passthrough proxy 保持上游签名。详见 [Alpine / APK 仓库使用指南](repository-guides/alpine-apk.md)。
+
+## R / CRAN
+
+在 `.Rprofile` 中把 R group 配成常用 source repository：
+
+```r
+local({
+  repos <- getOption("repos")
+  repos["KKRepo"] <- "https://nexus.example.com/repository/r-group"
+  options(repos = repos)
+})
+```
+
+向 hosted 发布 source package：
+
+```bash
+R CMD build acmepkg
+curl -u alice:"$KKREPO_PASSWORD" \
+  -H 'Content-Type: application/x-gzip' \
+  --upload-file acmepkg_1.2.3.tar.gz \
+  https://nexus.example.com/repository/r-hosted/src/contrib/acmepkg_1.2.3.tar.gz
+```
+
+通过 group 查询并安装：
+
+```r
+available.packages(repos = getOption("repos")["KKRepo"], type = "source")
+install.packages("acmepkg", repos = getOption("repos")["KKRepo"], type = "source")
+```
+
+Hosted/group 仅支持 source；上游 `.zip`、`.tgz` 或 `PACKAGES.rds` 需要直连 proxy。详见
+[R / CRAN 仓库使用指南](repository-guides/r-cran.md)。
+
+## Hugging Face Models
+
+创建 Models-only `huggingface-proxy`，再把 Hub 客户端指向仓库根路径：
+
+```bash
+export HF_ENDPOINT='https://nexus.example.com/repository/huggingface-models'
+export HF_HUB_DOWNLOAD_TIMEOUT=120
+export HF_HUB_ETAG_TIMEOUT=1800
+
+hf download sshleifer/tiny-gpt2 config.json
+hf download sshleifer/tiny-gpt2 --include '*.json' '*.safetensors'
+```
+
+本地认证使用只有 read 权限的 kkRepo `GenericToken`，并通过 `HF_TOKEN` 提供给客户端；只有
+上游 model 为 private/gated 时，才在仓库上单独配置 remote bearer token。
+`huggingface_hub`、Transformers 与 Diffusers 都会继承同一个 `HF_ENDPOINT`。详见
+[Hugging Face Models 仓库使用指南](repository-guides/hugging-face-models.md)。
 
 ## NuGet
 

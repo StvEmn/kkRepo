@@ -17,11 +17,13 @@ import com.github.klboke.kkrepo.core.RepositoryType;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AssetDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AnsibleGalaxyRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AptRegistryDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.AlpineRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.BrowseNodeDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.ConanRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.CondaRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.DockerRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.PersistenceHashes;
+import com.github.klboke.kkrepo.persistence.jdbc.api.RRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.SwiftRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.TerraformRegistryDao;
@@ -55,6 +57,247 @@ import org.springframework.http.HttpStatus;
 import org.springframework.web.server.ResponseStatusException;
 
 class BrowseAssetDetailServiceTest {
+
+  @Test
+  void rDetailExposesDurablePackageIdentityAndControlFields() {
+    RepositoryRecord repository = repository(
+        80L, "cran-hosted", RepositoryFormat.R, RepositoryType.HOSTED);
+    String path = "src/contrib/demo_1.2.3.tar.gz";
+    AssetRecord archive = new AssetRecord(
+        81L, repository.id(), 82L, 83L, RepositoryFormat.R,
+        path, PersistenceHashes.pathHash(path), archiveName(path),
+        "r-source-package", "application/x-gzip", 512L,
+        null, Instant.EPOCH, Map.of());
+    StubAssetDao assets = new StubAssetDao(
+        Map.of(key(repository.id(), path), archive), Map.of(83L, blob(83L, 512L)));
+    BrowseAssetDetailService service = new BrowseAssetDetailService(
+        new StubRepositoryDao(), assets,
+        new StubBlobStorageRegistry(new StubBlobStorage(new byte[0])), new ObjectMapper());
+    assertTrue(service.detail(repository, path, null).r().isEmpty());
+
+    RRegistryDao r = mock(RRegistryDao.class);
+    when(r.findPackageByPath(repository.id(), path)).thenReturn(Optional.of(
+        rPackage(repository.id(), archive.id(), archive.componentId(), path)));
+    service.setRRegistryDao(r);
+
+    Map<String, Object> detail = service.detail(repository, path, null).r();
+
+    assertEquals("src/contrib", detail.get("namespace"));
+    assertEquals("demo", detail.get("package"));
+    assertEquals("1.2.3", detail.get("version"));
+    assertEquals("demo_1.2.3.tar.gz", detail.get("filename"));
+    assertEquals("a".repeat(32), detail.get("md5"));
+    assertEquals("b".repeat(64), detail.get("sha256"));
+    assertEquals(512L, detail.get("size"));
+    assertEquals(RRegistryDao.SOURCE_HOSTED, detail.get("source_kind"));
+    assertEquals(repository.name(), detail.get("source_repository"));
+    assertEquals(7L, detail.get("revision"));
+    assertEquals(Instant.EPOCH, detail.get("indexed_at"));
+    assertEquals("MIT", detail.get("license"));
+    assertEquals("R (>= 4.3)", detail.get("depends"));
+    assertEquals("methods", detail.get("imports"));
+    assertEquals("Rcpp", detail.get("linkingto"));
+    assertEquals("testthat", detail.get("suggests"));
+    assertEquals("parallel", detail.get("enhances"));
+    assertEquals("yes", detail.get("needscompilation"));
+  }
+
+  @Test
+  void rGroupDetailResolvesNexusBrowseProjectionToCanonicalPackagePath() {
+    RepositoryRecord group = repository(
+        84L, "cran-group", RepositoryFormat.R, RepositoryType.GROUP);
+    RepositoryRecord hosted = repository(
+        85L, "cran-hosted", RepositoryFormat.R, RepositoryType.HOSTED);
+    String browsePath = "src/contrib/demo/1.2.3/demo_1.2.3.tar.gz";
+    String storagePath = "src/contrib/demo_1.2.3.tar.gz";
+    AssetRecord archive = new AssetRecord(
+        86L, hosted.id(), 87L, 88L, RepositoryFormat.R,
+        storagePath, PersistenceHashes.pathHash(storagePath), archiveName(storagePath),
+        "r-source-package", "application/x-gzip", 512L,
+        null, Instant.EPOCH, Map.of());
+    StubAssetDao assets = new StubAssetDao(
+        Map.of(key(hosted.id(), storagePath), archive), Map.of(88L, blob(88L, 512L)));
+    RepositoryDao repositories = new StubRepositoryDao() {
+      @Override
+      public List<RepositoryRecord> listMembers(long repositoryId) {
+        return repositoryId == group.id() ? List.of(hosted) : List.of();
+      }
+    };
+    BrowseNodeDao browse = mock(BrowseNodeDao.class);
+    when(browse.findNode(hosted.id(), browsePath)).thenReturn(Optional.of(
+        new BrowseNodeDao.BrowseChild(
+            1L, browsePath, archive.name(), 4, archive.id(), archive.componentId(),
+            archive.size(), archive.contentType(), "a".repeat(40), Instant.EPOCH, false, true)));
+    RRegistryDao r = mock(RRegistryDao.class);
+    when(r.findPackageByPath(hosted.id(), storagePath)).thenReturn(Optional.of(
+        rPackage(hosted.id(), archive.id(), archive.componentId(), storagePath)));
+    BrowseAssetDetailService service = new BrowseAssetDetailService(
+        repositories, assets,
+        new StubBlobStorageRegistry(new StubBlobStorage(new byte[0])), new ObjectMapper());
+    service.setBrowseNodeDao(browse);
+    service.setRRegistryDao(r);
+
+    BrowseAssetDetailService.BrowseAssetDetail detail =
+        service.detail(group, browsePath, hosted.name());
+
+    assertEquals(group.name(), detail.repository());
+    assertEquals(hosted.name(), detail.sourceRepository());
+    assertEquals(browsePath, detail.path());
+    assertEquals("/repository/cran-group/" + storagePath, detail.downloadUrl());
+    assertEquals("demo", detail.r().get("package"));
+    assertEquals(List.of(key(hosted.id(), storagePath)), assets.pathLookups);
+  }
+
+  @Test
+  void rDetailFailsClosedForMissingOrConflictingRegistryState() {
+    RepositoryRecord repository = repository(
+        84L, "cran-hosted", RepositoryFormat.R, RepositoryType.HOSTED);
+    String path = "src/contrib/demo_1.2.3.tar.gz";
+    AssetRecord archive = new AssetRecord(
+        85L, repository.id(), 86L, 87L, RepositoryFormat.R,
+        path, PersistenceHashes.pathHash(path), archiveName(path),
+        "r-source-package", "application/x-gzip", 512L,
+        null, Instant.EPOCH, Map.of());
+    StubAssetDao assets = new StubAssetDao(
+        Map.of(key(repository.id(), path), archive), Map.of(87L, blob(87L, 512L)));
+    RRegistryDao r = mock(RRegistryDao.class);
+    BrowseAssetDetailService service = new BrowseAssetDetailService(
+        new StubRepositoryDao(), assets,
+        new StubBlobStorageRegistry(new StubBlobStorage(new byte[0])), new ObjectMapper());
+    service.setRRegistryDao(r);
+
+    ResponseStatusException missing = assertThrows(
+        ResponseStatusException.class, () -> service.detail(repository, path, null));
+    assertEquals(HttpStatus.NOT_FOUND, missing.getStatusCode());
+
+    when(r.findPackageByPath(repository.id(), path)).thenReturn(Optional.of(
+        rPackage(repository.id(), 999L, archive.componentId(), path)));
+    ResponseStatusException conflict = assertThrows(
+        ResponseStatusException.class, () -> service.detail(repository, path, null));
+    assertEquals(HttpStatus.CONFLICT, conflict.getStatusCode());
+  }
+
+  @Test
+  void alpineDetailMapsProjectedPathAndExposesRegistryIdentity() {
+    RepositoryRecord repository = repository(
+        65L, "alpine-hosted", RepositoryFormat.ALPINE, RepositoryType.HOSTED);
+    String publicPath = "v3.23/main/x86_64/demo/1-r0/demo-1-r0.apk";
+    String storagePath = "v3.23/main/x86_64/demo-1-r0.apk";
+    AssetRecord archive = new AssetRecord(
+        66L, repository.id(), 67L, 68L, RepositoryFormat.ALPINE,
+        storagePath, PersistenceHashes.pathHash(storagePath), archiveName(storagePath),
+        "alpine-apk-v2", "application/vnd.alpine.apk", 512L,
+        null, Instant.EPOCH, Map.of());
+    StubAssetDao assets = new StubAssetDao(
+        Map.of(key(repository.id(), storagePath), archive), Map.of(68L, blob(68L, 512L)));
+    AlpineRegistryDao alpine = mock(AlpineRegistryDao.class);
+    AlpineRegistryDao.PackageRecord record = alpinePackage(
+        repository.id(), archive.id(), archive.componentId(), storagePath);
+    when(alpine.findPackage(
+        repository.id(), "v3.23/main/x86_64", "main", "demo", "1-r0", "x86_64"))
+        .thenReturn(Optional.of(record));
+    when(alpine.findPackageByPath(repository.id(), storagePath)).thenReturn(Optional.of(record));
+    BrowseAssetDetailService service = new BrowseAssetDetailService(
+        new StubRepositoryDao(), assets,
+        new StubBlobStorageRegistry(new StubBlobStorage(new byte[0])), new ObjectMapper());
+    service.setAlpineRegistryDao(alpine);
+
+    BrowseAssetDetailService.BrowseAssetDetail detail =
+        service.detail(repository, publicPath, null);
+
+    assertEquals(publicPath, detail.path());
+    assertEquals(storagePath, assets.pathLookups.getFirst().split("\\|", 2)[1]);
+    assertEquals("v3.23/main/x86_64", detail.alpine().get("namespace"));
+    assertEquals("v3.23", detail.alpine().get("distribution"));
+    assertEquals("main", detail.alpine().get("channel"));
+    assertEquals("x86_64", detail.alpine().get("repository_architecture"));
+    assertEquals("noarch", detail.alpine().get("package_architecture"));
+    assertEquals("demo", detail.alpine().get("package"));
+    assertEquals("1-r0", detail.alpine().get("version"));
+    assertEquals("identity", detail.alpine().get("identity"));
+    assertEquals("demo package", detail.alpine().get("description"));
+    assertEquals("https://example.invalid/demo", detail.alpine().get("url"));
+    assertEquals("MIT", detail.alpine().get("license"));
+    assertEquals("demo", detail.alpine().get("origin"));
+    assertEquals("admin@example.invalid", detail.alpine().get("maintainer"));
+    assertEquals("musl", detail.alpine().get("depends"));
+    assertEquals("cmd:demo", detail.alpine().get("provides"));
+    assertEquals("busybox", detail.alpine().get("install_if"));
+    assertEquals(AlpineRegistryDao.SOURCE_HOSTED, detail.alpine().get("source_kind"));
+    assertEquals(repository.name(), detail.alpine().get("source_repository"));
+  }
+
+  @Test
+  void alpineDetailFallsBackWithoutRegistryAndFailsClosedForMissingOrConflictingState() {
+    RepositoryRecord repository = repository(
+        69L, "alpine-hosted", RepositoryFormat.ALPINE, RepositoryType.HOSTED);
+    String path = "v3.23/main/x86_64/demo-1-r0.apk";
+    AssetRecord archive = new AssetRecord(
+        70L, repository.id(), null, 71L, RepositoryFormat.ALPINE,
+        path, PersistenceHashes.pathHash(path), archiveName(path),
+        "alpine-apk-v2", "application/vnd.alpine.apk", 10L,
+        null, Instant.EPOCH, Map.of());
+    StubAssetDao assets = new StubAssetDao(
+        Map.of(key(repository.id(), path), archive), Map.of(71L, blob(71L, 10L)));
+    BrowseAssetDetailService unavailable = new BrowseAssetDetailService(
+        new StubRepositoryDao(), assets,
+        new StubBlobStorageRegistry(new StubBlobStorage(new byte[0])), new ObjectMapper());
+    assertTrue(unavailable.detail(repository, path, null).alpine().isEmpty());
+
+    AlpineRegistryDao alpine = mock(AlpineRegistryDao.class);
+    BrowseAssetDetailService service = new BrowseAssetDetailService(
+        new StubRepositoryDao(), assets,
+        new StubBlobStorageRegistry(new StubBlobStorage(new byte[0])), new ObjectMapper());
+    service.setAlpineRegistryDao(alpine);
+    ResponseStatusException missing = assertThrows(
+        ResponseStatusException.class, () -> service.detail(repository, path, null));
+    assertEquals(HttpStatus.NOT_FOUND, missing.getStatusCode());
+
+    when(alpine.findPackageByPath(repository.id(), path)).thenReturn(Optional.of(
+        alpinePackage(repository.id(), 999L, null, path)));
+    ResponseStatusException conflict = assertThrows(
+        ResponseStatusException.class, () -> service.detail(repository, path, null));
+    assertEquals(HttpStatus.CONFLICT, conflict.getStatusCode());
+  }
+
+  @Test
+  void alpineBrowseProjectionKeepsOriginalPathWhenCoordinateIsInvalidOrFilenameDiffers() {
+    RepositoryRecord repository = repository(
+        72L, "alpine-hosted", RepositoryFormat.ALPINE, RepositoryType.HOSTED);
+    String invalid = "v3.23//x86_64/demo/1-r0/demo-1-r0.apk";
+    String mismatch = "v3.23/main/x86_64/demo/1-r0/wrong.apk";
+    AssetRecord invalidAsset = new AssetRecord(
+        73L, repository.id(), null, 74L, RepositoryFormat.ALPINE,
+        invalid, PersistenceHashes.pathHash(invalid), archiveName(invalid),
+        "alpine-apk-v2", "application/vnd.alpine.apk", 10L,
+        null, Instant.EPOCH, Map.of());
+    AssetRecord mismatchAsset = new AssetRecord(
+        75L, repository.id(), null, 76L, RepositoryFormat.ALPINE,
+        mismatch, PersistenceHashes.pathHash(mismatch), archiveName(mismatch),
+        "alpine-apk-v2", "application/vnd.alpine.apk", 10L,
+        null, Instant.EPOCH, Map.of());
+    StubAssetDao assets = new StubAssetDao(
+        Map.of(
+            key(repository.id(), invalid), invalidAsset,
+            key(repository.id(), mismatch), mismatchAsset),
+        Map.of(74L, blob(74L, 10L), 76L, blob(76L, 10L)));
+    AlpineRegistryDao alpine = mock(AlpineRegistryDao.class);
+    when(alpine.findPackage(
+        repository.id(), "v3.23/main/x86_64", "main", "demo", "1-r0", "x86_64"))
+        .thenReturn(Optional.of(alpinePackage(
+            repository.id(), 999L, null, "v3.23/main/x86_64/demo-1-r0.apk")));
+    when(alpine.findPackageByPath(repository.id(), invalid)).thenReturn(Optional.of(
+        alpinePackage(repository.id(), invalidAsset.id(), null, invalid)));
+    when(alpine.findPackageByPath(repository.id(), mismatch)).thenReturn(Optional.of(
+        alpinePackage(repository.id(), mismatchAsset.id(), null, mismatch)));
+    BrowseAssetDetailService service = new BrowseAssetDetailService(
+        new StubRepositoryDao(), assets,
+        new StubBlobStorageRegistry(new StubBlobStorage(new byte[0])), new ObjectMapper());
+    service.setAlpineRegistryDao(alpine);
+
+    assertEquals(invalid, service.detail(repository, invalid, null).path());
+    assertEquals(mismatch, service.detail(repository, mismatch, null).path());
+  }
 
   @Test
   void conanDetailResolvesTheWriteTimeBrowseProjectionAndTypedClientRoute() {
@@ -567,6 +810,64 @@ class BrowseAssetDetailServiceTest {
     assertEquals("DIST", detail.composer().get("asset_kind"));
     assertEquals("company/example", detail.composer().get("package_name"));
     assertEquals("1.2.3", detail.composer().get("version"));
+  }
+
+  @Test
+  void huggingFaceModelFileDetailExposesImmutableModelIdentity() {
+    RepositoryRecord repository = repository(
+        80L, "huggingface-proxy", RepositoryFormat.HUGGINGFACE, RepositoryType.PROXY);
+    String commit = "a".repeat(40);
+    String path = "org/model/resolve/" + commit + "/model.safetensors";
+    String browsePath = "org/model/" + commit + "/model.safetensors";
+    Map<String, Object> attributes = new LinkedHashMap<>();
+    attributes.put("huggingfaceRole", "model-file");
+    attributes.put("repoId", "org/model");
+    attributes.put("commit", commit);
+    attributes.put("requestedRef", "main");
+    attributes.put("filePath", "model.safetensors");
+    attributes.put("fileKind", "SAFETENSORS");
+    attributes.put("lfsSha256", "b".repeat(64));
+    attributes.put("expectedSize", 1024L);
+    attributes.put("library", "transformers");
+    attributes.put("pipeline", "text-classification");
+    attributes.put("license", "apache-2.0");
+    attributes.put("private", false);
+    attributes.put("gated", false);
+    AssetRecord model = new AssetRecord(
+        81L, repository.id(), 82L, 83L, RepositoryFormat.HUGGINGFACE,
+        path, PersistenceHashes.pathHash(path), "model.safetensors",
+        "huggingface-model-file", "application/octet-stream", 1024L,
+        null, Instant.EPOCH, attributes);
+    StubAssetDao assets = new StubAssetDao(
+        Map.of(key(repository.id(), path), model), Map.of(83L, blob(83L, 1024L)));
+    BrowseAssetDetailService service = new BrowseAssetDetailService(
+        new StubRepositoryDao(), assets,
+        new StubBlobStorageRegistry(new StubBlobStorage(new byte[0])), new ObjectMapper());
+    BrowseNodeDao browse = mock(BrowseNodeDao.class);
+    when(browse.findNode(repository.id(), browsePath)).thenReturn(Optional.of(
+        new BrowseNodeDao.BrowseChild(
+            1L, browsePath, "model.safetensors", 3, model.id(), model.componentId(),
+            model.size(), model.contentType(), "c".repeat(40), Instant.EPOCH, false, true)));
+    service.setBrowseNodeDao(browse);
+
+    BrowseAssetDetailService.BrowseAssetDetail detail =
+        service.detail(repository, browsePath, null);
+
+    assertEquals(browsePath, detail.path());
+    assertEquals("/repository/huggingface-proxy/" + path, detail.downloadUrl());
+    assertEquals("org/model", detail.huggingface().get("repoId"));
+    assertEquals(commit, detail.huggingface().get("commit"));
+    assertEquals("main", detail.huggingface().get("requestedRef"));
+    assertEquals("model.safetensors", detail.huggingface().get("filePath"));
+    assertEquals("SAFETENSORS", detail.huggingface().get("fileKind"));
+    assertEquals("b".repeat(64), detail.huggingface().get("lfsSha256"));
+    assertEquals(1024L, detail.huggingface().get("expectedSize"));
+    assertEquals("transformers", detail.huggingface().get("library"));
+    assertEquals("text-classification", detail.huggingface().get("pipeline"));
+    assertEquals("apache-2.0", detail.huggingface().get("license"));
+    assertEquals(false, detail.huggingface().get("private"));
+    assertEquals(false, detail.huggingface().get("gated"));
+    assertEquals("READY", detail.huggingface().get("cacheState"));
   }
 
   @Test
@@ -1544,6 +1845,46 @@ class BrowseAssetDetailServiceTest {
             "Depends", "libc6"),
         "a".repeat(32), "b".repeat(40), "c".repeat(64), 512L,
         assetId, componentId, AptRegistryDao.SOURCE_HOSTED, 7L,
+        Instant.EPOCH, Instant.EPOCH, Instant.EPOCH);
+  }
+
+  private static AlpineRegistryDao.PackageRecord alpinePackage(
+      long repositoryId, Long assetId, Long componentId, String path) {
+    return new AlpineRegistryDao.PackageRecord(
+        1L, repositoryId, "v3.23/main/x86_64", "main", "x86_64", "demo", "1-r0",
+        "noarch", archiveName(path), path,
+        Map.of(
+            "T", "demo package",
+            "U", "https://example.invalid/demo",
+            "L", "MIT",
+            "o", "demo",
+            "m", "admin@example.invalid",
+            "D", "musl",
+            "p", "cmd:demo",
+            "i", "busybox"),
+        "identity", "a".repeat(64), "b".repeat(64), 512L,
+        assetId, componentId, AlpineRegistryDao.SOURCE_HOSTED, 7L,
+        Instant.EPOCH, Instant.EPOCH, Instant.EPOCH);
+  }
+
+  private static RRegistryDao.PackageRecord rPackage(
+      long repositoryId, Long assetId, Long componentId, String path) {
+    return new RRegistryDao.PackageRecord(
+        1L, repositoryId, "src/contrib", "source", "source", "demo", "1.2.3",
+        "r1|0000000001.0000000002.0000000003".getBytes(java.nio.charset.StandardCharsets.US_ASCII),
+        "source", archiveName(path), path,
+        Map.of(
+            "Package", "demo",
+            "Version", "1.2.3",
+            "License", "MIT",
+            "Depends", "R (>= 4.3)",
+            "Imports", "methods",
+            "LinkingTo", "Rcpp",
+            "Suggests", "testthat",
+            "Enhances", "parallel",
+            "NeedsCompilation", "yes"),
+        "a".repeat(32), "b".repeat(64), "b".repeat(64), 512L,
+        assetId, componentId, RRegistryDao.SOURCE_HOSTED, 7L,
         Instant.EPOCH, Instant.EPOCH, Instant.EPOCH);
   }
 

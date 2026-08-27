@@ -3,11 +3,14 @@ package com.github.klboke.kkrepo.server.cleanup;
 import com.github.klboke.kkrepo.core.RepositoryFormat;
 import com.github.klboke.kkrepo.protocol.ansible.AnsibleGalaxyVersions;
 import com.github.klboke.kkrepo.protocol.apt.DebianVersions;
+import com.github.klboke.kkrepo.protocol.alpine.AlpineVersions;
 import com.github.klboke.kkrepo.protocol.cargo.CargoVersions;
 import com.github.klboke.kkrepo.protocol.conda.CondaVersions;
 import com.github.klboke.kkrepo.protocol.conan.ConanVersions;
+import com.github.klboke.kkrepo.protocol.goartifact.GoVersions;
 import com.github.klboke.kkrepo.protocol.maven.metadata.MavenVersionComparator;
 import com.github.klboke.kkrepo.protocol.pub.PubVersions;
+import com.github.klboke.kkrepo.protocol.r.RVersions;
 import com.github.klboke.kkrepo.protocol.swift.SwiftVersions;
 import com.github.klboke.kkrepo.protocol.terraform.TerraformVersions;
 import java.util.Comparator;
@@ -26,6 +29,7 @@ public class CleanupPolicyCapabilities {
         new EnumMap<>(RepositoryFormat.class);
     comparators.put(RepositoryFormat.MAVEN2, MavenVersionComparator.INSTANCE);
     comparators.put(RepositoryFormat.CARGO, CargoVersions::compare);
+    comparators.put(RepositoryFormat.GO, GoVersions.COMPARATOR);
     comparators.put(RepositoryFormat.PUB, PubVersions.COMPARATOR);
     comparators.put(RepositoryFormat.TERRAFORM, TerraformVersions.comparator());
     comparators.put(RepositoryFormat.SWIFT, SwiftVersions.COMPARATOR);
@@ -33,6 +37,8 @@ public class CleanupPolicyCapabilities {
     comparators.put(RepositoryFormat.CONDA, CondaVersions.COMPARATOR);
     comparators.put(RepositoryFormat.CONAN, ConanVersions.comparator());
     comparators.put(RepositoryFormat.APT, DebianVersions::compare);
+    comparators.put(RepositoryFormat.ALPINE, AlpineVersions.COMPARATOR);
+    comparators.put(RepositoryFormat.R, RVersions.COMPARATOR);
     this.versionComparators = Map.copyOf(comparators);
   }
 

@@ -9,11 +9,11 @@
 
 **English** | [中文](README.cn.md)
 
-kkRepo is a community-driven, fully open-source, self-hosted artifact repository designed to address the limitations and pain points of Sonatype Nexus Community Edition and provide the community with an open, reliable, and sustainably evolving artifact management solution. It currently supports Maven, npm, PyPI, Go, Helm, Cargo/Rust, Dart/Pub, Composer/PHP, Terraform, Swift Package Registry, Ansible Galaxy, Conda, APT/Debian, Conan 2, Docker/OCI, NuGet, RubyGems, Yum, Raw, and other artifact formats.
+kkRepo is a community-driven, fully open-source, self-hosted artifact repository designed to address the limitations and pain points of Sonatype Nexus Community Edition and provide the community with an open, reliable, and sustainably evolving artifact management solution. It currently supports Maven, npm, PyPI, Go, Helm, Cargo/Rust, Dart/Pub, Composer/PHP, Terraform, Swift Package Registry, Ansible Galaxy, Conda, APT/Debian, Conan 2, Alpine/APK, R/CRAN, Docker/OCI, NuGet, RubyGems, Yum, Raw, and other artifact formats.
 
 ## Features
 
-- Support for 19+ mainstream repository formats across hosted, proxy, and group repository types.
+- Support for 20+ mainstream repository formats across hosted, proxy, and group repository types.
 - Supports AOT compilation and runtime, with about one-second startup readiness and memory usage below 200 MB.
 - Per-repository outbound HTTP or SOCKS5 proxy configuration for proxy repositories, with optional proxy authentication and HTTPS upstream tunneling.
 - Artifact security scanning with CycloneDX SBOM generation, known-vulnerability matching, policy and waiver management, and optional download enforcement.
@@ -25,10 +25,6 @@ kkRepo is a community-driven, fully open-source, self-hosted artifact repository
 - MySQL or PostgreSQL-backed metadata and shared runtime state; MySQL remains the default.
 - OSS/S3/File storage support for artifact blobs.
 - Multi-replica high-availability deployment support.
-
-<p align="center">
-  <img src="docs/assets/kkrepo-project-map.svg" alt="kkRepo architecture: supported repository formats, protocol entrypoints, service replicas, storage, UI, and Nexus migration" width="100%">
-</p>
 
 ## Trademark Notice
 
@@ -83,7 +79,7 @@ Local hot-reload development and testing are documented in the [Development Guid
 | Maven | hosted / proxy / group | Maven deploy, PUT upload, and admin UI upload | Supported | Hosted repositories are migrated by default; proxy repositories can be migrated optionally |
 | npm | hosted / proxy / group | `npm publish`, dist-tag, and admin UI upload | Supported | Hosted repositories are migrated by default; proxy repositories can be migrated optionally |
 | PyPI | hosted / proxy / group | twine upload and admin UI upload | simple index supported | Hosted repositories are migrated by default; proxy repositories can be migrated optionally |
-| Go | proxy / group | Go module proxy is mainly read-only proxy; hosted upload is not supported | Supported | Proxy repositories can be migrated optionally |
+| Go | hosted / proxy / group | Nexus-compatible `<version>.zip` PUT plus UI/API upload; Go clients resolve private hosted and public proxied modules through one group | Supported | Hosted repositories are migrated by default; proxy repositories can be migrated optionally |
 | Helm | hosted / proxy | chart push, PUT upload, and admin UI upload | index.yaml supported | Hosted repositories are migrated by default; proxy repositories can be migrated optionally |
 | Cargo / Rust | hosted / proxy / group | `cargo publish`, yank/unyank, `CargoToken` auth, and UI/API `.crate` upload | Sparse index and `cargo search` supported | Cargo repository migration is supported |
 | Dart / Pub | hosted / proxy / group | `dart pub publish`, `dart pub get`, `flutter pub get`, `PubToken` auth, and UI/API `.tar.gz` upload | Package/version metadata, archive attributes, and Pub search supported | Nexus 3.92.0 Pub hosted migration and explicitly selected proxy cache migration are supported |
@@ -94,6 +90,9 @@ Local hot-reload development and testing are documented in the [Development Guid
 | Conda | hosted / proxy / group | Nexus-compatible raw PUT plus UI/API upload for `.tar.bz2` and `.conda` packages | Channel/subdir metadata, JSON/BZ2/ZSTD repodata, channeldata, Browse/Search, and Usage supported | Repository definitions and shape-gated Nexus 3.92.x-3.94.x hosted package data are supported; generated metadata is rebuilt on the target |
 | APT / Debian | hosted / proxy | Nexus-compatible repository-root POST and Components API/UI `.deb` upload; real `apt update`, download, install, and upgrade ([usage guide](docs/en/repository-guides/apt-debian.md)) | Signed Packages/Release metadata, by-hash, Browse/Search, and Usage supported | Repository definitions and shape-gated Nexus 3.92.x-3.94.x hosted packages are supported; signing keys require explicit import before migrated repositories are enabled |
 | Conan 2 | hosted / proxy / group | `conan upload`, Conan bearer login, and UI/API revision-file upload ([usage guide](docs/en/repository-guides/conan-2.md)) | RREV/PREV metadata, Nexus-aligned write-time Browse paths, Search, and Usage supported | Nexus 3.94 repository definitions and shape-gated hosted or explicitly selected proxy-cache revisions are supported; Conan 1 and unknown shapes fail closed |
+| Alpine / APK | hosted / proxy / group | Canonical APK v2 PUT and UI/Components API upload; real `apk update`, search, policy, fetch, install, and upgrade ([usage guide](docs/en/repository-guides/alpine-apk.md)) | Signed `APKINDEX.tar.gz`, passthrough/verified re-sign proxy, ordered group source binding, Browse/Search, and Usage supported | Nexus 3.94 definitions and shape-gated hosted packages are supported; generated indexes are rebuilt and unavailable signing keys or proxy secrets fail closed |
+| R / CRAN | hosted / proxy / group | Canonical source `.tar.gz` PUT and UI/Components API upload; real `available.packages()`, install, and update flows ([usage guide](docs/en/repository-guides/r-cran.md)) | Deterministic `PACKAGES.gz`, arbitrary-file proxy, snapshot-bound group, Browse/Search, Cleanup, scanning, and Usage supported | Nexus 3.94 definitions and shape-gated hosted source packages are supported; generated indexes and bindings are rebuilt |
+| Hugging Face Models | proxy | `hf download`, `hf_hub_download`, `snapshot_download`, Transformers, and Diffusers through `HF_ENDPOINT` ([usage guide](docs/en/repository-guides/hugging-face-models.md)) | Commit-pinned model metadata/files, server-side LFS/Xet bridge, Browse/Search, Cleanup, and scanning supported | Nexus 3.77+ definitions are recognized; explicitly selected Nexus 3.94 proxy cache is shape-gated and unknown identities fail closed |
 | Docker / OCI | hosted / proxy / group | Registry V2 login, hosted push/pull, proxy pull, group pull, OCI referrers, cleanup, and connector-port access | Manifest/tag/blob metadata supported | Hosted Docker repository data migration is supported through the Nexus Repository Data flow |
 | NuGet | hosted / proxy / group | package push and admin UI upload | v3 service index / search supported | Hosted repositories are migrated by default; proxy repositories can be migrated optionally |
 | RubyGems | hosted / proxy / group | gem push/yank and admin UI upload | Supported | Hosted repositories are migrated by default; proxy repositories can be migrated optionally |
@@ -117,7 +116,7 @@ Migration supports interruption and resume. Completed data is skipped on later r
 | Dimension | Sonatype Nexus Repository OSS / Community Edition | kkRepo |
 | --- | --- | --- |
 | Product positioning | A general-purpose artifact repository management platform with broad format and management coverage | Provides migration-oriented client behavior, permission model, and `/repository/<repo>/...` URL compatibility while using a relational-database, OSS/S3-first, multi-replica-friendly architecture |
-| Supported formats | Officially supports more formats; exact capabilities vary by version and distribution | Focuses on common artifact formats. Currently supports Maven, npm, PyPI, Go, Helm, Cargo/Rust, Dart/Pub, Composer/PHP, Terraform, Swift Package Registry, Ansible Galaxy, Conda, APT/Debian, Conan 2, Docker/OCI, NuGet, RubyGems, Yum, and Raw. Each format is implemented as an independent protocol module for prioritized extension and validation |
+| Supported formats | Officially supports more formats; exact capabilities vary by version and distribution | Focuses on common artifact formats. Currently supports Maven, npm, PyPI, Go, Helm, Cargo/Rust, Dart/Pub, Composer/PHP, Terraform, Swift Package Registry, Ansible Galaxy, Conda, APT/Debian, Conan 2, Alpine/APK, R/CRAN, Docker/OCI, NuGet, RubyGems, Yum, and Raw. Each format is implemented as an independent protocol module for prioritized extension and validation |
 | Usage limits | Community Edition targets individuals and small teams. Official limits are up to 40,000 components and 100,000 requests/day. When exceeded, new component creation is paused until usage returns below the limits | Does not include Community Edition-style license usage limits. Capacity is bounded by the selected relational database, OSS/S3, replica count, and deployment sizing, so it can scale with actual business needs |
 | High availability deployment | Open source editions are suitable for a single instance or basic Kubernetes deployment; official HA deployment is a Pro capability | Designed for multi-replica deployment by default: session, authentication tickets, catalog watermarks, locks, migration progress, and short-lived coordination state are stored in MySQL or PostgreSQL. In-process cache is only a rebuildable hot cache |
 | Stability and upgrade | Version boundaries are complex: 3.70.x is the last version supporting OrientDB; 3.71.0 defaults new installs to H2, but H2 is still embedded; Community Edition did not support free external PostgreSQL until 3.77.0+; search was fully moved to SQL and away from Elasticsearch only in 3.88.0. Older OrientDB/Elasticsearch/local-data-directory deployments carry heavy upgrade windows and recovery depends heavily on backups, repair tasks, and manual intervention | MySQL/PostgreSQL runtime with no dependency on OrientDB or embedded Elasticsearch. Core state is in the shared relational database, blobs are in OSS/S3/File blob store, and cache/index data is rebuildable, making rolling upgrade, failover, and recovery easier |
@@ -142,7 +141,7 @@ The repository list shows hosted, proxy, and group repositories with format, sta
 
 ![User repository list](docs/img/img_7.png)
 
-Search components by format across Maven, npm, PyPI, Go, Helm, Cargo/Rust, Dart/Pub, Composer/PHP, Terraform, Swift Package Registry, Ansible Galaxy, Conda, APT/Debian, Conan 2, Docker/OCI, NuGet, RubyGems, Yum, Raw, and other repository types.
+Search components by format across Maven, npm, PyPI, Go, Helm, Cargo/Rust, Dart/Pub, Composer/PHP, Terraform, Swift Package Registry, Ansible Galaxy, Conda, APT/Debian, Conan 2, Alpine/APK, R/CRAN, Hugging Face Models, Docker/OCI, NuGet, RubyGems, Yum, Raw, and other repository types.
 
 ![User artifact search](docs/img/img.png)
 
@@ -195,17 +194,21 @@ Repository format roadmap:
 8. ✅ Conda - Hosted, proxy, group, `.tar.bz2`/`.conda` publication, JSON/BZ2/ZSTD channel metadata, UI/API upload, Browse/Search, multi-replica coordination, real Conda client E2E, Nexus black-box fixtures, and shape-gated Nexus 3.92.x-3.94.x hosted-data migration E2E are implemented ([Chinese design notes](docs/zh/dev/conda-repository-design.md))
 9. ✅ APT / Debian - Hosted/proxy repositories, signed metadata, UI/API upload, Browse/Search, multi-replica publication, real APT client and Nexus black-box checks, shape-gated migration, and a reproducible Nexus performance baseline are implemented ([usage guide](docs/en/repository-guides/apt-debian.md), [Chinese design notes](docs/zh/dev/apt-debian-repository-design.md), [performance baseline](docs/en/dev/apt-performance-baseline.md))
 10. ✅ Conan 2 - Hosted/proxy/group, Conan bearer authentication, manifest-gated revision publication, write-time Nexus Browse projection, UI/API upload, Cleanup, composite package scanning, shape-gated migration, real Conan client E2E, and dual-database Nexus performance baselines are implemented ([usage guide](docs/en/repository-guides/conan-2.md), [Chinese design notes](docs/zh/dev/conan-repository-design.md), [performance baseline](docs/en/dev/conan-performance-baseline.md))
-11. Alpine / APK - Planned with hosted, proxy, and group repositories, including APK v2 indexes, repository signing, cleanup, security scanning, and shape-gated Nexus migration ([Chinese design notes](docs/zh/dev/alpine-apk-repository-design.md))
-12. ohpm / HarmonyOS - Planned with hosted, proxy, group, import, and admin capabilities ([Chinese design notes](docs/zh/dev/ohpm-repository-design.md))
-13. Go hosted repositories - Planned to complete Nexus-compatible Go coverage with internal module publication; proxy and group repositories are already supported.
-14. Helm group repositories - Planned to complete Nexus-compatible ordered aggregation across hosted, proxy, and group members.
-15. R / CRAN - Planned with proxy, hosted, and group repositories; hosted and group scope will follow Nexus `.gz` package support.
-16. Git Large File Storage (LFS) - Planned with Nexus-compatible hosted storage for large Git-managed assets.
-17. Hugging Face Models - Planned with Nexus-compatible proxy repositories for model metadata and large model assets.
+11. ✅ Alpine / APK - Hosted/proxy/group, APK v2 package validation, signed immutable indexes, passthrough/verified re-sign proxying, ordered group source binding, UI/API upload, Browse/Search, Cleanup, scanning, shape-gated Nexus 3.94 migration, apk-tools 2.14/3.0 client E2E, and reproducible Nexus performance gates are implemented ([usage guide](docs/en/repository-guides/alpine-apk.md), [Chinese design notes](docs/zh/dev/alpine-apk-repository-design.md), [performance baseline](docs/en/dev/alpine-performance-baseline.md))
+12. ✅ Hugging Face Models - Models-only proxy repositories with commit-pinned metadata/files, server-side LFS/Xet bridging, real Hub/Transformers/Diffusers clients, multi-replica S3 coordination, scanning, Cleanup, and shape-gated Nexus migration ([usage guide](docs/en/repository-guides/hugging-face-models.md), [Chinese design notes](docs/zh/dev/hugging-face-models-repository-design.md), [performance baseline](docs/en/dev/hugging-face-models-performance-baseline.md)).
+13. ✅ R / CRAN - Hosted/proxy/group, bounded source-package validation, deterministic `PACKAGES.gz`, lazy verified proxying, snapshot-bound group resolution, UI/API upload, Browse/Search, Cleanup, partial-coverage scanning, shape-gated Nexus 3.94 migration, R 4.5/4.6 client E2E, indexed dual-database access, and reproducible Nexus performance gates are implemented ([usage guide](docs/en/repository-guides/r-cran.md), [Chinese design notes](docs/zh/dev/r-cran-repository-design.md), [performance baseline](docs/en/dev/r-cran-performance-baseline.md)).
+14. ✅ Go - Hosted/proxy/group recipes, Nexus-compatible module ZIP publication, official path/version/archive validation, ordered group aggregation, Cleanup, artifact scanning, UI/API upload, migration, real Go client E2E, Nexus 3.94 black-box comparison, and a reproducible performance baseline are implemented ([usage guide](docs/en/repository-guides/go.md), [performance baseline](docs/en/dev/go-hosted-performance-baseline.md)).
+15. ohpm / HarmonyOS - Planned with hosted, proxy, group, import, and admin capabilities ([Chinese design notes](docs/zh/dev/ohpm-repository-design.md))
+16. Helm group repositories - Planned to complete Nexus-compatible ordered aggregation across hosted, proxy, and group members.
+17. Git Large File Storage (LFS) - Planned with Nexus-compatible hosted storage for large Git-managed assets.
 18. Eclipse p2 - Planned with Nexus-compatible proxy repositories for Eclipse and Equinox update sites.
 19. CocoaPods - Planned with Nexus-compatible proxy repositories for CocoaPods dependencies.
 
 Token types exposed in the user and admin UI include protocol-specific tokens (`NpmToken`, `CargoToken`, `PubToken`, `NuGetApiKey`, `RubyGemsApiKey`) plus `GenericToken` for Terraform service URLs, Ansible Galaxy clients, CI, scripts, and custom HTTP clients that can send the configured API-key header or bearer token.
+
+## Who Is Using kkRepo?
+
+If your company, enterprise, or organization uses kkRepo, you are welcome to share your deployment in the [user registration issue](https://github.com/klboke/kkRepo/issues/94). This issue is for usage registration only; please use the regular issue templates for bug reports and feature requests.
 
 ## Contributing
 
@@ -216,6 +219,18 @@ Local development and testing are documented in the [Development Guide](docs/en/
 ## Support
 
 Join the [kkRepo Telegram group](https://t.me/+UbIsTKXTzxBhYjFl) for community support and usage discussion. See [SUPPORT.md](SUPPORT.md) for issue routing, support scope, and security-reporting boundaries.
+
+## Sponsors
+
+Thank you to everyone supporting the ongoing development and maintenance of kkRepo. You can support the project through [GitHub Sponsors](https://github.com/sponsors/klboke).
+
+### Organization Sponsors
+
+Active organization sponsors will be featured here with their logo and link.
+
+### Project Backers
+
+Active project backers will be recognized here with their name or logo and optional link.
 
 ## Security
 

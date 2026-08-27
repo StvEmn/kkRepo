@@ -2,8 +2,12 @@ package com.github.klboke.kkrepo.server.migration;
 
 import com.github.klboke.kkrepo.core.RepositoryFormat;
 import com.github.klboke.kkrepo.protocol.maven.path.MavenPath;
+import com.github.klboke.kkrepo.protocol.huggingface.HuggingFacePath;
+import com.github.klboke.kkrepo.protocol.huggingface.HuggingFacePathParser;
 import com.github.klboke.kkrepo.server.pub.PubRepositoryDataMigrationWriter;
+import com.github.klboke.kkrepo.server.r.RRepositoryDataMigrationWriter;
 import com.github.klboke.kkrepo.server.ansible.AnsibleGalaxyRepositoryDataMigrationWriter;
+import com.github.klboke.kkrepo.server.alpine.AlpineRepositoryDataMigrationWriter;
 import com.github.klboke.kkrepo.server.apt.AptRepositoryDataMigrationWriter;
 import com.github.klboke.kkrepo.server.conda.CondaRepositoryDataMigrationWriter;
 import com.github.klboke.kkrepo.server.conan.ConanRepositoryDataMigrationWriter;
@@ -47,8 +51,19 @@ final class RepositoryDataMigrationPaths {
     if (format == RepositoryFormat.APT) {
       return AptRepositoryDataMigrationWriter.isMigratableAptPath(path);
     }
+    if (format == RepositoryFormat.ALPINE) {
+      return AlpineRepositoryDataMigrationWriter.isMigratableAlpinePath(path);
+    }
+    if (format == RepositoryFormat.R) {
+      return RRepositoryDataMigrationWriter.isMigratableRPath(path);
+    }
     if (format == RepositoryFormat.CONAN) {
       return ConanRepositoryDataMigrationWriter.isMigratableConanPath(path);
+    }
+    if (format == RepositoryFormat.HUGGINGFACE) {
+      HuggingFacePath parsed = new HuggingFacePathParser().parse(path);
+      return parsed.kind() == HuggingFacePath.Kind.RESOLVE
+          && HuggingFacePathParser.isCommit(parsed.revision());
     }
     return true;
   }

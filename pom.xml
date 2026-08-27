@@ -29,6 +29,9 @@
     <module>protocol-conda</module>
     <module>protocol-conan</module>
     <module>protocol-apt</module>
+    <module>protocol-alpine</module>
+    <module>protocol-r</module>
+    <module>protocol-huggingface</module>
     <module>protocol-go</module>
     <module>protocol-helm</module>
     <module>protocol-docker</module>
@@ -48,22 +51,23 @@
   </modules>
 
   <properties>
-    <revision>0.8.0</revision>
+    <revision>0.9.0</revision>
     <java.version>25</java.version>
-    <spring.boot.version>4.1.0</spring.boot.version>
-    <native-build-tools-plugin.version>1.1.8</native-build-tools-plugin.version>
+    <spring.boot.version>4.1.1</spring.boot.version>
+    <native-build-tools-plugin.version>1.1.10</native-build-tools-plugin.version>
     <apollo.client.version>2.5.0</apollo.client.version>
-    <guava.version>33.6.0-jre</guava.version>
+    <guava.version>33.7.1-jre</guava.version>
     <guice.version>7.0.0</guice.version>
     <re2j.version>1.8</re2j.version>
     <maven.artifact.version>3.9.16</maven.artifact.version>
-    <aws.sdk.version>2.51.2</aws.sdk.version>
+    <aws.sdk.version>2.54.1</aws.sdk.version>
     <commons.compress.version>1.28.0</commons.compress.version>
     <xz.version>1.12</xz.version>
-    <zstd.jni.version>1.5.7-12</zstd.jni.version>
+    <zstd.jni.version>1.5.7-15</zstd.jni.version>
     <commons.lang3.version>3.20.0</commons.lang3.version>
     <bouncycastle.version>1.85</bouncycastle.version>
     <jacoco.version>0.8.15</jacoco.version>
+    <archunit.version>1.5.0</archunit.version>
     <flatten.maven.plugin.version>1.8.0</flatten.maven.plugin.version>
     <maven.compiler.release>${java.version}</maven.compiler.release>
     <kkrepo.dist.version>${project.version}</kkrepo.dist.version>
@@ -95,6 +99,11 @@
         <groupId>org.apache.maven</groupId>
         <artifactId>maven-artifact</artifactId>
         <version>${maven.artifact.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.tngtech.archunit</groupId>
+        <artifactId>archunit-junit5</artifactId>
+        <version>${archunit.version}</version>
       </dependency>
       <dependency>
         <groupId>org.springframework.boot</groupId>
@@ -238,6 +247,21 @@
       <dependency>
         <groupId>com.github.klboke</groupId>
         <artifactId>kkrepo-protocol-apt</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.github.klboke</groupId>
+        <artifactId>kkrepo-protocol-alpine</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.github.klboke</groupId>
+        <artifactId>kkrepo-protocol-r</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.github.klboke</groupId>
+        <artifactId>kkrepo-protocol-huggingface</artifactId>
         <version>${project.version}</version>
       </dependency>
       <dependency>

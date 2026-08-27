@@ -4,6 +4,7 @@ import com.github.klboke.kkrepo.core.RepositoryFormat;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.ComponentRecord;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 
 public interface ComponentDao {
@@ -54,6 +55,22 @@ public interface ComponentDao {
 
   List<ComponentRecord> listByName(long repositoryId, String name);
 
+  /**
+   * Returns the unordered version projection for one format-specific component name.
+   *
+   * <p>Protocol callers must apply their own version validation and ordering. The default keeps
+   * lightweight adapters source-compatible; production implementations should avoid loading the
+   * full component row for this lookup.
+   */
+  default List<String> listVersionsByName(
+      long repositoryId, RepositoryFormat format, String name) {
+    return listByName(repositoryId, name).stream()
+        .filter(component -> component.format() == format)
+        .map(ComponentRecord::version)
+        .filter(Objects::nonNull)
+        .toList();
+  }
+
   List<ComponentRecord> listByGa(long repositoryId, String groupId, String artifactId);
 
   List<ComponentSearchRow> search(String keyword, RepositoryFormat format, int limit);
@@ -65,6 +82,25 @@ public interface ComponentDao {
       RepositoryFormat format,
       String keyword,
       int limit);
+
+  /**
+   * Returns a stable search page scoped to repositories the caller has already authorized.
+   *
+   * <p>The cursor follows {@code last_updated_at DESC, id DESC}. The default keeps lightweight
+   * adapters source-compatible for the first page; production implementations must override this
+   * method when callers need to continue after a cursor.
+   */
+  default List<ComponentSearchRow> searchPageByRepositoryIds(
+      List<Long> repositoryIds,
+      RepositoryFormat format,
+      String keyword,
+      ComponentSearchCursor after,
+      int limit) {
+    if (after != null) {
+      throw new UnsupportedOperationException("component search cursor is not supported");
+    }
+    return searchByRepositoryIds(repositoryIds, format, keyword, limit);
+  }
 
   List<ComponentRecord> searchComponentsByRepositoryIds(
       List<Long> repositoryIds,
@@ -93,6 +129,12 @@ public interface ComponentDao {
       String kind,
       java.time.Instant lastUpdatedAt,
       String storagePath) {
+  }
+
+  record ComponentSearchCursor(java.time.Instant lastUpdatedAt, long id) {
+    public static ComponentSearchCursor after(ComponentSearchRow row) {
+      return new ComponentSearchCursor(row.lastUpdatedAt(), row.id());
+    }
   }
 
   record CleanupFamilyCursor(String namespace, String name, String kind) {

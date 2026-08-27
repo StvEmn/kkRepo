@@ -22,8 +22,9 @@ NEXUS_COMPAT_PASSWORD=Admin1234
 Current Maven compatibility checks and repository-format compatibility checks can compare against
 this same long-running Nexus reference unless a test explicitly documents why it needs an isolated
 throwaway Nexus instance. Cargo/Rust requires Nexus 3.77.x+, Terraform requires Nexus 3.90.0+ for
-hosted/proxy/group coverage, Pub, Conda, and APT require Nexus 3.92.0+, and the Conan 2 and Swift reference matrices target
-Nexus 3.94.x so their latest repository implementations are available; the Swift lane also verifies versioned-manifest fallback and `v`/`V` tag normalization. The
+hosted/proxy/group coverage, Pub, Conda, and APT require Nexus 3.92.0+, and the Conan 2, Swift,
+Alpine/APK, R/CRAN, and Hugging Face Models reference matrices target Nexus 3.94.x so their latest repository implementations are
+available; the Swift lane also verifies versioned-manifest fallback and `v`/`V` tag normalization. The
 datastore-era PostgreSQL compose file below defaults to Nexus 3.92.0 for the general newer-format
 checks, while the Swift workflow explicitly overrides that image with Nexus 3.94.x.
 
@@ -59,7 +60,8 @@ docker compose -f docker-compose.compat.yml down -v
 
 For datastore-era compatibility work, use the Nexus PostgreSQL compose file instead of the default
 Nexus 3.29.2 OrientDB reference. It pins Nexus to 3.92.0 with PostgreSQL datastore enabled, which
-covers Cargo/Rust, Dart/Pub, Terraform, Conda, APT/Debian, and the other newer-format live checks. Override the Nexus image with 3.94.x for Conan 2 and Swift:
+covers Cargo/Rust, Dart/Pub, Terraform, Conda, APT/Debian, and the other newer-format live checks.
+Override the Nexus image with 3.94.x for Conan 2, Swift, Alpine/APK, and R/CRAN:
 
 ```bash
 scripts/build-docker-image.sh kkrepo:compat
@@ -80,16 +82,19 @@ Available suites:
 - `smoke`: diagnostic console API checks plus Maven proxy GET/HEAD/checksum read compatibility.
 - `write-smoke`: Maven hosted release/snapshot write compatibility with `COMPAT_WRITE_ENABLED=true`.
 - `nexus`: the disposable Nexus reference matrix. It enables write checks and compares kkrepo with
-  Nexus across Maven, npm, PyPI, Cargo/Rust, Dart/Pub, Composer/PHP, Terraform, Swift, Ansible Galaxy, Conda, APT/Debian, Conan 2, Raw, selected NuGet/RubyGems/Yum behavior,
-  Go proxy endpoints, Helm hosted round trips, component upload specs, and selected security/admin
+  Nexus across Maven, npm, PyPI, Cargo/Rust, Dart/Pub, Composer/PHP, Terraform, Swift, Ansible Galaxy,
+  Conda, APT/Debian, Conan 2, Alpine/APK, R/CRAN, Raw, selected NuGet/RubyGems/Yum behavior,
+  Go hosted publication plus proxy/group endpoints, Helm hosted round trips, component upload specs, and selected security/admin
   contracts. Composer is required when enabled; a missing Nexus Composer endpoint fails instead of skipping.
   The self-contained Conda fixtures run in this module, while the live Conda comparison is enabled
   explicitly as described below.
 - `extended`: diagnostic smoke coverage plus currently separated PyPI, Helm, Pub, NuGet, RubyGems, and Yum checks.
 - `client-e2e`: starts from the disposable kkrepo service and uses real package clients to publish
   and then download/resolve through hosted and group/proxy repositories. It covers Maven, npm,
-  PyPI, Helm, Cargo/Rust, Dart/Pub, Flutter Pub, Composer/PHP, Terraform 0.13/current, Ansible Galaxy 2.9/current, Conda, APT/Debian, Conan 2, NuGet, RubyGems, Yum, and Docker/OCI. Go is
-  resolve-only through the Go proxy because hosted Go publishing is not a supported repository mode.
+  PyPI, Helm, Cargo/Rust, Dart/Pub, Flutter Pub, Composer/PHP, Terraform 0.13/current, Ansible Galaxy
+  2.9/current, Conda, APT/Debian, Conan 2, Alpine/APK, R 4.5/4.6, NuGet, RubyGems, Yum, and Docker/OCI.
+  Go uploads an internal module to hosted, resolves it through group, and then resolves a public
+  module through the same group's proxy fallback.
   SwiftPM is included when `swift` or `SWIFT_E2E_BINS` is available; it publishes to Swift hosted,
   resolves and builds through group, checks immutable conflict and checksum replay, and exercises
   GitHub SCM-to-registry replacement through proxy.
@@ -104,6 +109,12 @@ Available suites:
   proxy cache, and local re-signing.
   Conan runs an installed Conan 2 client through create, upload, list, download, install, remote
   package-revision removal, and the shared whole-revision cleanup gate.
+  Alpine runs apk-tools 2.x and 3.x clients through signed `update`, `search`, `policy`, `fetch`,
+  `add`, and `upgrade`, then verifies deletion, proxy passthrough, and byte-identical metadata from
+  a second replica.
+  R runs R 4.5.3 and 4.6.1 through hosted/group `available.packages()`, dependency installation and
+  update, proxy `PACKAGES.gz`/`PACKAGES.rds`, version-order differential checks, cleanup, and an
+  optional second replica.
   The Composer flow additionally validates a hosted-to-proxy transitive dependency, rejected Basic
   credentials, and lock replay from the server cache after clearing the client cache and detaching
   the Packagist upstream.
@@ -118,6 +129,11 @@ Available suites:
 - `conan`: the opt-in Nexus 3.94.x Conan 2 hosted matrix. It compares manifest-gated RREV/PREV
   publication, search/revision/file responses, package archives, Range/HEAD behavior, and the
   Nexus-aligned Browse tree persisted by the candidate write path.
+- `alpine`: the opt-in Nexus 3.94.x Alpine hosted matrix. It compares raw APK v2 upload, signed
+  `APKINDEX.tar.gz`, official `Q1` package identity, package GET/HEAD/Range/validators, Browse, and
+  Search.
+- `r`: the opt-in Nexus 3.94.x R hosted matrix. It compares canonical source package upload,
+  normalized `PACKAGES.gz`, package GET/HEAD/Range/validators, Browse, and Search.
 
 In GitHub Actions, add the `run-live-compat` label to a PR to run the unified Nexus compatibility
 matrix against the Nexus 3.92.0 PostgreSQL reference. The live compatibility workflow
@@ -269,6 +285,105 @@ The client flow uses `conan-hosted` for publication and `conan-group` for reads 
 validates create/upload/list/download/install/remove and leaves the recipe revision for the shared
 cleanup-policy Try Run/Execute gate. Override repository names with
 `CONAN_E2E_HOSTED_REPOSITORY` and `CONAN_E2E_GROUP_REPOSITORY`.
+
+### Alpine / APK compatibility and client matrix
+
+`AlpineRepositoryBlackBoxCompatibilityTest` creates isolated signed hosted repositories on Nexus
+3.94.x and kkrepo. It uploads the same deterministic APK v2 package, validates the official
+compressed-control-member `Q1` identity and signed index, and compares package GET/HEAD/Range,
+validators, Browse, and Search:
+
+```bash
+ALPINE_COMPAT_ENABLED=true \
+ALPINE_NEXUS_COMPAT_BASE_URL=http://127.0.0.1:39400 \
+ALPINE_KKREPO_COMPAT_BASE_URL=http://127.0.0.1:18090 \
+ALPINE_NEXUS_COMPAT_USERNAME=admin \
+ALPINE_NEXUS_COMPAT_PASSWORD=Admin1234 \
+ALPINE_KKREPO_COMPAT_USERNAME=admin \
+ALPINE_KKREPO_COMPAT_PASSWORD=12345678 \
+mvn -pl compat-test -am \
+  -Dtest=AlpineRepositoryBlackBoxCompatibilityTest \
+  -Dsurefire.failIfNoSpecifiedTests=false test
+```
+
+Run the real apk-tools matrix with:
+
+```bash
+CLIENT_E2E_TESTS=alpine \
+ALPINE_E2E_IMAGES='2.14=alpine:3.20,3.x=alpine:3.23' \
+scripts/ci/run-client-e2e.sh
+```
+
+Set `ALPINE_KKREPO_SECONDARY_BASE_URL` to a second replica sharing the database and blob store to
+require byte-identical signed group metadata across replicas. The flow validates signed
+`apk update`, `search`, `policy`, `fetch`, `add`, and `upgrade`, package-byte identity, deletion,
+proxy passthrough, and the 2.x/3.x version-order differential corpus. Migration E2E creates native
+Nexus 3.94 hosted/proxy/group definitions and a dependency graph, proves the exact datastore
+shape, restores only original `.apk` packages to MySQL/PostgreSQL targets, leaves repositories
+offline until the source test key is explicitly imported, rebuilds signed metadata, and verifies a
+real install plus row-count and cross-replica invariants.
+
+### R / CRAN compatibility and client matrix
+
+`RRepositoryBlackBoxCompatibilityTest` creates isolated hosted repositories on Nexus 3.94.x and
+kkRepo, uploads the same deterministic source package, compares normalized `PACKAGES.gz` records,
+and validates package GET/HEAD/Range/validators, Browse, and Search:
+
+```bash
+R_COMPAT_ENABLED=true \
+R_NEXUS_COMPAT_BASE_URL=http://127.0.0.1:39400 \
+R_KKREPO_COMPAT_BASE_URL=http://127.0.0.1:18090 \
+R_NEXUS_COMPAT_USERNAME=admin \
+R_NEXUS_COMPAT_PASSWORD=Admin1234 \
+R_KKREPO_COMPAT_USERNAME=admin \
+R_KKREPO_COMPAT_PASSWORD=12345678 \
+mvn -pl compat-test -am \
+  -Dtest=RRepositoryBlackBoxCompatibilityTest \
+  -Dsurefire.failIfNoSpecifiedTests=false test
+```
+
+Run the real R matrix with:
+
+```bash
+CLIENT_E2E_TESTS=r \
+R_E2E_IMAGES='4.5.3=r-base:4.5.3,4.6.1=r-base:4.6.1' \
+scripts/ci/run-client-e2e.sh
+```
+
+Set `R_KKREPO_SECONDARY_BASE_URL` to a second replica to require byte-identical group metadata.
+The flow validates hosted dependency installation/update, proxy compressed and RDS metadata,
+group source binding, package-byte identity, cleanup registration, and the official version-order
+differential corpus. See the [R / CRAN performance baseline](../docs/en/dev/r-cran-performance-baseline.md).
+
+### Hugging Face Models compatibility and client matrix
+
+`HuggingFaceRepositoryBlackBoxCompatibilityTest` compares two pre-created Models proxy
+repositories that point to the same deterministic Hub/LFS/Xet-bridge fixture. It validates model
+metadata, conditional GET, paths-info, commit-pinned full bytes, HEAD, Range, linked identity, and
+the absence of client-visible Xet/external redirects. Nexus 3.94's 400 response on the current
+paths-info flow is recorded explicitly while kkRepo is required to support the official client
+route:
+
+```bash
+python3 scripts/perf/huggingface-hub-fixture.py --port 48770
+
+HUGGINGFACE_COMPAT_ENABLED=true \
+HUGGINGFACE_NEXUS_PROXY_URL=http://127.0.0.1:39400/repository/huggingface-compat \
+HUGGINGFACE_KKREPO_PROXY_URL=http://127.0.0.1:18090/repository/huggingface-compat \
+NEXUS_COMPAT_USERNAME=admin \
+NEXUS_COMPAT_PASSWORD=Admin1234 \
+KKREPO_COMPAT_USERNAME=admin \
+KKREPO_COMPAT_PASSWORD=12345678 \
+mvn -pl compat-test -am \
+  -Dtest=HuggingFaceRepositoryBlackBoxCompatibilityTest \
+  -Dsurefire.failIfNoSpecifiedTests=false test
+```
+
+Create the two `huggingface-proxy` repositories first and set their remote URL to
+`http://host.docker.internal:48770` when the services run in Docker. The performance fixture and
+the exact `huggingface_hub` 0.34.6/1.27.0, `hf` CLI, Transformers, Diffusers, File/S3, and
+dual-replica evidence are documented in the
+[Hugging Face performance baseline](../docs/en/dev/hugging-face-models-performance-baseline.md).
 
 ### Swift Registry compatibility and client matrix
 
@@ -568,9 +683,11 @@ Useful thresholds:
 - `COMPAT_PERF_WARMUPS`, default `2`
 - `COMPAT_PERF_SAMPLES`, default `8`
 
-## Go Proxy And Group Compatibility
+## Go Hosted, Proxy, And Group Compatibility
 
-The Go black-box test compares kkrepo against Nexus Go proxy and group repositories. By default
+The Go black-box test compares kkrepo against Nexus 3.93+ Go hosted, proxy, and group repositories.
+It covers repository-root `<version>.zip` publication; list/info/mod/zip/latest and HEAD responses;
+hosted-first group reads; ordered proxy fallback; media types; and generated metadata. By default
 it targets the local Nexus at `http://localhost:28090` with `admin` / `Admin1234`, and kkrepo at
 `http://127.0.0.1:18090`. Override `GO_KKREPO_COMPAT_BASE_URL` when testing a non-default
 kkrepo port.
@@ -590,10 +707,10 @@ mvn -pl compat-test -am \
   test
 ```
 
-The test creates/updates `go-proxy-compat`, `go-group-compat-miss`,
+The test creates/updates `go-hosted-compat`, `go-proxy-compat`, `go-group-compat-miss`,
 `go-group-compat-hit`, and `go-group-compat` on both sides. Override with
 `GO_NEXUS_COMPAT_BASE_URL`, `GO_KKREPO_COMPAT_BASE_URL`,
-`GO_NEXUS_COMPAT_PASSWORD`, `GO_GROUP_COMPAT_REPOSITORY`, and related
+`GO_NEXUS_COMPAT_PASSWORD`, `GO_HOSTED_COMPAT_REPOSITORY`, `GO_GROUP_COMPAT_REPOSITORY`, and related
 `GO_GROUP_COMPAT_*` settings when needed.
 
 ## Helm Hosted And Proxy Compatibility
@@ -758,3 +875,9 @@ The migration script uses the local Nexus REST endpoint `http://localhost:28090/
 pushes a fixture image to `docker-hosted`, starts repository-data metadata and
 package migration for only that Docker repository, then pulls the image from the
 kkrepo Docker connector `127.0.0.1:18183`.
+
+When `GO_MIGRATION_ENABLED=true`, the same script also creates and publishes a native Go module in
+the Nexus 3.94 `go-hosted` repository, requires a `FULL` datastore-backed migration plan, migrates
+its assets, checks the module ZIP digest, and runs `go mod download` against both kkrepo replicas.
+The migration workflow enables this fixture only for its Nexus 3.94 H2/PostgreSQL lanes because Go
+hosted repositories were introduced in Nexus 3.93.

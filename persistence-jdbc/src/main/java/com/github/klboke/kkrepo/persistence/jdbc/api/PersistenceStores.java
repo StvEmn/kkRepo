@@ -2,6 +2,8 @@ package com.github.klboke.kkrepo.persistence.jdbc.api;
 
 /** Complete set of persistence contracts available to standalone tools. */
 public interface PersistenceStores extends AutoCloseable {
+  AlpineRegistryDao alpineRegistry();
+
   AptRegistryDao aptRegistry();
 
   AnsibleGalaxyRegistryDao ansibleGalaxyRegistry();
@@ -34,6 +36,8 @@ public interface PersistenceStores extends AutoCloseable {
 
   DockerUploadDao dockerUploads();
 
+  HuggingFaceRegistryDao huggingFaceRegistry();
+
   MaintenanceCursorDao maintenanceCursors();
 
   MetadataRebuildDao metadataRebuild();
@@ -45,6 +49,8 @@ public interface PersistenceStores extends AutoCloseable {
   NpmReleaseIndexDao npmReleaseIndexes();
 
   ProxyStateDao proxyStates();
+
+  RRegistryDao rRegistry();
 
   PubUploadSessionDao pubUploadSessions();
 

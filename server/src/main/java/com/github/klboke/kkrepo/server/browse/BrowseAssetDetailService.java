@@ -8,12 +8,14 @@ import com.github.klboke.kkrepo.core.RepositoryFormat;
 import com.github.klboke.kkrepo.core.RepositoryType;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AnsibleGalaxyRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AptRegistryDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.AlpineRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AssetDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.BrowseNodeDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.ConanRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.CondaRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.DockerRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.RRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.SwiftRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.TerraformRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.AssetBlobRecord;
@@ -31,6 +33,7 @@ import com.github.klboke.kkrepo.protocol.ansible.AnsibleGalaxyPathParser;
 import com.github.klboke.kkrepo.protocol.conda.CondaPath;
 import com.github.klboke.kkrepo.protocol.npm.NpmMetadata;
 import com.github.klboke.kkrepo.protocol.npm.NpmPackageId;
+import com.github.klboke.kkrepo.protocol.r.RPathParser;
 import com.github.klboke.kkrepo.protocol.swift.SwiftPath;
 import com.github.klboke.kkrepo.protocol.swift.SwiftPathParser;
 import com.github.klboke.kkrepo.protocol.swift.SwiftToolsVersions;
@@ -76,6 +79,8 @@ public class BrowseAssetDetailService {
   private AnsibleGalaxyRegistryDao ansibleDao;
   private CondaRegistryDao condaDao;
   private AptRegistryDao aptDao;
+  private AlpineRegistryDao alpineDao;
+  private RRegistryDao rDao;
   private BrowseNodeDao browseNodeDao;
   private ConanRegistryDao conanDao;
   private final BlobStorageRegistry blobStorageRegistry;
@@ -112,6 +117,16 @@ public class BrowseAssetDetailService {
   @Autowired(required = false)
   void setAptRegistryDao(AptRegistryDao aptDao) {
     this.aptDao = aptDao;
+  }
+
+  @Autowired(required = false)
+  void setAlpineRegistryDao(AlpineRegistryDao alpineDao) {
+    this.alpineDao = alpineDao;
+  }
+
+  @Autowired(required = false)
+  void setRRegistryDao(RRegistryDao rDao) {
+    this.rDao = rDao;
   }
 
   @Autowired(required = false)
@@ -219,11 +234,20 @@ public class BrowseAssetDetailService {
     Map<String, Object> apt = source.format() == RepositoryFormat.APT
         ? aptAttributes(source, asset)
         : Map.of();
+    Map<String, Object> alpine = source.format() == RepositoryFormat.ALPINE
+        ? alpineAttributes(source, asset)
+        : Map.of();
+    Map<String, Object> r = source.format() == RepositoryFormat.R
+        ? rAttributes(source, asset)
+        : Map.of();
     Map<String, Object> swift = source.format() == RepositoryFormat.SWIFT
         ? swiftAttributes(source, asset)
         : Map.of();
     Map<String, Object> ansible = source.format() == RepositoryFormat.ANSIBLEGALAXY
         ? ansibleAttributes(source, asset, ansibleVersion)
+        : Map.of();
+    Map<String, Object> huggingFace = source.format() == RepositoryFormat.HUGGINGFACE
+        ? huggingFaceAttributes(asset)
         : Map.of();
     String displayName = storagePath.equals(publicPath)
         ? asset.name()
@@ -261,6 +285,9 @@ public class BrowseAssetDetailService {
         composer,
         conda,
         apt,
+        alpine,
+        r,
+        huggingFace,
         swift,
         ansible,
         provenance);
@@ -341,6 +368,83 @@ public class BrowseAssetDetailService {
       }
     }
     return Collections.unmodifiableMap(apt);
+  }
+
+  private Map<String, Object> alpineAttributes(
+      RepositoryRecord source, AssetRecord asset) {
+    if (alpineDao == null) return Map.of();
+    AlpineRegistryDao.PackageRecord record = alpineDao.findPackageByPath(source.id(), asset.path())
+        .orElseThrow(() -> new ResponseStatusException(
+            HttpStatus.NOT_FOUND, "Alpine package identity not found"));
+    if (record.assetId() != null && !record.assetId().equals(asset.id())) {
+      throw new ResponseStatusException(
+          HttpStatus.CONFLICT, "Alpine package asset does not match registry state");
+    }
+    LinkedHashMap<String, Object> alpine = new LinkedHashMap<>();
+    put(alpine, "namespace", record.distribution());
+    put(alpine, "distribution", alpineDistribution(record.distribution()));
+    put(alpine, "channel", record.component());
+    put(alpine, "repository_architecture", record.architecture());
+    put(alpine, "package_architecture", record.packageArchitecture());
+    put(alpine, "package", record.packageName());
+    put(alpine, "version", record.version());
+    put(alpine, "filename", record.filename());
+    put(alpine, "identity", record.identity());
+    put(alpine, "data_sha256", record.dataSha256());
+    put(alpine, "sha256", record.sha256());
+    put(alpine, "size", record.size());
+    put(alpine, "source_kind", record.sourceKind());
+    put(alpine, "source_repository", source.name());
+    put(alpine, "revision", record.revision());
+    put(alpine, "indexed_at", record.indexedAt());
+    Map<String, String> names = Map.of(
+        "T", "description",
+        "U", "url",
+        "L", "license",
+        "o", "origin",
+        "m", "maintainer",
+        "D", "depends",
+        "p", "provides",
+        "i", "install_if");
+    names.forEach((field, name) -> put(alpine, name, record.controlFields().get(field)));
+    return Collections.unmodifiableMap(alpine);
+  }
+
+  private Map<String, Object> rAttributes(
+      RepositoryRecord source, AssetRecord asset) {
+    if (rDao == null) return Map.of();
+    RRegistryDao.PackageRecord record = rDao.findPackageByPath(source.id(), asset.path())
+        .orElseThrow(() -> new ResponseStatusException(
+            HttpStatus.NOT_FOUND, "R package identity not found"));
+    if (record.assetId() != null && !record.assetId().equals(asset.id())) {
+      throw new ResponseStatusException(
+          HttpStatus.CONFLICT, "R package asset does not match registry state");
+    }
+    LinkedHashMap<String, Object> r = new LinkedHashMap<>();
+    put(r, "namespace", record.distribution());
+    put(r, "package", record.packageName());
+    put(r, "version", record.version());
+    put(r, "filename", record.filename());
+    put(r, "md5", record.identity());
+    put(r, "sha256", record.sha256());
+    put(r, "size", record.size());
+    put(r, "source_kind", record.sourceKind());
+    put(r, "source_repository", source.name());
+    put(r, "revision", record.revision());
+    put(r, "indexed_at", record.indexedAt());
+    for (String field : List.of(
+        "License", "Depends", "Imports", "LinkingTo", "Suggests", "Enhances",
+        "NeedsCompilation")) {
+      Object value = record.controlFields().get(field);
+      if (value != null) put(r, field.toLowerCase(Locale.ROOT), value);
+    }
+    return Collections.unmodifiableMap(r);
+  }
+
+  private static String alpineDistribution(String namespace) {
+    if (namespace == null) return null;
+    int slash = namespace.indexOf('/');
+    return slash < 0 ? namespace : namespace.substring(0, slash);
   }
 
   private Map<String, Object> ansibleAttributes(
@@ -501,6 +605,9 @@ public class BrowseAssetDetailService {
           Map.of(),
           Map.of(),
           Map.of(),
+          Map.of(),
+          Map.of(),
+          Map.of(),
           swiftReleaseAttributes(source, row),
           Map.of(),
           Map.of("dynamic", true, "hashes_not_verified", false)));
@@ -594,6 +701,9 @@ public class BrowseAssetDetailService {
           null,
           Map.copyOf(checksum),
           Map.of("generated", true, "format", "swift-manifest-browse"),
+          Map.of(),
+          Map.of(),
+          Map.of(),
           Map.of(),
           Map.of(),
           Map.of(),
@@ -745,6 +855,9 @@ public class BrowseAssetDetailService {
         Map.of(),
         Map.of(),
         Map.of(),
+        Map.of(),
+        Map.of(),
+        Map.of(),
         provenance);
   }
 
@@ -777,7 +890,24 @@ public class BrowseAssetDetailService {
         Map.of(),
         Map.of(),
         Map.of(),
+        Map.of(),
+        Map.of(),
+        Map.of(),
         provenance);
+  }
+
+  private static Map<String, Object> huggingFaceAttributes(AssetRecord asset) {
+    Map<String, Object> attributes = asset.attributes() == null ? Map.of() : asset.attributes();
+    if (!"model-file".equals(attributes.get("huggingfaceRole"))) return Map.of();
+    LinkedHashMap<String, Object> values = new LinkedHashMap<>();
+    for (String key : List.of(
+        "repoId", "commit", "requestedRef", "filePath", "fileKind", "gitOid",
+        "lfsSha256", "expectedSize", "library", "pipeline",
+        "license", "private", "gated")) {
+      put(values, key, attributes.get(key));
+    }
+    values.put("cacheState", "READY");
+    return Collections.unmodifiableMap(values);
   }
 
   private static Map<String, Object> composerAttributes(AssetRecord asset) {
@@ -887,7 +1017,17 @@ public class BrowseAssetDetailService {
       String normalized,
       String sourceRepositoryName) {
     if (visibleRepository.format() == RepositoryFormat.CONAN) {
-      return conanStoragePath(visibleRepository, normalized, sourceRepositoryName);
+      return projectedStoragePath(
+          visibleRepository, normalized, sourceRepositoryName, "Conan");
+    }
+    if (visibleRepository.format() == RepositoryFormat.HUGGINGFACE) {
+      return projectedStoragePath(
+          visibleRepository, normalized, sourceRepositoryName, "Hugging Face");
+    }
+    if (visibleRepository.format() == RepositoryFormat.R
+        && isRBrowseProjection(normalized)) {
+      return projectedStoragePath(
+          visibleRepository, normalized, sourceRepositoryName, "R");
     }
     if (visibleRepository.format() == RepositoryFormat.TERRAFORM && terraformDao != null) {
       Optional<TerraformBrowseAssetPathResolver.ResolvedStoragePath> terraform =
@@ -938,16 +1078,54 @@ public class BrowseAssetDetailService {
         }
       }
     }
+    if (visibleRepository.format() == RepositoryFormat.ALPINE && alpineDao != null) {
+      String[] segments = normalized.split("/", -1);
+      if (segments.length == 6) {
+        String namespace;
+        try {
+          namespace = AlpineRegistryDao.namespace(segments[0], segments[1], segments[2]);
+        } catch (IllegalArgumentException invalid) {
+          return new ResolvedStoragePath(normalized, sourceRepositoryName);
+        }
+        Optional<AlpineRegistryDao.PackageRecord> projected = alpineDao.findPackage(
+            visibleRepository.id(), namespace, segments[1], segments[3], segments[4], segments[2]);
+        if (projected.isPresent() && segments[5].equals(projected.orElseThrow().filename())) {
+          return new ResolvedStoragePath(projected.orElseThrow().path(), sourceRepositoryName);
+        }
+      }
+    }
     return new ResolvedStoragePath(normalized, sourceRepositoryName);
   }
 
-  private ResolvedStoragePath conanStoragePath(
+  private static boolean isRBrowseProjection(String path) {
+    String[] segments = path.split("/", -1);
+    int coordinateOffset;
+    if (segments.length == 5
+        && "src".equals(segments[0])
+        && "contrib".equals(segments[1])) {
+      coordinateOffset = 2;
+    } else if (segments.length == 3) {
+      // Accept the pre-alignment projection long enough for existing nodes to remain operable.
+      coordinateOffset = 0;
+    } else {
+      return false;
+    }
+    try {
+      return segments[coordinateOffset + 2].equals(RPathParser.sourceFilename(
+          segments[coordinateOffset], segments[coordinateOffset + 1]));
+    } catch (IllegalArgumentException ignored) {
+      return false;
+    }
+  }
+
+  private ResolvedStoragePath projectedStoragePath(
       RepositoryRecord visibleRepository,
       String browsePath,
-      String sourceRepositoryName) {
+      String sourceRepositoryName,
+      String formatLabel) {
     if (browseNodeDao == null) {
       throw new ResponseStatusException(
-          HttpStatus.CONFLICT, "Conan Browse projection is unavailable");
+          HttpStatus.CONFLICT, formatLabel + " Browse projection is unavailable");
     }
     List<RepositoryRecord> sources = visibleRepository.type() == RepositoryType.GROUP
         ? repositoryDao.listMembers(visibleRepository.id())
@@ -966,7 +1144,8 @@ public class BrowseAssetDetailService {
         return new ResolvedStoragePath(asset.orElseThrow().path(), source.name());
       }
     }
-    throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Conan Browse asset not found");
+    throw new ResponseStatusException(
+        HttpStatus.NOT_FOUND, formatLabel + " Browse asset not found");
   }
 
   private static String conanFileRoute(ConanRegistryDao.AssetFile file) {
@@ -1514,6 +1693,9 @@ public class BrowseAssetDetailService {
       Map<String, Object> composer,
       Map<String, Object> conda,
       Map<String, Object> apt,
+      Map<String, Object> alpine,
+      Map<String, Object> r,
+      Map<String, Object> huggingface,
       Map<String, Object> swift,
       Map<String, Object> ansible,
       Map<String, Object> provenance) {}

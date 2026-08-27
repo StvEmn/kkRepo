@@ -8,6 +8,7 @@ import com.github.klboke.kkrepo.persistence.jdbc.api.model.AssetRecord;
 import com.github.klboke.kkrepo.security.scan.ScanEnums.CandidateDisposition;
 import com.github.klboke.kkrepo.security.scan.ScanEnums.SubjectKind;
 import com.github.klboke.kkrepo.security.scan.ScanEnums.TargetClassification;
+import com.github.klboke.kkrepo.protocol.huggingface.HuggingFaceFileKind;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
@@ -33,9 +34,24 @@ public class SecurityScanCandidateClassifier {
   public SubjectIdentity subjectIdentity(AssetRecord asset, AssetBlobRecord blob) {
     LinkedHashMap<String, Object> attributes = new LinkedHashMap<>();
     attributes.put("path", asset.path());
+    if (asset.format() == RepositoryFormat.R) {
+      Map<String, Object> source = asset.attributes() == null ? Map.of() : asset.attributes();
+      copyAttribute(source, attributes, "rPackage", "package");
+      copyAttribute(source, attributes, "rVersion", "version");
+      copyAttribute(source, attributes, "rNamespace", "namespace");
+      copyAttribute(source, attributes, "rSource", "source");
+      copyAttribute(source, attributes, "rInputSchema", "descriptionProvenance");
+      attributes.put("packageType", "source");
+      attributes.put("vulnerabilityCoverage", "PARTIAL");
+    }
     if (asset.format() != RepositoryFormat.CONAN
         || !isConanPackageArchive(asset.path().toLowerCase(Locale.ROOT),
             asset.kind() == null ? "" : asset.kind().toLowerCase(Locale.ROOT))) {
+      if (asset.format() == RepositoryFormat.HUGGINGFACE) {
+        attributes.putAll(asset.attributes() == null ? Map.of() : asset.attributes());
+        return new SubjectIdentity(
+            "hf-model-file:sha256:" + blob.sha256(), Map.copyOf(attributes), true);
+      }
       return new SubjectIdentity("sha256:" + blob.sha256(), Map.copyOf(attributes), true);
     }
     if (conanDao == null) {
@@ -90,7 +106,8 @@ public class SecurityScanCandidateClassifier {
         asset.kind(),
         asset.contentType(),
         blob.size(),
-        profile);
+        profile,
+        asset.attributes());
   }
 
   Classification classify(
@@ -100,6 +117,18 @@ public class SecurityScanCandidateClassifier {
       String assetContentType,
       long blobSize,
       ScanProfile profile) {
+    return classify(
+        format, assetPath, assetKind, assetContentType, blobSize, profile, Map.of());
+  }
+
+  private Classification classify(
+      RepositoryFormat format,
+      String assetPath,
+      String assetKind,
+      String assetContentType,
+      long blobSize,
+      ScanProfile profile,
+      Map<String, Object> assetAttributes) {
     if (blobSize < 0 || blobSize > profile.maxInputBytes()) {
       return new Classification(
           CandidateDisposition.REJECTED_BY_LIMIT,
@@ -140,6 +169,17 @@ public class SecurityScanCandidateClassifier {
       case CONAN -> isConanPackageArchive(path, kind);
       case APT -> hasAnySuffix(path, ".deb")
           && !path.startsWith(".apt/") && !path.contains("/.apt/");
+      case ALPINE -> hasAnySuffix(path, ".apk")
+          && !path.startsWith(".alpine/") && !path.contains("/.alpine/");
+      case R -> hasAnySuffix(path, ".tar.gz")
+          && path.startsWith("src/contrib/")
+          && !path.endsWith("/PACKAGES.gz")
+          && !path.startsWith(".r/") && !path.contains("/.r/")
+          && "r-source-package-v1".equals(
+              String.valueOf((assetAttributes == null ? Map.of() : assetAttributes)
+                  .get("rInputSchema")));
+      case HUGGINGFACE -> HuggingFaceFileKind.classify(path).modelBinary()
+          || HuggingFaceFileKind.classify(path) == HuggingFaceFileKind.SHARD_INDEX;
       case NUGET -> hasAnySuffix(path, ".nupkg") && !hasAnySuffix(path, ".snupkg");
       case RUBYGEMS -> hasAnySuffix(path, ".gem") && !containsAny(kind, "index", "spec");
       case YUM -> hasAnySuffix(path, ".rpm") && !path.contains("/repodata/");
@@ -151,10 +191,13 @@ public class SecurityScanCandidateClassifier {
     }
     TargetClassification target = format == RepositoryFormat.RAW
         ? TargetClassification.ARCHIVE
-        : TargetClassification.PACKAGE;
+        : format == RepositoryFormat.HUGGINGFACE
+            ? TargetClassification.MODEL
+            : TargetClassification.PACKAGE;
     SubjectKind subjectKind = switch (format) {
       case CONAN -> SubjectKind.CONAN_PACKAGE;
       case CONDA -> SubjectKind.CONDA_PACKAGE;
+      case HUGGINGFACE -> SubjectKind.HF_MODEL_FILE;
       default -> SubjectKind.ASSET_BLOB;
     };
     return scannable(subjectKind, target);
@@ -229,6 +272,15 @@ public class SecurityScanCandidateClassifier {
 
   private static String lower(String value) {
     return value == null ? "" : value.trim().toLowerCase(Locale.ROOT);
+  }
+
+  private static void copyAttribute(
+      Map<String, Object> source,
+      Map<String, Object> target,
+      String sourceName,
+      String targetName) {
+    Object value = source.get(sourceName);
+    if (value != null) target.put(targetName, value);
   }
 
   private static Classification scannable(

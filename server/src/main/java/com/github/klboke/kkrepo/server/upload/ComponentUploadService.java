@@ -9,11 +9,13 @@ import com.github.klboke.kkrepo.protocol.conan.ConanReference;
 import com.github.klboke.kkrepo.protocol.maven.path.MavenPath;
 import com.github.klboke.kkrepo.protocol.maven.path.MavenPathParser;
 import com.github.klboke.kkrepo.server.apt.AptService;
+import com.github.klboke.kkrepo.server.alpine.AlpineService;
 import com.github.klboke.kkrepo.server.ansible.AnsibleGalaxyService;
 import com.github.klboke.kkrepo.server.cargo.CargoHostedService;
 import com.github.klboke.kkrepo.server.composer.ComposerHostedService;
 import com.github.klboke.kkrepo.server.conda.CondaService;
 import com.github.klboke.kkrepo.server.conan.ConanService;
+import com.github.klboke.kkrepo.server.goartifact.GoHostedService;
 import com.github.klboke.kkrepo.server.helm.HelmHostedService;
 import com.github.klboke.kkrepo.server.maven.MavenExceptions;
 import com.github.klboke.kkrepo.server.maven.MavenHostedService;
@@ -24,6 +26,7 @@ import com.github.klboke.kkrepo.server.npm.NpmHostedService;
 import com.github.klboke.kkrepo.server.pypi.PypiHostedService;
 import com.github.klboke.kkrepo.server.pub.PubHostedService;
 import com.github.klboke.kkrepo.server.raw.RawHostedService;
+import com.github.klboke.kkrepo.server.r.RService;
 import com.github.klboke.kkrepo.server.swift.SwiftService;
 import com.github.klboke.kkrepo.server.swift.SwiftPublishLimits;
 import com.github.klboke.kkrepo.server.terraform.TerraformService;
@@ -69,6 +72,7 @@ public class ComponentUploadService {
       singleAsset("npm"),
       singleAsset("pypi"),
       singleAsset("helm"),
+      singleAsset("go"),
       singleAsset("cargo"),
       singleAsset("pub"),
       new UploadDefinition(
@@ -130,9 +134,21 @@ public class ComponentUploadService {
               field("filename", "STRING", "Revision-relative file path", true, null),
               field("asset", "FILE", "Revision file", false, null))),
       singleAsset("apt"),
-      rawLikeUpload("nuget"),
-      rawLikeUpload("rubygems"),
-      rawLikeUpload("yum"),
+      new UploadDefinition(
+          "alpine",
+          false,
+          List.of(
+              field("distribution", "STRING", "Distribution, for example v3.23 or edge", false,
+                  "Repository namespace"),
+              field("channel", "STRING", "Channel, for example main or community", false,
+                  "Repository namespace"),
+              field("repositoryArchitecture", "STRING", "Repository architecture", false,
+                  "Repository namespace")),
+          List.of(field("asset", "FILE", "Alpine .apk package", false, null))),
+      singleAsset("r"),
+      singleAsset("nuget"),
+      singleAsset("rubygems"),
+      yumUpload(),
       rawUpload());
 
   private final RepositoryRuntimeRegistry registry;
@@ -141,6 +157,7 @@ public class ComponentUploadService {
   private final NpmHostedService npmHosted;
   private final PypiHostedService pypiHosted;
   private final HelmHostedService helmHosted;
+  private GoHostedService goHosted;
   private final CargoHostedService cargoHosted;
   private final PubHostedService pubHosted;
   private final ComposerHostedService composerHosted;
@@ -152,6 +169,8 @@ public class ComponentUploadService {
   private CondaService condaService;
   private ConanService conanService;
   private AptService aptService;
+  private AlpineService alpineService;
+  private RService rService;
   private final MavenPathParser mavenPathParser = new MavenPathParser();
   private final TerraformPathParser terraformPathParser = new TerraformPathParser();
 
@@ -237,6 +256,11 @@ public class ComponentUploadService {
   }
 
   @Autowired(required = false)
+  void setGoHostedService(GoHostedService goHosted) {
+    this.goHosted = goHosted;
+  }
+
+  @Autowired(required = false)
   void setCondaService(CondaService condaService) {
     this.condaService = condaService;
   }
@@ -249,6 +273,16 @@ public class ComponentUploadService {
   @Autowired(required = false)
   void setAptService(AptService aptService) {
     this.aptService = aptService;
+  }
+
+  @Autowired(required = false)
+  void setAlpineService(AlpineService alpineService) {
+    this.alpineService = alpineService;
+  }
+
+  @Autowired(required = false)
+  void setRService(RService rService) {
+    this.rService = rService;
   }
 
   public UploadDefinition definition(String format) {
@@ -287,7 +321,7 @@ public class ComponentUploadService {
       case NPM -> uploadNpm(runtime, upload, createdBy, createdByIp);
       case PYPI -> uploadPypi(runtime, upload, createdBy, createdByIp);
       case HELM -> uploadHelm(runtime, upload, createdBy, createdByIp);
-      case GO -> throw new UploadValidationException("Go hosted upload is not supported");
+      case GO -> uploadGo(runtime, upload, createdBy, createdByIp);
       case CARGO -> uploadCargo(runtime, upload, createdBy, createdByIp);
       case PUB -> uploadPub(runtime, upload, createdBy, createdByIp);
       case COMPOSER -> uploadComposer(runtime, upload, createdBy, createdByIp);
@@ -297,13 +331,40 @@ public class ComponentUploadService {
       case CONDA -> uploadConda(runtime, upload, createdBy, createdByIp);
       case CONAN -> uploadConan(runtime, upload, createdBy, createdByIp);
       case APT -> uploadApt(runtime, upload, createdBy, createdByIp);
+      case ALPINE -> uploadAlpine(runtime, upload, createdBy, createdByIp);
+      case R -> uploadR(runtime, upload, createdBy, createdByIp);
+      case HUGGINGFACE -> throw new UploadValidationException(
+          "Hugging Face Models repositories are proxy-only");
       case DOCKER -> throw new UploadValidationException("Docker hosted upload must use the Docker Registry V2 API");
-      case NUGET -> uploadRaw(runtime, upload, createdBy, createdByIp);
-      case RUBYGEMS -> uploadRaw(runtime, upload, createdBy, createdByIp);
+      case NUGET -> uploadSingleRaw(runtime, upload, "NuGet", createdBy, createdByIp);
+      case RUBYGEMS -> uploadSingleRaw(runtime, upload, "RubyGems", createdBy, createdByIp);
       case YUM -> uploadYum(runtime, upload, createdBy, createdByIp);
       case RAW -> uploadRaw(runtime, upload, createdBy, createdByIp);
     };
     return new UploadResult(paths);
+  }
+
+  private List<String> uploadGo(
+      RepositoryRuntime runtime,
+      NormalizedUpload upload,
+      String createdBy,
+      String createdByIp) throws IOException {
+    if (goHosted == null) {
+      throw new UploadValidationException("Go upload service is unavailable");
+    }
+    if (upload.assets().size() != 1) {
+      throw new UploadValidationException("Go upload requires exactly one module zip");
+    }
+    AssetUpload asset = upload.assets().getFirst();
+    if (asset.file().getOriginalFilename() == null
+        || asset.file().getOriginalFilename().isBlank()) {
+      throw new UploadValidationException("Go module zip filename is required");
+    }
+    String filename = originalFilename(asset.file());
+    try (InputStream body = asset.file().getInputStream()) {
+      return List.of(goHosted.publish(
+          runtime, filename, body, createdBy, createdByIp).archivePath());
+    }
   }
 
   private List<String> uploadConda(
@@ -440,6 +501,54 @@ public class ComponentUploadService {
     try (InputStream body = asset.file().getInputStream()) {
       return List.of(aptService.publish(
           runtime, filename, body, null, null, createdBy, createdByIp).path());
+    }
+  }
+
+  private List<String> uploadAlpine(
+      RepositoryRuntime runtime,
+      NormalizedUpload upload,
+      String createdBy,
+      String createdByIp) throws IOException {
+    if (alpineService == null) {
+      throw new UploadValidationException("Alpine upload service is unavailable");
+    }
+    AssetUpload asset = singleAsset(upload, "Alpine");
+    String filename = originalFilename(asset.file());
+    if (!filename.toLowerCase(Locale.ROOT).endsWith(".apk")) {
+      throw new UploadValidationException("Alpine upload requires an .apk package");
+    }
+    String distribution = requireField(upload.fields(), "distribution");
+    String channel = requireField(upload.fields(), "channel");
+    String architecture = requireField(upload.fields(), "repositoryArchitecture");
+    try (InputStream body = asset.file().getInputStream()) {
+      return List.of(alpineService.publish(
+          runtime,
+          distribution,
+          channel,
+          architecture,
+          filename,
+          body,
+          createdBy,
+          createdByIp).path());
+    }
+  }
+
+  private List<String> uploadR(
+      RepositoryRuntime runtime,
+      NormalizedUpload upload,
+      String createdBy,
+      String createdByIp) throws IOException {
+    if (rService == null) {
+      throw new UploadValidationException("R upload service is unavailable");
+    }
+    AssetUpload asset = singleAsset(upload, "R");
+    String filename = originalFilename(asset.file());
+    if (!filename.toLowerCase(Locale.ROOT).endsWith(".tar.gz")) {
+      throw new UploadValidationException("R upload requires a source .tar.gz package");
+    }
+    try (InputStream body = asset.file().getInputStream()) {
+      return List.of(rService.publish(
+          runtime, filename, body, createdBy, createdByIp).path());
     }
   }
 
@@ -673,17 +782,33 @@ public class ComponentUploadService {
       NormalizedUpload upload,
       String createdBy,
       String createdByIp) throws IOException {
-    AssetUpload asset = singleAsset(upload, "Raw");
-    String filename = blankToNull(asset.fields().get("filename"));
-    if (filename == null) {
-      filename = originalFilename(asset.file());
+    List<RawUploadItem> items = new ArrayList<>(upload.assets().size());
+    for (AssetUpload asset : upload.assets()) {
+      String filename = blankToNull(asset.fields().get("filename"));
+      if (filename == null) {
+        filename = originalFilename(asset.file());
+      }
+      items.add(new RawUploadItem(
+          rawPath(upload.fields().get("directory"), filename), asset.file()));
     }
-    String path = rawPath(upload.fields().get("directory"), filename);
-    ensureNoExistingAssets(runtime, List.of(path));
-    try (var input = asset.file().getInputStream()) {
-      rawHosted.put(runtime, path, input, asset.file().getContentType(), createdBy, createdByIp);
+    ensureNoExistingAssets(runtime, items.stream().map(RawUploadItem::path).toList());
+    for (RawUploadItem item : items) {
+      try (var input = item.file().getInputStream()) {
+        rawHosted.put(
+            runtime, item.path(), input, item.file().getContentType(), createdBy, createdByIp);
+      }
     }
-    return List.of(path);
+    return items.stream().map(RawUploadItem::path).toList();
+  }
+
+  private List<String> uploadSingleRaw(
+      RepositoryRuntime runtime,
+      NormalizedUpload upload,
+      String label,
+      String createdBy,
+      String createdByIp) throws IOException {
+    singleAsset(upload, label);
+    return uploadRaw(runtime, upload, createdBy, createdByIp);
   }
 
   private List<String> uploadYum(
@@ -773,9 +898,9 @@ public class ComponentUploadService {
             field("asset", "FILE", "Asset", false, null)));
   }
 
-  private static UploadDefinition rawLikeUpload(String format) {
-    return new UploadDefinition(format, true,
-        List.of(field("directory", "STRING", "Destination for uploaded files", false,
+  private static UploadDefinition yumUpload() {
+    return new UploadDefinition("yum", false,
+        List.of(field("directory", "STRING", "Destination for uploaded files", true,
             "Component attributes")),
         List.of(
             field("filename", "STRING", "Filename", false, null),
@@ -807,6 +932,9 @@ public class ComponentUploadService {
       case CONDA -> "conda";
       case CONAN -> "conan";
       case APT -> "apt";
+      case ALPINE -> "alpine";
+      case R -> "r";
+      case HUGGINGFACE -> "huggingface";
       case RAW -> "raw";
     };
   }
@@ -1057,4 +1185,6 @@ public class ComponentUploadService {
   private record ConanUploadAsset(String path, AssetUpload asset) {}
 
   private record MavenUploadItem(String path, String contentType, MultipartFile file, byte[] body) {}
+
+  private record RawUploadItem(String path, MultipartFile file) {}
 }

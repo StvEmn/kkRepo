@@ -16,4 +16,24 @@ class CleanupPolicyCapabilitiesTest {
         && item.lastDownloadedSupported()
         && item.executeSupported()));
   }
+
+  @Test
+  void rRetainCountUsesNumericPackageVersionOrdering() {
+    var comparator = new CleanupPolicyCapabilities()
+        .versionComparator(RepositoryFormat.R).orElseThrow();
+
+    assertTrue(comparator.compare("0.9", "0.75") < 0);
+    assertTrue(comparator.compare("1.2-10", "1.2-9") > 0);
+    assertEquals(0, comparator.compare("0.01.0", "0.1-0"));
+  }
+
+  @Test
+  void goRetainCountUsesGoSemverOrdering() {
+    CleanupPolicyCapabilities capabilities = new CleanupPolicyCapabilities();
+    var comparator = capabilities.versionComparator(RepositoryFormat.GO).orElseThrow();
+
+    assertTrue(capabilities.supportsRetainCount(RepositoryFormat.GO));
+    assertTrue(comparator.compare("v1.10.0", "v1.9.9") > 0);
+    assertTrue(comparator.compare("v2.0.0-rc.1", "v2.0.0") < 0);
+  }
 }

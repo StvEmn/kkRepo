@@ -20,10 +20,12 @@ import com.github.klboke.kkrepo.persistence.jdbc.api.AssetDao;
 import com.github.klboke.kkrepo.protocol.ansible.AnsibleGalaxyPathParser;
 import com.github.klboke.kkrepo.server.ansible.AnsibleGalaxyService;
 import com.github.klboke.kkrepo.server.apt.AptService;
+import com.github.klboke.kkrepo.server.alpine.AlpineService;
 import com.github.klboke.kkrepo.server.cargo.CargoHostedService;
 import com.github.klboke.kkrepo.server.composer.ComposerHostedService;
 import com.github.klboke.kkrepo.server.conda.CondaService;
 import com.github.klboke.kkrepo.server.conan.ConanService;
+import com.github.klboke.kkrepo.server.goartifact.GoHostedService;
 import com.github.klboke.kkrepo.server.helm.HelmHostedService;
 import com.github.klboke.kkrepo.server.maven.MavenHostedService;
 import com.github.klboke.kkrepo.server.maven.RepositoryRuntime;
@@ -32,13 +34,16 @@ import com.github.klboke.kkrepo.server.npm.NpmHostedService;
 import com.github.klboke.kkrepo.server.pypi.PypiHostedService;
 import com.github.klboke.kkrepo.server.pub.PubHostedService;
 import com.github.klboke.kkrepo.server.raw.RawHostedService;
+import com.github.klboke.kkrepo.server.r.RService;
 import com.github.klboke.kkrepo.server.swift.SwiftService;
 import com.github.klboke.kkrepo.server.swift.SwiftPublishLimits;
 import com.github.klboke.kkrepo.server.terraform.TerraformService;
 import com.github.klboke.kkrepo.server.yum.YumService;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
@@ -48,6 +53,108 @@ import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.web.multipart.MultipartFile;
 
 class ComponentUploadServiceTest {
+
+  @Test
+  void alpineDefinitionAndDelegationPreserveRepositoryNamespace() throws Exception {
+    AlpineService alpine = mock(AlpineService.class);
+    ComponentUploadService service = service(alpine);
+    String path = "v3.23/main/x86_64/demo-1-r0.apk";
+    when(alpine.publish(
+        any(RepositoryRuntime.class), eq("v3.23"), eq("main"), eq("x86_64"),
+        eq("demo-1-r0.apk"), any(InputStream.class), eq("alice"), eq("127.0.0.1")))
+        .thenReturn(new AlpineService.PublishedPackage(
+            path, "demo", "1-r0", "x86_64", "identity", "a".repeat(64), 5));
+
+    UploadDefinition definition = service.definition("alpine");
+    assertFalse(definition.multipleUpload());
+    assertEquals(List.of("distribution", "channel", "repositoryArchitecture"),
+        definition.componentFields().stream().map(UploadFieldDefinition::name).toList());
+    assertEquals(List.of("asset"),
+        definition.assetFields().stream().map(UploadFieldDefinition::name).toList());
+
+    ComponentUploadService.UploadResult result = service.upload(
+        "alpine-hosted",
+        Map.of(
+            "alpine.distribution", new String[] {" v3.23 "},
+            "alpine.channel", new String[] {" main "},
+            "alpine.repositoryArchitecture", new String[] {" x86_64 "}),
+        files("alpine.asset", "demo-1-r0.apk"),
+        "alice", "127.0.0.1");
+
+    assertEquals(List.of(path), result.paths());
+    verify(alpine).publish(
+        any(RepositoryRuntime.class), eq("v3.23"), eq("main"), eq("x86_64"),
+        eq("demo-1-r0.apk"), any(InputStream.class), eq("alice"), eq("127.0.0.1"));
+  }
+
+  @Test
+  void alpineComponentUploadValidatesServiceFilenameAndCoordinates() {
+    RepositoryRuntime runtime = runtime("alpine-hosted", RepositoryFormat.ALPINE);
+    ComponentUploadService unavailable = service(
+        runtime, mock(CargoHostedService.class), mock(PubHostedService.class));
+    Map<String, String[]> fields = Map.of(
+        "alpine.distribution", new String[] {"v3.23"},
+        "alpine.channel", new String[] {"main"},
+        "alpine.repositoryArchitecture", new String[] {"x86_64"});
+    assertEquals("Alpine upload service is unavailable", assertThrows(
+        UploadValidationException.class,
+        () -> unavailable.upload(runtime.name(), fields,
+            files("alpine.asset", "demo.apk"), "alice", "ip")).getMessage());
+
+    ComponentUploadService service = service(mock(AlpineService.class));
+    assertEquals("Alpine upload requires an .apk package", assertThrows(
+        UploadValidationException.class,
+        () -> service.upload(runtime.name(), fields,
+            files("alpine.asset", "demo.tar.gz"), "alice", "ip")).getMessage());
+    assertTrue(assertThrows(UploadValidationException.class,
+        () -> service.upload(runtime.name(), Map.of(),
+            files("alpine.asset", "demo.apk"), "alice", "ip"))
+        .getMessage().contains("distribution"));
+  }
+
+  @Test
+  void rDefinitionAndDelegationUseTheCanonicalSourcePackagePath() throws Exception {
+    RService r = mock(RService.class);
+    ComponentUploadService service = service(r);
+    when(r.publish(
+        any(RepositoryRuntime.class), eq("demo_1.0.0.tar.gz"), any(InputStream.class),
+        eq("alice"), eq("127.0.0.1")))
+        .thenReturn(new RService.PublishedPackage(
+            "src/contrib/demo_1.0.0.tar.gz", "demo", "1.0.0",
+            "a".repeat(32), "b".repeat(64), 5L));
+
+    UploadDefinition definition = service.definition("r");
+    assertFalse(definition.multipleUpload());
+    assertTrue(definition.componentFields().isEmpty());
+    assertEquals(List.of("asset"),
+        definition.assetFields().stream().map(UploadFieldDefinition::name).toList());
+
+    ComponentUploadService.UploadResult result = service.upload(
+        "r-hosted", Map.of(), files("r.asset", "demo_1.0.0.tar.gz"),
+        "alice", "127.0.0.1");
+
+    assertEquals(List.of("src/contrib/demo_1.0.0.tar.gz"), result.paths());
+    verify(r).publish(
+        any(RepositoryRuntime.class), eq("demo_1.0.0.tar.gz"), any(InputStream.class),
+        eq("alice"), eq("127.0.0.1"));
+  }
+
+  @Test
+  void rComponentUploadRequiresTheServiceAndSourceTarball() {
+    RepositoryRuntime runtime = runtime("r-hosted", RepositoryFormat.R);
+    ComponentUploadService unavailable = service(
+        runtime, mock(CargoHostedService.class), mock(PubHostedService.class));
+    assertEquals("R upload service is unavailable", assertThrows(
+        UploadValidationException.class,
+        () -> unavailable.upload(runtime.name(), Map.of(),
+            files("r.asset", "demo_1.0.0.tar.gz"), "alice", "ip")).getMessage());
+
+    ComponentUploadService service = service(mock(RService.class));
+    assertEquals("R upload requires a source .tar.gz package", assertThrows(
+        UploadValidationException.class,
+        () -> service.upload(runtime.name(), Map.of(),
+            files("r.asset", "demo.zip"), "alice", "ip")).getMessage());
+  }
 
   @Test
   void aptComponentUploadUsesNexusCompatibleSingleAssetFieldAndSharedImporter() throws Exception {
@@ -74,6 +181,117 @@ class ComponentUploadServiceTest {
     verify(apt).publish(
         any(RepositoryRuntime.class), eq("demo_1.0_amd64.deb"), any(InputStream.class),
         isNull(), isNull(), eq("alice"), eq("127.0.0.1"));
+  }
+
+  @Test
+  void nexusCompatiblePathUploadDefinitionsOnlyExposeDirectoryWhereSupported() {
+    ComponentUploadService service = service(mock(CargoHostedService.class));
+
+    UploadDefinition raw = service.definition("raw");
+    assertTrue(raw.multipleUpload());
+    assertEquals(List.of("directory"),
+        raw.componentFields().stream().map(UploadFieldDefinition::name).toList());
+    assertFalse(raw.componentFields().getFirst().optional());
+    assertEquals(List.of("filename", "asset"),
+        raw.assetFields().stream().map(UploadFieldDefinition::name).toList());
+
+    UploadDefinition yum = service.definition("yum");
+    assertFalse(yum.multipleUpload());
+    assertEquals(List.of("directory"),
+        yum.componentFields().stream().map(UploadFieldDefinition::name).toList());
+    assertTrue(yum.componentFields().getFirst().optional());
+    assertTrue(service.definition("nuget").componentFields().isEmpty());
+    assertTrue(service.definition("rubygems").componentFields().isEmpty());
+  }
+
+  @Test
+  void rawComponentUploadHonorsDirectoryFilenamesAndMultipleAssets() throws Exception {
+    RepositoryRuntime runtime = runtime("raw-hosted", RepositoryFormat.RAW);
+    RepositoryRuntimeRegistry registry = mock(RepositoryRuntimeRegistry.class);
+    when(registry.resolve(runtime.name())).thenReturn(Optional.of(runtime));
+    AssetDao assets = mock(AssetDao.class);
+    RawHostedService rawHosted = mock(RawHostedService.class);
+    ComponentUploadService service = new ComponentUploadService(
+        registry,
+        assets,
+        mock(MavenHostedService.class),
+        mock(NpmHostedService.class),
+        mock(PypiHostedService.class),
+        mock(HelmHostedService.class),
+        mock(CargoHostedService.class),
+        mock(PubHostedService.class),
+        rawHosted,
+        mock(YumService.class));
+    LinkedMultiValueMap<String, MultipartFile> uploads = new LinkedMultiValueMap<>();
+    uploads.add("raw.asset1", new MockMultipartFile(
+        "raw.asset1", "local-one.zip", "application/zip", new byte[] {1}));
+    uploads.add("raw.asset2", new MockMultipartFile(
+        "raw.asset2", "local-two.zip", "application/zip", new byte[] {2}));
+
+    ComponentUploadService.UploadResult result = service.upload(
+        runtime.name(),
+        Map.of(
+            "raw.directory", new String[] {" /team/releases/ "},
+            "raw.asset1.filename", new String[] {"one.zip"}),
+        uploads,
+        "alice",
+        "127.0.0.1");
+
+    assertEquals(
+        List.of("team/releases/one.zip", "team/releases/local-two.zip"), result.paths());
+    InOrder order = inOrder(rawHosted);
+    order.verify(rawHosted).put(
+        any(), eq("team/releases/one.zip"), any(InputStream.class), eq("application/zip"),
+        eq("alice"), eq("127.0.0.1"));
+    order.verify(rawHosted).put(
+        any(), eq("team/releases/local-two.zip"), any(InputStream.class), eq("application/zip"),
+        eq("alice"), eq("127.0.0.1"));
+  }
+
+  @Test
+  void nugetAndRubyGemsComponentUploadsAcceptOneAssetAndRejectMultipleAssets() throws Exception {
+    for (RepositoryFormat format : List.of(RepositoryFormat.NUGET, RepositoryFormat.RUBYGEMS)) {
+      String formatName = format.name().toLowerCase(Locale.ROOT);
+      RepositoryRuntime runtime = runtime(formatName + "-hosted", format);
+      RepositoryRuntimeRegistry registry = mock(RepositoryRuntimeRegistry.class);
+      when(registry.resolve(runtime.name())).thenReturn(Optional.of(runtime));
+      RawHostedService rawHosted = mock(RawHostedService.class);
+      ComponentUploadService service = new ComponentUploadService(
+          registry,
+          mock(AssetDao.class),
+          mock(MavenHostedService.class),
+          mock(NpmHostedService.class),
+          mock(PypiHostedService.class),
+          mock(HelmHostedService.class),
+          mock(CargoHostedService.class),
+          mock(PubHostedService.class),
+          rawHosted,
+          mock(YumService.class));
+
+      ComponentUploadService.UploadResult result = service.upload(
+          runtime.name(), Map.of(), files(formatName + ".asset", "one.zip"),
+          "alice", "127.0.0.1");
+
+      assertEquals(List.of("one.zip"), result.paths());
+      verify(rawHosted).put(
+          any(), eq("one.zip"), any(InputStream.class), eq("application/x-tar"),
+          eq("alice"), eq("127.0.0.1"));
+
+      LinkedMultiValueMap<String, MultipartFile> uploads = files(
+          formatName + ".asset", "one.zip");
+      uploads.add(formatName + ".asset2", new MockMultipartFile(
+          formatName + ".asset2",
+          "two.zip",
+          "application/zip",
+          new byte[] {2}));
+
+      UploadValidationException error = assertThrows(
+          UploadValidationException.class,
+          () -> service.upload(runtime.name(), Map.of(), uploads, "alice", "127.0.0.1"));
+
+      String label = format == RepositoryFormat.NUGET ? "NuGet" : "RubyGems";
+      assertEquals(label + " upload requires exactly one asset", error.getMessage());
+    }
   }
 
   @Test
@@ -467,6 +685,32 @@ class ComponentUploadServiceTest {
   }
 
   @Test
+  void goComponentUploadDelegatesVersionZipToHostedPublication() throws Exception {
+    GoHostedService goHosted = mock(GoHostedService.class);
+    when(goHosted.publish(
+        any(RepositoryRuntime.class), eq("v1.2.3.zip"), any(InputStream.class),
+        eq("alice"), eq("127.0.0.1")))
+        .thenReturn(new GoHostedService.Published(
+            "example.com/acme/demo",
+            "v1.2.3",
+            "example.com/acme/demo/@v/v1.2.3.zip",
+            Instant.parse("2026-08-25T00:00:00Z")));
+    ComponentUploadService service = service(goHosted);
+
+    ComponentUploadService.UploadResult result = service.upload(
+        "go-hosted",
+        Map.of(),
+        files("go.asset", "C:\\fakepath\\v1.2.3.zip"),
+        "alice",
+        "127.0.0.1");
+
+    assertEquals(List.of("example.com/acme/demo/@v/v1.2.3.zip"), result.paths());
+    verify(goHosted).publish(
+        any(RepositoryRuntime.class), eq("v1.2.3.zip"), any(InputStream.class),
+        eq("alice"), eq("127.0.0.1"));
+  }
+
+  @Test
   void cargoComponentUploadDelegatesToHostedCrateUpload() throws Exception {
     CargoHostedService cargoHosted = mock(CargoHostedService.class);
     when(cargoHosted.uploadCrate(any(RepositoryRuntime.class), any(InputStream.class), eq("alice"), eq("127.0.0.1")))
@@ -601,6 +845,25 @@ class ComponentUploadServiceTest {
     return service(runtime("cargo-hosted", RepositoryFormat.CARGO), cargoHosted, mock(PubHostedService.class));
   }
 
+  private static ComponentUploadService service(GoHostedService goHosted) {
+    RepositoryRuntime runtime = runtime("go-hosted", RepositoryFormat.GO);
+    RepositoryRuntimeRegistry registry = mock(RepositoryRuntimeRegistry.class);
+    when(registry.resolve(runtime.name())).thenReturn(Optional.of(runtime));
+    ComponentUploadService service = new ComponentUploadService(
+        registry,
+        mock(AssetDao.class),
+        mock(MavenHostedService.class),
+        mock(NpmHostedService.class),
+        mock(PypiHostedService.class),
+        mock(HelmHostedService.class),
+        mock(CargoHostedService.class),
+        mock(PubHostedService.class),
+        mock(RawHostedService.class),
+        mock(YumService.class));
+    service.setGoHostedService(goHosted);
+    return service;
+  }
+
   private static ComponentUploadService service(PubHostedService pubHosted) {
     return service(runtime("pub-hosted", RepositoryFormat.PUB), mock(CargoHostedService.class), pubHosted);
   }
@@ -691,6 +954,22 @@ class ComponentUploadServiceTest {
     ComponentUploadService service = service(
         runtime, mock(CargoHostedService.class), mock(PubHostedService.class));
     service.setAptService(aptService);
+    return service;
+  }
+
+  private static ComponentUploadService service(AlpineService alpineService) {
+    RepositoryRuntime runtime = runtime("alpine-hosted", RepositoryFormat.ALPINE);
+    ComponentUploadService service = service(
+        runtime, mock(CargoHostedService.class), mock(PubHostedService.class));
+    service.setAlpineService(alpineService);
+    return service;
+  }
+
+  private static ComponentUploadService service(RService rService) {
+    RepositoryRuntime runtime = runtime("r-hosted", RepositoryFormat.R);
+    ComponentUploadService service = service(
+        runtime, mock(CargoHostedService.class), mock(PubHostedService.class));
+    service.setRService(rService);
     return service;
   }
 

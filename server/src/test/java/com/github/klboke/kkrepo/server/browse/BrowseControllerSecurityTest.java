@@ -12,10 +12,12 @@ import com.github.klboke.kkrepo.auth.PermissionSubject;
 import com.github.klboke.kkrepo.auth.RepositoryPermission;
 import com.github.klboke.kkrepo.core.RepositoryFormat;
 import com.github.klboke.kkrepo.core.RepositoryType;
+import com.github.klboke.kkrepo.persistence.jdbc.api.AssetDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.BrowseNodeDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.ConanRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.SecurityDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.model.AssetRecord;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.RepositoryRecord;
 import com.github.klboke.kkrepo.server.security.AuthenticatedSubject;
 import com.github.klboke.kkrepo.server.security.SecurityAuthenticationService;
@@ -151,6 +153,75 @@ class BrowseControllerSecurityTest {
 
     assertEquals("kk", listing.path());
     assertEquals(List.of("re"), listing.entries().stream().map(BrowseController.BrowseEntry::name).toList());
+  }
+
+  @Test
+  void huggingFaceBrowseDownloadUsesTheCanonicalResolveRoute() {
+    RepositoryRecord repository = repo(
+        1L, "hf-proxy", RepositoryFormat.HUGGINGFACE, RepositoryType.PROXY);
+    String commit = "a".repeat(40);
+    String parent = "org/model/" + commit;
+    String browsePath = parent + "/model.safetensors";
+    String storagePath = "org/model/resolve/" + commit + "/model.safetensors";
+    StubRepositoryDao repositories = new StubRepositoryDao(Map.of(repository.name(), repository));
+    StubBrowseNodeDao browseNodes = new StubBrowseNodeDao();
+    browseNodes.children.put(key(repository.id(), parent), List.of(child(
+        browsePath, "model.safetensors", true)));
+    RecordingSecurityService security =
+        new RecordingSecurityService(permission -> AccessDecision.allow());
+    BrowseController controller = controller(
+        repositories, browseNodes, subject("alice"), null, security);
+    AssetDao assets = mock(AssetDao.class);
+    when(assets.findAssetById(1L)).thenReturn(Optional.of(new AssetRecord(
+        1L, repository.id(), 2L, 3L, RepositoryFormat.HUGGINGFACE,
+        storagePath, null, "model.safetensors", "huggingface-model-file",
+        "application/octet-stream", 100L, null, Instant.EPOCH, Map.of())));
+    controller.setAssetDao(assets);
+
+    BrowseController.BrowseListing listing = controller.list(
+        repository.name(), parent,
+        request("GET", "/internal/browse/" + repository.name()));
+
+    assertEquals(parent, listing.path());
+    assertEquals(browsePath, listing.entries().getFirst().path());
+    assertEquals(
+        "/repository/hf-proxy/" + storagePath,
+        listing.entries().getFirst().downloadUrl());
+  }
+
+  @Test
+  void rGroupBrowseUsesTheNexusProjectionAndCanonicalPackageDownloadRoute() {
+    RepositoryRecord group = repo(
+        1L, "r-group", RepositoryFormat.R, RepositoryType.GROUP);
+    RepositoryRecord hosted = repo(
+        2L, "r-hosted", RepositoryFormat.R, RepositoryType.HOSTED);
+    String parent = "src/contrib/demo/1.2.3";
+    String browsePath = parent + "/demo_1.2.3.tar.gz";
+    String storagePath = "src/contrib/demo_1.2.3.tar.gz";
+    StubRepositoryDao repositories = new StubRepositoryDao(Map.of(group.name(), group));
+    repositories.members.put(group.id(), List.of(hosted));
+    StubBrowseNodeDao browseNodes = new StubBrowseNodeDao();
+    browseNodes.children.put(key(hosted.id(), parent), List.of(child(
+        browsePath, "demo_1.2.3.tar.gz", true)));
+    RecordingSecurityService security =
+        new RecordingSecurityService(permission -> AccessDecision.allow());
+    BrowseController controller = controller(
+        repositories, browseNodes, subject("alice"), null, security);
+    AssetDao assets = mock(AssetDao.class);
+    when(assets.findAssetById(1L)).thenReturn(Optional.of(new AssetRecord(
+        1L, hosted.id(), 2L, 3L, RepositoryFormat.R,
+        storagePath, null, "demo_1.2.3.tar.gz", "r-source-package",
+        "application/x-gzip", 100L, null, Instant.EPOCH, Map.of())));
+    controller.setAssetDao(assets);
+
+    BrowseController.BrowseListing listing = controller.list(
+        group.name(), parent,
+        request("GET", "/internal/browse/" + group.name()));
+
+    assertEquals(browsePath, listing.entries().getFirst().path());
+    assertEquals(
+        "/repository/r-group/" + storagePath,
+        listing.entries().getFirst().downloadUrl());
   }
 
   @Test

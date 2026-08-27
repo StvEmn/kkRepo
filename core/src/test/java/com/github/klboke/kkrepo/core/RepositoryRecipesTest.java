@@ -31,6 +31,9 @@ class RepositoryRecipesTest {
     assertRecipe(recipes, "composer-hosted", RepositoryFormat.COMPOSER, RepositoryType.HOSTED);
     assertRecipe(recipes, "composer-proxy", RepositoryFormat.COMPOSER, RepositoryType.PROXY);
     assertRecipe(recipes, "composer-group", RepositoryFormat.COMPOSER, RepositoryType.GROUP);
+    assertRecipe(recipes, "go-hosted", RepositoryFormat.GO, RepositoryType.HOSTED);
+    assertRecipe(recipes, "go-proxy", RepositoryFormat.GO, RepositoryType.PROXY);
+    assertRecipe(recipes, "go-group", RepositoryFormat.GO, RepositoryType.GROUP);
     assertRecipe(recipes, "swift-hosted", RepositoryFormat.SWIFT, RepositoryType.HOSTED);
     assertRecipe(recipes, "swift-proxy", RepositoryFormat.SWIFT, RepositoryType.PROXY);
     assertRecipe(recipes, "swift-group", RepositoryFormat.SWIFT, RepositoryType.GROUP);
@@ -46,6 +49,12 @@ class RepositoryRecipesTest {
     assertRecipe(recipes, "apt-hosted", RepositoryFormat.APT, RepositoryType.HOSTED);
     assertRecipe(recipes, "apt-proxy", RepositoryFormat.APT, RepositoryType.PROXY);
     assertTrue(!recipes.containsKey("apt-group"));
+    assertRecipe(recipes, "r-hosted", RepositoryFormat.R, RepositoryType.HOSTED);
+    assertRecipe(recipes, "r-proxy", RepositoryFormat.R, RepositoryType.PROXY);
+    assertRecipe(recipes, "r-group", RepositoryFormat.R, RepositoryType.GROUP);
+    assertRecipe(recipes, "huggingface-proxy", RepositoryFormat.HUGGINGFACE, RepositoryType.PROXY);
+    assertTrue(!recipes.containsKey("huggingface-hosted"));
+    assertTrue(!recipes.containsKey("huggingface-group"));
   }
 
   private static void assertRecipe(

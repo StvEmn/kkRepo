@@ -2,6 +2,8 @@
   const STORAGE_KEY = "kkrepo.uiSettings";
   const SUPPORTED_DEFAULT_LANGUAGES = new Set(["browser", "zh-CN", "en"]);
   const DEFAULT_LANGUAGE = "en";
+  const DEFAULT_THEME = "default";
+  const THEME_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
   const ATTRIBUTE_NAMES = ["aria-label", "placeholder", "title"];
   const SKIP_TEXT_TAGS = new Set(["SCRIPT", "STYLE", "TEXTAREA", "CODE", "PRE", "KBD", "SAMP"]);
   const textOriginals = new WeakMap();
@@ -26,6 +28,8 @@
     "Browse navigation": "浏览导航",
     "Browse": "浏览",
     "Admin": "管理",
+    "Search components": "搜索组件",
+    "All formats": "全部格式",
     "Repository": "仓库",
     "Repositories": "仓库",
     "Manage repositories": "管理仓库",
@@ -173,6 +177,18 @@
     "Realm": "Realm",
     "LDAP": "LDAP",
     "Manage LDAP connection, user mapping, and group roles": "管理 LDAP 连接、用户映射和组角色",
+    "Realm settings": "Realm 设置",
+    "Enable the realm and control its place in the authentication order.": "启用 Realm 并控制其在认证顺序中的位置。",
+    "System managed": "系统管理",
+    "Source LDAP, system managed": "来源 LDAP，由系统管理",
+    "Source OIDC, system managed": "来源 OIDC，由系统管理",
+    "Server connection": "服务器连接",
+    "Use a complete URL, or configure the protocol, host, port, and search base separately.": "使用完整 URL，或分别配置协议、主机、端口和搜索基准。",
+    "Bind account": "绑定账户",
+    "Leave blank to keep existing": "留空以保留现有值",
+    "User mapping": "用户映射",
+    "Group mapping": "组映射",
+    "Advanced settings": "高级设置",
     "Protocol": "协议",
     "Host": "主机",
     "Port": "端口",
@@ -204,8 +220,17 @@
     "Group object class": "组对象类",
     "Attributes JSON": "属性 JSON",
     "Save LDAP settings": "保存 LDAP 设置",
+    "Configuration JSON": "配置 JSON",
+    "Form and valid JSON changes sync automatically. Existing secrets are masked.": "表单与有效 JSON 会自动双向同步；现有密钥将脱敏显示。",
+    "Synced": "已同步",
+    "Waiting for valid JSON": "等待有效 JSON",
+    "LDAP configuration JSON": "LDAP 配置 JSON",
     "OIDC": "OIDC",
     "Manage OIDC issuer, token validation, and claim mapping": "管理 OIDC Issuer、Token 校验和声明映射",
+    "Provider settings": "提供方设置",
+    "Configure the issuer and keys used to validate identity tokens.": "配置用于校验身份令牌的 Issuer 和密钥。",
+    "Client configuration": "客户端配置",
+    "Claim mapping": "Claim 映射",
     "Issuer": "Issuer",
     "JWKS URI": "JWKS URI",
     "Audience": "Audience",
@@ -223,6 +248,7 @@
     "Roles claim": "角色 Claim",
     "Clock skew seconds": "时钟偏移秒数",
     "JWKS cache seconds": "JWKS 缓存秒数",
+    "OIDC configuration JSON": "OIDC 配置 JSON",
     "Save OIDC settings": "保存 OIDC 设置",
     "Anonymous": "匿名",
     "Anonymous Access": "匿名访问",
@@ -284,15 +310,18 @@
     "Refresh jobs": "刷新任务",
     "System": "系统",
     "UI Settings": "界面设置",
-    "Configure the default UI language shared by all replicas": "配置所有副本共享的默认界面语言",
+    "Configure the default UI language and theme shared by all replicas": "配置所有副本共享的默认界面语言和主题",
     "Default language": "默认语言",
+    "Default theme": "默认主题",
+    "Default": "默认",
     "Follow browser": "跟随浏览器",
     "Chinese": "中文",
     "English": "英文",
     "Save UI settings": "保存界面设置",
-    "This preference is stored in MySQL and applies to the administration, browse, and sign-in UI on every replica.": "此设置存储在 MySQL 中，对所有副本的管理、浏览和登录界面均生效。",
+    "These preferences are stored in the database and apply to the administration, browse, and sign-in UI on every replica. The current kkRepo design is provided as the default CSS theme template.": "这些设置存储在数据库中，对所有副本的管理、浏览和登录界面均生效。当前 kkRepo 设计作为默认 CSS 主题模板提供。",
+    "Theme preview is active. Save UI settings to make it the default.": "正在预览所选主题。保存界面设置后，它才会成为默认主题。",
     "Welcome": "欢迎",
-    "Nexus-compatible repository access for internal packages": "面向内部包的 Nexus 兼容仓库访问",
+    "Enterprise-grade artifact management for modern software delivery": "面向现代软件交付的企业级制品管理",
     "Initial administrator setup": "初始管理员设置",
     "Administrator": "管理员",
     "Confirm password": "确认密码",
@@ -310,6 +339,10 @@
     "Version": "版本",
     "Upload": "上传",
     "Upload content to the repository": "上传内容到仓库",
+    "Directory": "目录",
+    "Filename": "文件名",
+    "Add asset": "添加文件",
+    "Remove": "移除",
     "My Token": "我的 Token",
     "API keys for package clients": "包客户端使用的 API Key",
     "NpmToken": "NpmToken",
@@ -406,7 +439,7 @@
     "Docker connector refresh failed.": "Docker 连接器刷新失败。",
     "Docker operations request failed.": "Docker 操作请求失败。",
     "Docker operations request failed": "Docker 操作请求失败",
-    "UI language settings saved.": "界面语言设置已保存。",
+    "UI settings saved.": "界面设置已保存。",
     "Session check failed": "Session 检查失败",
     "Save failed": "保存失败",
     "Create failed": "创建失败",
@@ -489,7 +522,7 @@
     "DISABLED": "DISABLED",
     "SUCCESS": "SUCCESS",
     "FAILURE": "FAILURE",
-    "File": "File",
+    "File": "文件",
     "AWS S3 SDK": "AWS S3 SDK",
     "OSS Native SDK": "OSS Native SDK"
   };
@@ -546,11 +579,15 @@
 
   function normalizeSettings(value) {
     const defaultLanguage = normalizeDefaultLanguage(value?.defaultLanguage);
+    const supportedDefaultThemes = normalizeSupportedDefaultThemes(value?.supportedDefaultThemes);
+    const defaultTheme = normalizeDefaultTheme(value?.defaultTheme, supportedDefaultThemes);
     return {
       defaultLanguage,
       supportedDefaultLanguages: Array.isArray(value?.supportedDefaultLanguages)
         ? value.supportedDefaultLanguages
         : ["browser", "zh-CN", "en"],
+      defaultTheme,
+      supportedDefaultThemes,
       updatedAt: value?.updatedAt || null
     };
   }
@@ -560,6 +597,22 @@
     if (value === "en" || value === "en-US") return "en";
     if (value === "browser") return "browser";
     return SUPPORTED_DEFAULT_LANGUAGES.has(value) ? value : DEFAULT_LANGUAGE;
+  }
+
+  function normalizeSupportedDefaultThemes(value) {
+    const themes = Array.isArray(value)
+      ? value.map((theme) => String(theme || "").trim().toLowerCase())
+        .filter((theme) => THEME_ID_PATTERN.test(theme))
+      : [];
+    if (!themes.includes(DEFAULT_THEME)) themes.unshift(DEFAULT_THEME);
+    return [...new Set(themes)];
+  }
+
+  function normalizeDefaultTheme(value, supportedThemes) {
+    const normalized = String(value || "").trim().toLowerCase();
+    return THEME_ID_PATTERN.test(normalized) && supportedThemes.includes(normalized)
+      ? normalized
+      : DEFAULT_THEME;
   }
 
   function resolveLanguage(defaultLanguage) {
@@ -574,6 +627,7 @@
   function updateSettings(nextSettings, options = {}) {
     settings = normalizeSettings(nextSettings);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+    window.kkrepoTheme?.applySettings(settings);
     const nextLanguage = resolveLanguage(settings.defaultLanguage);
     const changed = nextLanguage !== currentLanguage || options.force;
     currentLanguage = nextLanguage;
@@ -596,21 +650,33 @@
     }
   }
 
-  async function saveDefaultLanguage(defaultLanguage) {
-    const normalized = normalizeDefaultLanguage(defaultLanguage);
+  async function saveSettings(defaultLanguage, defaultTheme) {
+    const normalizedLanguage = normalizeDefaultLanguage(defaultLanguage);
+    const normalizedTheme = normalizeDefaultTheme(defaultTheme, settings.supportedDefaultThemes);
     const response = await fetch("/internal/ui-settings", {
       method: "PUT",
       headers: {
         Accept: "application/json",
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({ defaultLanguage: normalized }),
+      body: JSON.stringify({
+        defaultLanguage: normalizedLanguage,
+        defaultTheme: normalizedTheme
+      }),
       cache: "no-store"
     });
     if (!response.ok) {
       throw new Error(await responseMessage(response, `HTTP ${response.status}`));
     }
     return updateSettings(await response.json(), { force: true });
+  }
+
+  function saveDefaultLanguage(defaultLanguage) {
+    return saveSettings(defaultLanguage, settings.defaultTheme);
+  }
+
+  function saveDefaultTheme(defaultTheme) {
+    return saveSettings(settings.defaultLanguage, defaultTheme);
   }
 
   async function responseMessage(response, fallback) {
@@ -626,6 +692,10 @@
 
   function setDefaultLanguage(defaultLanguage) {
     return updateSettings({ ...settings, defaultLanguage }, { force: true });
+  }
+
+  function setDefaultTheme(defaultTheme) {
+    return updateSettings({ ...settings, defaultTheme }, { force: true });
   }
 
   function translate(value) {
@@ -684,10 +754,10 @@
     if (match) return `API Key 已创建：${match[1]}`;
     match = body.match(/^Docker cache cleared for (.+)$/);
     if (match) return `已清理 ${match[1]} 的 Docker 缓存`;
-    match = body.match(/^Default language: (.+)\. Active language: (.+)\.$/);
-    if (match) return `默认语言：${translateBody(match[1])}。当前语言：${translateBody(match[2])}。`;
     match = body.match(/^Current language: (.+)$/);
     if (match) return `当前语言：${translateBody(match[1])}`;
+    match = body.match(/^New version (v[^ ]+) available\. View release\.$/);
+    if (match) return `有新版本 ${match[1]} 可更新，查看发布页面。`;
     return body;
   }
 
@@ -826,6 +896,7 @@
     window.dispatchEvent(new CustomEvent("kkrepo:i18n-change", {
       detail: {
         defaultLanguage: settings.defaultLanguage,
+        defaultTheme: settings.defaultTheme,
         currentLanguage,
         settings
       }
@@ -850,10 +921,14 @@
     apply,
     currentLanguage: () => currentLanguage,
     defaultLanguage: () => settings.defaultLanguage,
+    defaultTheme: () => settings.defaultTheme,
     loadSettings,
     ready: () => readyPromise,
     saveDefaultLanguage,
+    saveDefaultTheme,
+    saveSettings,
     setDefaultLanguage,
+    setDefaultTheme,
     settings: () => settings,
     text: translate
   };

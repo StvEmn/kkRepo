@@ -12,6 +12,7 @@ import com.github.klboke.kkrepo.persistence.jdbc.api.CleanupPolicyDao.CleanupPro
 import com.github.klboke.kkrepo.persistence.jdbc.api.CleanupPolicyDao.CleanupScanCursor;
 import com.github.klboke.kkrepo.persistence.jdbc.api.CleanupPolicyDao.CleanupUsage;
 import com.github.klboke.kkrepo.persistence.jdbc.api.DockerRegistryDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.HuggingFaceRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.PersistenceHashes;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.AssetRecord;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.ComponentRecord;
@@ -43,6 +44,7 @@ public class CleanupSubjectScanner {
   private final CleanupPolicyDao cleanupDao;
   private final CleanupRuntimeProperties runtimeProperties;
   private final CleanupUsageTrackingService usageTracking;
+  private HuggingFaceRegistryDao huggingFaceRegistry;
 
   @Autowired
   public CleanupSubjectScanner(
@@ -67,6 +69,11 @@ public class CleanupSubjectScanner {
       AssetDao assetDao,
       CleanupPolicyCapabilities capabilities) {
     this(componentDao, assetDao, null, capabilities, null, null, null);
+  }
+
+  @Autowired
+  void setHuggingFaceRegistry(HuggingFaceRegistryDao huggingFaceRegistry) {
+    this.huggingFaceRegistry = huggingFaceRegistry;
   }
 
   public ScanResult scan(
@@ -381,6 +388,11 @@ public class CleanupSubjectScanner {
     List<Subject> subjects = new ArrayList<>(components.size());
     for (ComponentRecord component : components) {
       List<AssetRecord> assets = expanded.getOrDefault(component.id(), List.of());
+      if (repository.format() == RepositoryFormat.HUGGINGFACE
+          && huggingFaceRegistry != null
+          && huggingFaceRegistry.isRevisionProtected(repository.id(), component.id())) {
+        continue;
+      }
       if (isCleanupComponent(repository, component, assets)) {
         subjects.add(componentSubject(repository.format(), component, assets, usage));
       }
@@ -531,13 +543,19 @@ public class CleanupSubjectScanner {
   private static String familyKey(ComponentRecord component) {
     return familyPart(component.namespace())
         + familyPart(component.name())
-        + familyPart(component.kind());
+        + familyPart(familyKind(component));
   }
 
   private static boolean sameFamily(ComponentRecord left, ComponentRecord right) {
     return value(left.namespace()).equals(value(right.namespace()))
         && value(left.name()).equals(value(right.name()))
-        && value(left.kind()).equals(value(right.kind()));
+        && value(familyKind(left)).equals(value(familyKind(right)));
+  }
+
+  private static String familyKind(ComponentRecord component) {
+    // Older Nexus datastore imports used the generic "package" kind for Go. Treat those rows and
+    // native go-module rows as one module family so retainCount is correct after a live migration.
+    return component.format() == RepositoryFormat.GO ? "go-module" : component.kind();
   }
 
   private static CleanupScanCursor componentCursor(

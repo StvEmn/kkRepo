@@ -67,6 +67,32 @@ import org.springframework.transaction.support.SimpleTransactionStatus;
 class NexusApiMigrationServiceTest {
 
   @Test
+  void migratesPypiRemoteIndexPathIncludingAnExplicitEmptyValue() {
+    FakeRepositoryDao repositories = new FakeRepositoryDao();
+    NexusApiMigrationService service = service(new FakeBlobStoreDao(), repositories);
+    NexusInventory inventory = new NexusInventory(
+        List.of(Map.of("name", "default")),
+        List.of(
+            repository("pytorch", "pypi", "proxy", Map.of(
+                "storage", storage("default"),
+                "proxy", Map.of("remoteUrl", "https://download.pytorch.org/whl/cpu/"),
+                "pypi", Map.of("indexPath", ""))),
+            repository("pypi-default", "pypi", "proxy", Map.of(
+                "storage", storage("default"),
+                "proxy", Map.of("remoteUrl", "https://pypi.org/")))),
+        NexusSecurityExport.empty(),
+        List.of());
+
+    service.migrateConfig(inventory, request("https://old-nexus.example"));
+
+    Map<?, ?> rootIndex = (Map<?, ?>) repositories.required("pytorch").attributes().get("pypi");
+    Map<?, ?> defaultIndex = (Map<?, ?>) repositories.required("pypi-default")
+        .attributes().get("pypi");
+    assertEquals("", rootIndex.get("indexPath"));
+    assertEquals("/simple", defaultIndex.get("indexPath"));
+  }
+
+  @Test
   void nativeRuntimeDoesNotInstallBouncyCastleProvider() {
     Provider previousProvider = Security.getProvider(BouncyCastleProvider.PROVIDER_NAME);
     Security.removeProvider(BouncyCastleProvider.PROVIDER_NAME);
@@ -139,10 +165,14 @@ class NexusApiMigrationServiceTest {
     assertEquals("default", preflight.blobStorePlans().get(0).sourceName());
     assertEquals("s3", preflight.blobStorePlans().get(0).targetType());
     assertEquals("migrated", preflight.blobStorePlans().get(0).targetPrefix());
-    assertEquals(3, preflight.repositoriesToMigrate().size());
+    assertEquals(4, preflight.repositoriesToMigrate().size());
     assertEquals("maven2-hosted", preflight.repositoriesToMigrate().get(0).recipe());
-    assertEquals(1, preflight.unsupported().size());
-    assertEquals("go-hosted", preflight.unsupported().get(0).name());
+    assertEquals("go-hosted", preflight.repositoriesToMigrate().stream()
+        .filter(repository -> "go-hosted".equals(repository.name()))
+        .findFirst()
+        .orElseThrow()
+        .recipe());
+    assertEquals(0, preflight.unsupported().size());
     assertEquals(List.of("maven-releases", "maven-central"), preflight.groupRepositories().get(0).members());
     assertEquals("https://repo1.maven.org/maven2/", preflight.proxyRemoteRisks().get(0).remoteUrl());
     assertEquals(1, preflight.security().users());
@@ -162,6 +192,13 @@ class NexusApiMigrationServiceTest {
         SupportStatus.FULL,
         preflight.migrationPlan().items().stream()
             .filter(item -> "maven-releases".equals(item.name()))
+            .findFirst()
+            .orElseThrow()
+            .status());
+    assertEquals(
+        SupportStatus.FULL,
+        preflight.migrationPlan().items().stream()
+            .filter(item -> "go-hosted".equals(item.name()))
             .findFirst()
             .orElseThrow()
             .status());
@@ -619,6 +656,53 @@ class NexusApiMigrationServiceTest {
   }
 
   @Test
+  void migratesRDefinitionsWithProxyCachePolicyAndOrderedMembers() {
+    FakeBlobStoreDao blobStores = new FakeBlobStoreDao();
+    FakeRepositoryDao repositories = new FakeRepositoryDao();
+    NexusApiMigrationService service = service(blobStores, repositories);
+    NexusInventory inventory = new NexusInventory(
+        List.of(Map.of("name", "default")),
+        List.of(
+            repository("r-hosted", "r", "hosted", Map.of(
+                "storage", Map.of(
+                    "blobStoreName", "default",
+                    "strictContentTypeValidation", true,
+                    "writePolicy", "allow"))),
+            repository("r-proxy", "r", "proxy", Map.of(
+                "storage", storage("default"),
+                "proxy", Map.of(
+                    "remoteUrl", "https://cran.example.test/",
+                    "contentMaxAge", 37,
+                    "metadataMaxAge", 19),
+                "negativeCache", Map.of("enabled", true, "timeToLive", 11),
+                "httpClient", Map.of("autoBlock", false))),
+            repository("r-group", "r", "group", Map.of(
+                "storage", storage("default"),
+                "group", Map.of("memberNames", List.of("r-hosted", "r-proxy"))))),
+        NexusSecurityExport.empty(),
+        List.of());
+
+    ConfigMigrationCounts counts = service.migrateConfig(
+        inventory, request("https://old-nexus.example"));
+
+    assertEquals(3, counts.repositories());
+    RepositoryRecord hosted = repositories.required("r-hosted");
+    RepositoryRecord proxy = repositories.required("r-proxy");
+    assertEquals(RepositoryFormat.R, hosted.format());
+    assertEquals("r-hosted", hosted.recipeName());
+    assertEquals("ALLOW", hosted.writePolicy());
+    assertEquals("https://cran.example.test/", proxy.proxyRemoteUrl());
+    Map<?, ?> proxyAttributes = (Map<?, ?>) proxy.attributes().get("proxy");
+    assertEquals(37, proxyAttributes.get("contentMaxAgeMinutes"));
+    assertEquals(19, proxyAttributes.get("metadataMaxAgeMinutes"));
+    assertEquals(false, proxyAttributes.get("autoBlock"));
+    assertEquals(
+        Map.of("enabled", true, "timeToLive", 11),
+        proxyAttributes.get("negativeCache"));
+    assertEquals(List.of("r-hosted", "r-proxy"), repositories.memberNames("r-group"));
+  }
+
+  @Test
   void migratesSwiftProxyAuthenticationAndTtlsWithoutKeepingNestedSecrets() {
     FakeRepositoryDao repositories = new FakeRepositoryDao();
     NexusApiMigrationService service = service(new FakeBlobStoreDao(), repositories);
@@ -809,6 +893,75 @@ class NexusApiMigrationServiceTest {
   }
 
   @Test
+  void requiresExplicitAlpineRsaKeyImportAndKeepsLocalSignersOffline() {
+    FakeBlobStoreDao blobStores = new FakeBlobStoreDao();
+    FakeRepositoryDao repositories = new FakeRepositoryDao();
+    FakeMigrationJobDao migrationJobs = new FakeMigrationJobDao();
+    NexusApiMigrationService service = new NexusApiMigrationService(
+        new ObjectMapper(),
+        blobStores.asDao(),
+        repositories.asDao(),
+        null,
+        migrationJobs,
+        noopSecurityWriter());
+    String privateKey = "-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----";
+    NexusInventory inventory = new NexusInventory(
+        List.of(Map.of("name", "default")),
+        List.of(
+            repository("alpine-hosted", "alpine", "hosted", Map.of(
+                "storage", storage("default"),
+                "alpine", Map.of(
+                    "distributions", List.of("v3.23"),
+                    "channels", List.of("main"),
+                    "architectures", List.of("x86_64")),
+                "alpineSigning", Map.of(
+                    "keypair", privateKey, "keyFilename", "source.rsa.pub"))),
+            repository("alpine-resign", "alpine", "proxy", Map.of(
+                "storage", storage("default"),
+                "alpineSigning", Map.of("keypair", privateKey),
+                "proxy", Map.of("remoteUrl", "https://apk.example.invalid/alpine/"))),
+            repository("alpine-passthrough", "alpine", "proxy", Map.of(
+                "storage", storage("default"),
+                "proxy", Map.of("remoteUrl", "https://apk.example.invalid/alpine/"))),
+            repository("alpine-group", "alpine", "group", Map.of(
+                "storage", storage("default"),
+                "alpineSigning", Map.of("keypair", privateKey),
+                "group", Map.of("memberNames", List.of("alpine-hosted"))))),
+        NexusSecurityExport.empty(),
+        List.of());
+
+    NexusMigrationPreflight preflight = service.preflight(
+        inventory,
+        request("https://old-nexus.example").targetBlobStore());
+    NexusApiMigrationService.NexusMigrationResult result = service.migrate(
+        inventory,
+        request("https://old-nexus.example"));
+
+    for (String name : List.of("alpine-hosted", "alpine-resign", "alpine-group")) {
+      assertEquals(SupportStatus.NEEDS_MANUAL_ACTION, status(preflight, name));
+      assertTrue(preflight.migrationPlan().manualActions().contains("repository:" + name));
+      assertFalse(repositories.required(name).online());
+    }
+    assertTrue(repositories.required("alpine-passthrough").online());
+    assertEquals("finished_with_manual_actions", result.status());
+    assertTrue(result.validation().manualActions().contains("repository/Alpine signing keys"));
+    assertEquals("RESIGN", ((Map<?, ?>) repositories.required("alpine-hosted")
+        .attributes().get("alpine")).get("metadataMode"));
+    assertEquals("RESIGN", ((Map<?, ?>) repositories.required("alpine-resign")
+        .attributes().get("alpine")).get("metadataMode"));
+    assertEquals("PASSTHROUGH", ((Map<?, ?>) repositories.required("alpine-passthrough")
+        .attributes().get("alpine")).get("metadataMode"));
+    Map<?, ?> migrated = (Map<?, ?>) repositories.required("alpine-hosted")
+        .attributes().get("alpine");
+    assertEquals(List.of("v3.23"), migrated.get("distributions"));
+    assertEquals("source.rsa.pub", migrated.get("keyFilename"));
+    assertEquals(true, migrated.get("verifyUpstreamSignatures"));
+    Map<?, ?> source = (Map<?, ?>) repositories.required("alpine-hosted")
+        .attributes().get("sourceRepository");
+    assertEquals("<redacted>", ((Map<?, ?>) source.get("alpineSigning")).get("keypair"));
+  }
+
+  @Test
   void rollsBackRepositoryAndGroupDefinitionWritesButKeepsFailedJobSummary() {
     FakeBlobStoreDao blobStores = new FakeBlobStoreDao();
     FakeRepositoryDao repositories = new FakeRepositoryDao();
@@ -901,7 +1054,7 @@ class NexusApiMigrationServiceTest {
   }
 
   @Test
-  void unsupportedHostedRepositoryDoesNotCreateFallbackProxy() {
+  void migratesGoHostedRepositoryAndKeepsItInGroup() {
     FakeBlobStoreDao blobStores = new FakeBlobStoreDao();
     FakeRepositoryDao repositories = new FakeRepositoryDao();
     NexusApiMigrationService service = service(blobStores, repositories);
@@ -916,13 +1069,13 @@ class NexusApiMigrationServiceTest {
         NexusSecurityExport.empty(),
         List.of()), request("https://old-nexus.example"));
 
-    assertEquals(1, counts.unsupportedRepositories());
-    assertEquals(1, counts.repositories());
+    assertEquals(0, counts.unsupportedRepositories());
+    assertEquals(2, counts.repositories());
     assertEquals(1, counts.groupRepositories());
-    assertTrue(repositories.findByName("go-hosted").isEmpty());
+    assertTrue(repositories.findByName("go-hosted").isPresent());
     assertTrue(repositories.findByName("go-public").isPresent());
     assertFalse(repositories.findByName("go-hosted-source-proxy").isPresent());
-    assertEquals(List.of(), repositories.memberNames("go-public"));
+    assertEquals(List.of("go-hosted"), repositories.memberNames("go-public"));
   }
 
   @Test
