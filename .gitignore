@@ -11,3 +11,5 @@ server/blobs/
 .local/
 .claude/settings.local.json
 .playwright-mcp/
+.settings
+.codegraph
