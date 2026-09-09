@@ -50,6 +50,22 @@ class ContentSelectorExpressionEvaluatorTest {
   }
 
   @Test
+  void decodesPercentEncodedNpmScopedPathsBeforeMatching() {
+    // npm clients publish scoped packages as /@scope%2fname; selectors written against the
+    // decoded asset path (Nexus semantics) must still match.
+    assertTrue(ContentSelectorExpressionEvaluator.matches(
+        "format == \"npm\" and path =^ \"/@casit.jiyun.lc/\"",
+        "npm-hosted",
+        "npm",
+        "@casit.jiyun.lc%2fCategoryTableSelect"));
+    assertTrue(ContentSelectorExpressionEvaluator.matches(
+        "format == \"npm\" and coordinate.scope == \"casit.jiyun.lc\"",
+        "npm-hosted",
+        "npm",
+        "@casit.jiyun.lc%2fCategoryTableSelect"));
+  }
+
+  @Test
   void supportsBooleanGroupingAndNegation() {
     assertTrue(ContentSelectorExpressionEvaluator.matches(
         "format == \"raw\" && !(path =~ \".*private.*\")",

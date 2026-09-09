@@ -228,6 +228,9 @@ public class SecurityManagementFilter extends OncePerRequestFilter {
     if (path.startsWith("privileges/") || path.equals("privileges")) {
       return Optional.of("nexus:privileges:" + crudAction(method));
     }
+    if (path.startsWith("content-selectors/") || path.equals("content-selectors")) {
+      return Optional.of("nexus:selectors:" + crudAction(method));
+    }
     if (path.startsWith("realms/") || path.equals("realms")) {
       return Optional.of("GET".equals(method) ? "nexus:settings:read" : "nexus:settings:update");
     }

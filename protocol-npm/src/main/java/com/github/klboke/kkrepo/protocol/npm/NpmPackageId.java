@@ -63,7 +63,7 @@ public record NpmPackageId(String scope, String name) implements Comparable<NpmP
     return new NpmPackageId(null, value);
   }
 
-  static String decode(String value) {
+  public static String decode(String value) {
     byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
     byte[] decoded = new byte[bytes.length];
     int out = 0;

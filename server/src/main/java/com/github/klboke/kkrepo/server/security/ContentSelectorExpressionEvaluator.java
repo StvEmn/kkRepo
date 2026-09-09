@@ -2,6 +2,7 @@ package com.github.klboke.kkrepo.server.security;
 
 import com.github.klboke.kkrepo.protocol.maven.path.Coordinates;
 import com.github.klboke.kkrepo.protocol.maven.path.MavenPathParser;
+import com.github.klboke.kkrepo.protocol.npm.NpmPackageId;
 import com.github.klboke.kkrepo.protocol.npm.NpmPath;
 import com.github.klboke.kkrepo.protocol.npm.NpmPathParser;
 import com.google.re2j.Pattern;
@@ -37,7 +38,9 @@ final class ContentSelectorExpressionEvaluator {
   }
 
   private static Map<String, String> variables(String repository, String format, String path) {
-    String normalizedPath = stripLeadingSlashes(path == null ? "" : path);
+    // Nexus evaluates selectors against the decoded asset path; scoped npm requests arrive with
+    // %2f-encoded separators, so decode before exposing the path variables.
+    String normalizedPath = stripLeadingSlashes(NpmPackageId.decode(path == null ? "" : path));
     String normalizedFormat = nexusFormat(format);
     Map<String, String> values = new HashMap<>();
     put(values, "path", normalizedPath);
