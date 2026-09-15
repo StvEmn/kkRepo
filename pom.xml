@@ -51,16 +51,16 @@
   </modules>
 
   <properties>
-    <revision>1.0.0</revision>
+    <revision>1.0.1</revision>
     <java.version>25</java.version>
     <spring.boot.version>4.1.1</spring.boot.version>
-    <native-build-tools-plugin.version>1.1.11</native-build-tools-plugin.version>
+    <native-build-tools-plugin.version>1.1.12</native-build-tools-plugin.version>
     <apollo.client.version>2.5.0</apollo.client.version>
     <guava.version>33.7.1-jre</guava.version>
     <guice.version>7.0.0</guice.version>
     <re2j.version>1.8</re2j.version>
     <maven.artifact.version>3.9.16</maven.artifact.version>
-    <aws.sdk.version>2.54.12</aws.sdk.version>
+    <aws.sdk.version>2.54.16</aws.sdk.version>
     <commons.compress.version>1.28.0</commons.compress.version>
     <xz.version>1.12</xz.version>
     <zstd.jni.version>1.5.7-16</zstd.jni.version>

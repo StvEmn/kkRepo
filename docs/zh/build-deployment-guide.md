@@ -40,7 +40,7 @@ curl -fsSL https://raw.githubusercontent.com/klboke/kkrepo/main/scripts/quicksta
   | KKREPO_RUNTIME=native KKREPO_DATABASE_TYPE=postgresql bash
 ```
 
-`KKREPO_RUNTIME=jvm` 选择 `ghcr.io/klboke/kkrepo:1.0.0`，`KKREPO_RUNTIME=native` 选择 `ghcr.io/klboke/kkrepo:1.0.0-native`。两种镜像均发布 Linux `amd64` 和 `arm64` 架构。显式设置 `KKREPO_IMAGE_TAG` 时，会覆盖对应运行时的默认 tag。
+`KKREPO_RUNTIME=jvm` 选择 `ghcr.io/klboke/kkrepo:1.0.1`，`KKREPO_RUNTIME=native` 选择 `ghcr.io/klboke/kkrepo:1.0.1-native`。两种镜像均发布 Linux `amd64` 和 `arm64` 架构。显式设置 `KKREPO_IMAGE_TAG` 时，会覆盖对应运行时的默认 tag。
 
 该脚本会逐步打印日志并执行：
 
@@ -61,8 +61,9 @@ bash quickstart.sh
 
 默认会启动：
 
-- `ghcr.io/klboke/kkrepo:1.0.0` 中的 JVM 运行时
+- `ghcr.io/klboke/kkrepo:1.0.1` 中的 JVM 运行时
 - MySQL 8.0
+- 持续探测应用就绪状态的 `kkrepo-health` sidecar
 - 用于本地试用的持久化 MySQL volume 和 File blob storage volume
 
 启动后访问：
@@ -73,6 +74,16 @@ bash quickstart.sh
 - Prometheus 指标：`http://127.0.0.1:19091/actuator/prometheus`
 
 首次进入页面时，在 UI 中创建初始 `Local/admin` 管理员密码。进入管理控制台后，先创建名为 `default` 的 blob store；本地试用可以选择 File，生产环境建议使用 OSS/S3。
+
+两份 quickstart Compose 文件均包含 `kkrepo-health`，每 15 秒检查一次 `http://kkrepo:8081/actuator/health/readiness`。探测在 Alpine sidecar 中执行，因此同时兼容 JVM 和无 shell 的 Native 镜像。通过 `KKREPO_MANAGEMENT_PORT` 修改宿主机映射端口时，容器内端口仍为 `8081`。
+
+在 quickstart 目录中查看就绪状态：
+
+```bash
+docker compose -f docker-compose.quickstart.yml ps kkrepo-health
+```
+
+PostgreSQL 请使用 `docker-compose.quickstart-postgresql.yml`。`healthy` / `unhealthy` 状态属于 `kkrepo-health`，应用容器本身仍显示 `running`。启动完整环境并等待就绪，可执行 `docker compose -f docker-compose.quickstart.yml up -d --wait`。需要等待 kkRepo 就绪的其他服务，应使用 `condition: service_healthy` 依赖 `kkrepo-health`。此健康检查用于报告就绪状态，检查失败不会自动重启 kkRepo。
 
 停止试用环境：
 
@@ -153,7 +164,7 @@ server/target/kkrepo-server-<version>.jar
 拉取最新公开发行镜像：
 
 ```bash
-docker pull ghcr.io/klboke/kkrepo:1.0.0
+docker pull ghcr.io/klboke/kkrepo:1.0.1
 ```
 
 也可以使用 `latest` 跟随最新公开发行版本：
@@ -165,7 +176,7 @@ docker pull ghcr.io/klboke/kkrepo:latest
 Native 镜像使用独立 tag：
 
 ```bash
-docker pull ghcr.io/klboke/kkrepo:1.0.0-native
+docker pull ghcr.io/klboke/kkrepo:1.0.1-native
 docker pull ghcr.io/klboke/kkrepo:native-latest
 ```
 

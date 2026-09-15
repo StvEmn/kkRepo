@@ -40,7 +40,7 @@ curl -fsSL https://raw.githubusercontent.com/klboke/kkrepo/main/scripts/quicksta
   | KKREPO_RUNTIME=native KKREPO_DATABASE_TYPE=postgresql bash
 ```
 
-`KKREPO_RUNTIME=jvm` selects `ghcr.io/klboke/kkrepo:1.0.0`, while `KKREPO_RUNTIME=native` selects `ghcr.io/klboke/kkrepo:1.0.0-native`. Both are published for Linux `amd64` and `arm64`. An explicit `KKREPO_IMAGE_TAG` overrides the runtime's default tag.
+`KKREPO_RUNTIME=jvm` selects `ghcr.io/klboke/kkrepo:1.0.1`, while `KKREPO_RUNTIME=native` selects `ghcr.io/klboke/kkrepo:1.0.1-native`. Both are published for Linux `amd64` and `arm64`. An explicit `KKREPO_IMAGE_TAG` overrides the runtime's default tag.
 
 The script prints each step and:
 
@@ -61,8 +61,9 @@ bash quickstart.sh
 
 By default, it starts:
 
-- The JVM runtime from `ghcr.io/klboke/kkrepo:1.0.0`
+- The JVM runtime from `ghcr.io/klboke/kkrepo:1.0.1`
 - MySQL 8.0
+- A `kkrepo-health` sidecar that continuously probes application readiness
 - Persistent MySQL and File blob storage volumes for local trials
 
 After startup, open:
@@ -73,6 +74,16 @@ After startup, open:
 - Prometheus metrics: `http://127.0.0.1:19091/actuator/prometheus`
 
 On the first visit, create the initial `Local/admin` administrator password in the UI. After entering the admin console, create a blob store named `default`. File is fine for local trials; OSS/S3 is recommended for production.
+
+Both quickstart Compose files include `kkrepo-health`, which checks `http://kkrepo:8081/actuator/health/readiness` every 15 seconds. The probe runs in an Alpine sidecar, so it works with both JVM and shell-less Native images. The container port stays `8081` when you change the published host port with `KKREPO_MANAGEMENT_PORT`.
+
+From the quickstart directory, inspect readiness with:
+
+```bash
+docker compose -f docker-compose.quickstart.yml ps kkrepo-health
+```
+
+Use `docker-compose.quickstart-postgresql.yml` for PostgreSQL. The `healthy` / `unhealthy` status belongs to `kkrepo-health`; the application container itself remains `running`. To wait for readiness when starting the full stack, use `docker compose -f docker-compose.quickstart.yml up -d --wait`. Additional services that need to wait for kkRepo should depend on `kkrepo-health` with `condition: service_healthy`. This health check reports readiness; an unhealthy result does not automatically restart kkRepo.
 
 Stop the trial environment:
 
@@ -153,7 +164,7 @@ Note: a normal `server` module jar does not contain a Spring Boot executable ent
 Pull the latest public release image:
 
 ```bash
-docker pull ghcr.io/klboke/kkrepo:1.0.0
+docker pull ghcr.io/klboke/kkrepo:1.0.1
 ```
 
 You can also use `latest` to follow the latest public release:
@@ -165,7 +176,7 @@ docker pull ghcr.io/klboke/kkrepo:latest
 The Native image is published separately:
 
 ```bash
-docker pull ghcr.io/klboke/kkrepo:1.0.0-native
+docker pull ghcr.io/klboke/kkrepo:1.0.1-native
 docker pull ghcr.io/klboke/kkrepo:native-latest
 ```
 

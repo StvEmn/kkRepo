@@ -83,6 +83,81 @@ import org.springframework.dao.DuplicateKeyException;
 
 /** Reusable black-box contract that every database backend must pass through the public API. */
 public abstract class PersistenceApiContract {
+  @Test
+  void concurrentSelectorCreationNeverOverwritesTheWinningExpression() throws Exception {
+    CyclicBarrier ready = new CyclicBarrier(2);
+    List<Callable<String>> attempts = List.of("path =^ '/one/'", "path =^ '/two/'").stream()
+        .<Callable<String>>map(expression -> () -> {
+          ready.await(10, java.util.concurrent.TimeUnit.SECONDS);
+          try {
+            return inTransaction(() -> {
+              stores().security().insertRepositoryTarget(
+                  new com.github.klboke.kkrepo.persistence.jdbc.api.model.SecurityRepositoryTargetRecord(
+                      null, "concurrent-selector", "concurrent-selector", "*", expression,
+                      Map.of("patterns", List.of()), Map.of("source", "nexus-content-selector", "type", "csel")));
+              return expression;
+            });
+          } catch (DuplicateKeyException expected) {
+            return "duplicate";
+          }
+        }).toList();
+    List<String> results = invokeConcurrently(attempts, 2);
+    assertEquals(1, results.stream().filter("duplicate"::equals).count());
+    String winner = results.stream().filter(result -> !result.equals("duplicate")).findFirst().orElseThrow();
+    assertEquals(winner, stores().security().findRepositoryTarget("concurrent-selector").orElseThrow().contentExpression());
+  }
+
+  @Test
+  void selectorCandidateBooleanScopesStayWithinTheirRepositories() {
+    long repo = createRepository("selector-boolean", RepositoryFormat.RAW);
+    long other = createRepository("selector-boolean-other", RepositoryFormat.RAW);
+    for (long repository : List.of(repo, other)) {
+      for (String path : List.of("team/public.txt", "private/secret.txt")) {
+        stores().assets().insertAsset(new AssetRecord(null, repository, null, null, RepositoryFormat.RAW,
+            path, sha256(path), path, "FILE", "text/plain", 1L, null, Instant.EPOCH, Map.of()));
+      }
+    }
+    var prefix = com.github.klboke.kkrepo.persistence.jdbc.api.AssetPathFilter.prefix("team/");
+    var exact = com.github.klboke.kkrepo.persistence.jdbc.api.AssetPathFilter.exact("team/public.txt");
+    var alternative = com.github.klboke.kkrepo.persistence.jdbc.api.AssetPathFilter.exact("private/secret.txt");
+    var combined = com.github.klboke.kkrepo.persistence.jdbc.api.AssetPathFilter.and(prefix,
+        com.github.klboke.kkrepo.persistence.jdbc.api.AssetPathFilter.or(exact, alternative));
+    var rows = stores().assets().listSelectorCandidates(Map.of(repo, combined,
+        other, com.github.klboke.kkrepo.persistence.jdbc.api.AssetPathFilter.NONE), 0, 20);
+    assertEquals(1, rows.size()); assertEquals(repo, rows.getFirst().repositoryId());
+    assertEquals("team/public.txt", rows.getFirst().path());
+    assertEquals(2, stores().assets().listSelectorCandidates(
+        Map.of(repo, com.github.klboke.kkrepo.persistence.jdbc.api.AssetPathFilter.ALL), 0, 20).size());
+  }
+
+  @Test
+  void selectorCandidatesFilterBeforePaginationAndEscapeSqlWildcards() {
+    long repo = createRepository("selector-candidates", RepositoryFormat.RAW);
+    long other = createRepository("selector-other", RepositoryFormat.RAW);
+    var now = Instant.parse("2026-09-08T00:00:00Z");
+    long matchedComponent = 0;
+    long matchedAsset = 0;
+    for (int index = 0; index < 1005; index++) {
+      long repository = index == 1004 ? other : repo;
+      String path = index >= 1003 ? "team/%_!/allowed.txt" : "private/" + index;
+      long component = stores().components().upsertReturningId(component(repository,
+          RepositoryFormat.RAW, "", "file" + index, "1", Map.of(), now.minusSeconds(index)));
+      long asset = stores().assets().insertAsset(new AssetRecord(null, repository, component, null,
+          RepositoryFormat.RAW, path, sha256(path), "file" + index, "FILE", "text/plain", 1L,
+          null, now, Map.of()));
+      if (index == 1003) { matchedComponent = component; matchedAsset = asset; }
+    }
+    var filters = Map.of(repo, com.github.klboke.kkrepo.persistence.jdbc.api.AssetPathFilter.prefix("team/%_!/"));
+    var results = stores().components().searchPageByRepositoryIds(List.of(repo), null, null, null, 20, filters);
+    assertEquals(List.of(matchedComponent), results.stream().map(row -> row.id()).toList());
+    var candidates = stores().assets().listSelectorCandidates(filters, 0, 20);
+    assertEquals(List.of(matchedAsset), candidates.stream().map(asset -> asset.id()).toList());
+    assertTrue(stores().assets().listSelectorCandidates(filters, matchedAsset, 20).isEmpty());
+    assertTrue(stores().assets().listSelectorCandidates(Map.of(), 0, 20).isEmpty());
+    var exact = Map.of(repo, com.github.klboke.kkrepo.persistence.jdbc.api.AssetPathFilter.exact("team/%_!/allowed.txt"));
+    assertEquals(1, stores().assets().listSelectorCandidates(exact, 0, 20).size());
+  }
+
   protected abstract PersistenceStores stores();
 
   protected abstract <T> T inTransaction(Supplier<T> action);
@@ -4873,6 +4948,151 @@ public abstract class PersistenceApiContract {
         .findUnreferencedBlobAssetIdForCleanup(
             dockerRepositoryId, 0, 10, Instant.parse("2026-07-13T11:00:00Z"))
         .orElseThrow());
+  }
+
+  @Test
+  void dockerBrowseDeletionPreservesTagsUntilTheLastReferenceAndCanBeRepushed() {
+    DockerManifestRecord manifest = dockerBrowseFixture("docker-browse-delete");
+    DockerRegistryDao registry = stores().dockerRegistry();
+    long repo = manifest.repositoryId();
+    String image = manifest.imageName();
+    String digest = manifest.digest();
+    assertEquals(0, inTransaction(() -> registry.deleteBrowseReference(repo, image, "missing")).deleted());
+    assertThrows(IllegalStateException.class, () -> inTransaction(() -> {
+      registry.deleteBrowseReference(repo, image, digest);
+      throw new IllegalStateException("rollback administrative deletion");
+    }));
+    assertTrue(registry.findBrowseManifestByReferencePath(repo, image + "/manifests/" + digest).isPresent());
+
+    var deleted = inTransaction(() -> registry.deleteBrowseReference(repo, image, digest));
+    assertEquals(1, deleted.deleted());
+    assertNull(deleted.assetId(), "tag-owned manifest content must not be released");
+    assertNull(deleted.assetBlobId());
+    assertFalse(registry.findManifestByDigest(repo, image, digest).orElseThrow().hasDigestReference());
+    assertEquals(List.of("1.0.0", "latest"), registry.listBrowseReferences(repo, image).stream()
+        .map(DockerRegistryDao.BrowseReferenceRow::reference).toList());
+    assertTrue(registry.findBrowseManifestByReferencePath(repo, image + "/manifests/" + digest).isEmpty());
+    assertTrue(registry.findBrowseManifestByReferencePath(repo, image + "/manifests/1.0.0").isPresent());
+    assertEquals(0, inTransaction(() -> registry.deleteBrowseReference(repo, image, digest)).deleted());
+    assertNull(inTransaction(() -> registry.deleteBrowseReference(repo, image, "latest")).assetId());
+    assertTrue(registry.findManifestByTag(repo, image, "1.0.0").isPresent());
+    var last = inTransaction(() -> registry.deleteBrowseReference(repo, image, "1.0.0"));
+    assertEquals(1, last.deleted());
+    assertEquals(manifest.assetId(), last.assetId());
+    assertNotNull(last.assetBlobId());
+    assertTrue(registry.findManifestByDigest(repo, image, digest).isEmpty());
+    assertTrue(registry.listBrowseReferences(repo, image).isEmpty());
+
+    inTransaction(() -> registry.upsertManifest(manifest));
+    assertTrue(registry.findBrowseManifestByReferencePath(repo, image + "/manifests/" + digest).isPresent());
+    assertEquals(List.of(digest), registry.listBrowseReferences(repo, image).stream()
+        .map(DockerRegistryDao.BrowseReferenceRow::reference).toList());
+    assertEquals(manifest.assetId(), inTransaction(() ->
+        registry.deleteBrowseReference(repo, image, digest)).assetId(), "untagged digest can be released");
+  }
+
+  @Test
+  void dockerBrowseDigestDeletionSerializesAcrossReplicas() throws Exception {
+    DockerManifestRecord manifest = dockerBrowseFixture("docker-browse-concurrent");
+    DockerRegistryDao registry = stores().dockerRegistry();
+    CountDownLatch locked = new CountDownLatch(1);
+    CountDownLatch release = new CountDownLatch(1);
+    try (var executor = Executors.newFixedThreadPool(2)) {
+      var first = executor.submit(() -> inTransaction(() -> {
+        var deleted = registry.deleteBrowseReference(
+            manifest.repositoryId(), manifest.imageName(), manifest.digest());
+        locked.countDown();
+        await(release);
+        return deleted.deleted();
+      }));
+      assertTrue(locked.await(30, java.util.concurrent.TimeUnit.SECONDS));
+      var second = executor.submit(() -> inTransaction(() -> registry.deleteBrowseReference(
+          manifest.repositoryId(), manifest.imageName(), manifest.digest()).deleted()));
+      try {
+        assertThrows(java.util.concurrent.TimeoutException.class,
+            () -> second.get(250, java.util.concurrent.TimeUnit.MILLISECONDS));
+      } finally {
+        release.countDown();
+      }
+      assertEquals(1, first.get(30, java.util.concurrent.TimeUnit.SECONDS));
+      assertEquals(0, second.get(30, java.util.concurrent.TimeUnit.SECONDS));
+    } finally {
+      release.countDown();
+    }
+    assertEquals(List.of("1.0.0", "latest"), registry.listTags(
+        manifest.repositoryId(), manifest.imageName(), null, 10));
+  }
+
+  @Test
+  void dockerBrowseDeleteUsesTheCurrentAssetAfterWaitingForRepublish() throws Exception {
+    DockerManifestRecord manifest = dockerBrowseFixture("docker-browse-republish");
+    DockerRegistryDao registry = stores().dockerRegistry();
+    long repo = manifest.repositoryId();
+    inTransaction(() -> {
+      registry.deleteTag(repo, manifest.imageName(), "latest");
+      registry.deleteTag(repo, manifest.imageName(), "1.0.0");
+      return null;
+    });
+    AssetRecord prior = stores().assets().findAssetById(manifest.assetId()).orElseThrow();
+    CountDownLatch publishing = new CountDownLatch(1);
+    CountDownLatch release = new CountDownLatch(1);
+    try (var executor = Executors.newFixedThreadPool(2)) {
+      var writer = executor.submit(() -> inTransaction(() -> {
+        registry.findManifestByDigestForUpdate(repo, manifest.imageName(), manifest.digest()).orElseThrow();
+        String path = prior.path() + "/replacement";
+        long assetId = stores().assets().insertAsset(new AssetRecord(null, repo, null, prior.assetBlobId(),
+            prior.format(), path, PersistenceHashes.pathHash(path), prior.name(), prior.kind(),
+            prior.contentType(), prior.size(), null, Instant.now(), prior.attributes()));
+        registry.upsertManifest(new DockerManifestRecord(manifest.id(), repo, manifest.imageName(),
+            manifest.imageNameHash(), manifest.digestAlgorithm(), manifest.digest(), manifest.digestHash(),
+            manifest.mediaType(), null, null, null, assetId, manifest.size(), "publisher", "127.0.0.1",
+            null, Map.of(), manifest.createdAt(), Instant.now()));
+        publishing.countDown();
+        await(release);
+        return assetId;
+      }));
+      assertTrue(publishing.await(30, java.util.concurrent.TimeUnit.SECONDS));
+      var deleting = executor.submit(() -> inTransaction(() -> registry.deleteBrowseReference(
+          repo, manifest.imageName(), manifest.digest())));
+      try {
+        assertThrows(java.util.concurrent.TimeoutException.class,
+            () -> deleting.get(250, java.util.concurrent.TimeUnit.MILLISECONDS));
+      } finally {
+        release.countDown();
+      }
+      long publishedAsset = writer.get(30, java.util.concurrent.TimeUnit.SECONDS);
+      var deleted = deleting.get(30, java.util.concurrent.TimeUnit.SECONDS);
+      assertEquals(publishedAsset, deleted.assetId());
+      assertEquals(prior.assetBlobId(), deleted.assetBlobId());
+    } finally {
+      release.countDown();
+    }
+  }
+
+  private DockerManifestRecord dockerBrowseFixture(String repositoryName) {
+    long repositoryId = createRepository(repositoryName, RepositoryFormat.DOCKER);
+    long blobStoreId = stores().repositories().findById(repositoryId).orElseThrow().blobStoreId();
+    Instant now = Instant.now();
+    long blobId = stores().assets().insertBlob(
+        blob(blobStoreId, "docker/manifests/acme/app/v1", repositoryName + "-manifest"));
+    String image = "acme/app";
+    String digest = "sha256:" + "a".repeat(64);
+    String path = "docker/manifests/acme/app/sha256/" + "a".repeat(64);
+    long assetId = stores().assets().insertAsset(new AssetRecord(
+        null, repositoryId, null, blobId, RepositoryFormat.DOCKER,
+        path, PersistenceHashes.sha256(path), "manifest.json", "MANIFEST",
+        "application/vnd.oci.image.manifest.v1+json", 42L, null, now, Map.of()));
+    return inTransaction(() -> {
+      DockerManifestRecord manifest = stores().dockerRegistry().upsertManifest(new DockerManifestRecord(
+          null, repositoryId, image, PersistenceHashes.sha256(image), "sha256", digest, PersistenceHashes.sha256(digest),
+          "application/vnd.oci.image.manifest.v1+json", null, null, null, assetId, 42L,
+          "contract", "127.0.0.1", null, Map.of(), now, now));
+      for (String tag : List.of("latest", "1.0.0")) {
+        stores().dockerRegistry().upsertTag(new DockerTagRecord(null, repositoryId, image, PersistenceHashes.sha256(image),
+            tag, PersistenceHashes.sha256(tag), manifest.id(), digest, "contract", "127.0.0.1", now, now));
+      }
+      return manifest;
+    });
   }
 
   @Test
