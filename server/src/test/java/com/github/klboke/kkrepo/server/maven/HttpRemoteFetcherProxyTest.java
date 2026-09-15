@@ -268,7 +268,7 @@ class HttpRemoteFetcherProxyTest {
 
   private static HttpRemoteFetcher proxiedFetcher(ProxiedHttpClientFactory factory) {
     return new HttpRemoteFetcher(
-        OutboundRequestPolicy.allowPrivateForTests(), null, factory, "HTTP_1_1", 30, 60, 300, 2, 1);
+        OutboundRequestPolicy.allowPrivateForTests(), null, factory, "HTTP_1_1", 30, 60, 300, 2, 1, 16);
   }
 
   private static OutboundProxyConfig proxyConfig(int port, String username, String password) {

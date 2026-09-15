@@ -99,7 +99,7 @@ public class ProxiedHttpClientFactory implements AutoCloseable {
 
   public ProxiedHttpClientFactory(
       @Value("${kkrepo.outbound-proxy.idle-ttl-ms:3600000}") long idleTtlMillis,
-      @Value("${kkrepo.outbound-proxy.connect-timeout-ms:10000}") long connectTimeoutMillis) {
+      @Value("${kkrepo.outbound-proxy.connect-timeout-ms:3000}") long connectTimeoutMillis) {
     this.idleTtl = Duration.ofMillis(Math.max(1L, idleTtlMillis));
     this.connectTimeout = Duration.ofMillis(Math.max(1L, connectTimeoutMillis));
     this.cache = LocalCacheFactory.standard()
@@ -349,6 +349,10 @@ public class ProxiedHttpClientFactory implements AutoCloseable {
         .setRoutePlanner(new PinnedRoutePlanner(null, false))
         .disableContentCompression()
         .disableRedirectHandling()
+        // Upstream fetches are retried by the per-repository circuit breaker and
+        // HttpRemoteFetcher body-read retries; HttpClient's implicit retry would silently
+        // multiply thread-pool occupancy (up to 4x) while a remote endpoint hangs.
+        .disableAutomaticRetries()
         .build();
   }
 
@@ -360,7 +364,9 @@ public class ProxiedHttpClientFactory implements AutoCloseable {
         .setConnectionManager(connectionManager)
         .setRoutePlanner(new PinnedRoutePlanner(proxy, true))
         .disableContentCompression()
-        .disableRedirectHandling();
+        .disableRedirectHandling()
+        // See buildDirect(): implicit retries amplify hang-induced thread starvation.
+        .disableAutomaticRetries();
     if (config.authenticated()) {
       BasicCredentialsProvider credentials = new BasicCredentialsProvider();
       credentials.setCredentials(
@@ -402,6 +408,8 @@ public class ProxiedHttpClientFactory implements AutoCloseable {
         .setRoutePlanner(new PinnedRoutePlanner(null, true))
         .disableContentCompression()
         .disableRedirectHandling()
+        // See buildDirect(): implicit retries amplify hang-induced thread starvation.
+        .disableAutomaticRetries()
         .build();
   }
 

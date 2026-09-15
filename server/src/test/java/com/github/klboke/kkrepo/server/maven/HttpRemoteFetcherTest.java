@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyMap;
@@ -81,7 +82,7 @@ class HttpRemoteFetcherTest {
     assertEquals(HttpClient.Version.HTTP_2, HttpRemoteFetcher.httpVersion("2"));
 
     HttpRemoteFetcher fetcher = new HttpRemoteFetcher(
-        null, null, null, "HTTP_2", 11, 22, 33, 7, 1);
+        null, null, null, "HTTP_2", 11, 22, 33, 7, 1, 16);
     assertEquals(
         Duration.ofSeconds(33),
         fetcher.requestTimeout(HttpRemoteFetcher.Request.get("https://repo.example/artifact.jar")));
@@ -101,7 +102,7 @@ class HttpRemoteFetcherTest {
 
   @Test
   void requestTimeoutUsesSharedProxyDefaults() {
-    HttpRemoteFetcher fetcher = new HttpRemoteFetcher(null, null, null, "HTTP_1_1", 11, 22, 33, 7, 1);
+    HttpRemoteFetcher fetcher = new HttpRemoteFetcher(null, null, null, "HTTP_1_1", 11, 22, 33, 7, 1, 16);
 
     assertEquals(
         Duration.ofSeconds(11),
@@ -347,7 +348,7 @@ class HttpRemoteFetcherTest {
         });
     HttpRemoteFetcher fetcher = new HttpRemoteFetcher(
         OutboundRequestPolicy.allowPrivateForTests(), null, transport,
-        "HTTP_1_1", 30, 60, 300, 2, 1);
+        "HTTP_1_1", 30, 60, 300, 2, 1, 16);
     HttpRemoteFetcher.Request request = HttpRemoteFetcher.Request
         .get("http://localhost/artifact.jar")
         .withRepository(runtime("http://localhost", "robot", "secret", null));
@@ -390,7 +391,7 @@ class HttpRemoteFetcherTest {
         });
     HttpRemoteFetcher fetcher = new HttpRemoteFetcher(
         OutboundRequestPolicy.allowPrivateForTests(), null, transport,
-        "HTTP_1_1", 30, 60, 300, 3, 1);
+        "HTTP_1_1", 30, 60, 300, 3, 1, 16);
     HttpRemoteFetcher.Request request = HttpRemoteFetcher.Request
         .get("http://localhost/artifact.jar")
         .withRepository(runtime("http://localhost", "robot", "secret", null));
@@ -636,6 +637,71 @@ class HttpRemoteFetcherTest {
         200,
         Map.of(),
         new ByteArrayInputStream(body.getBytes(StandardCharsets.UTF_8)));
+  }
+
+  @Test
+  void fetchGateExhaustionFailsFastWithoutTouchingTransport() throws Exception {
+    // Max 2 in-flight fetches per repository; three concurrent fetches must reject the third
+    // before any network work, and closing the first two results must release their permits.
+    ProxiedHttpClientFactory transport = mock(ProxiedHttpClientFactory.class);
+    when(transport.execute(
+        nullable(String.class),
+        nullable(OutboundProxyConfig.class),
+        eq("GET"),
+        any(OutboundRequestPolicy.ResolvedHttpTarget.class),
+        anyMap(),
+        nullable(byte[].class),
+        anyLong()))
+        .thenAnswer(ignored -> response(200, Map.of(), "artifact"));
+    HttpRemoteFetcher fetcher = new HttpRemoteFetcher(
+        OutboundRequestPolicy.allowPrivateForTests(), null, transport,
+        "HTTP_1_1", 30, 15, 30, 2, 1, 2);
+    HttpRemoteFetcher.Request request = HttpRemoteFetcher.Request
+        .get("https://localhost/maven2/artifact.jar")
+        .withRepository(runtime("https://localhost/maven2", null, null, null));
+
+    HttpRemoteFetcher.Result first = fetcher.fetch(request);
+    HttpRemoteFetcher.Result second = fetcher.fetch(request);
+    IOException exhausted = assertThrows(IOException.class, () -> fetcher.fetch(request));
+    assertTrue(exhausted.getMessage().contains("gate exhausted"));
+
+    first.close();
+    try (HttpRemoteFetcher.Result reused = fetcher.fetch(request)) {
+      assertEquals(200, reused.status());
+    }
+    second.close();
+
+    // A different repository is gated independently. Reuse localhost (no DNS needed) under a
+    // request without repository identity — ungated requests bypass the bulkhead entirely.
+    HttpRemoteFetcher.Request untagged = HttpRemoteFetcher.Request
+        .get("https://localhost/maven2/other-artifact.jar");
+    try (HttpRemoteFetcher.Result unblocked = fetcher.fetch(untagged)) {
+      assertEquals(200, unblocked.status());
+    }
+  }
+
+  @Test
+  void fetchGateReleasesPermitWhenFetchFails() throws Exception {
+    ProxiedHttpClientFactory transport = mock(ProxiedHttpClientFactory.class);
+    when(transport.execute(
+        nullable(String.class),
+        nullable(OutboundProxyConfig.class),
+        eq("GET"),
+        any(OutboundRequestPolicy.ResolvedHttpTarget.class),
+        anyMap(),
+        nullable(byte[].class),
+        anyLong()))
+        .thenThrow(new IOException("upstream hang"));
+    HttpRemoteFetcher fetcher = new HttpRemoteFetcher(
+        OutboundRequestPolicy.allowPrivateForTests(), null, transport,
+        "HTTP_1_1", 30, 15, 30, 2, 1, 1);
+    HttpRemoteFetcher.Request request = HttpRemoteFetcher.Request
+        .get("https://localhost/maven2/artifact.jar")
+        .withRepository(runtime("https://localhost/maven2", null, null, null));
+
+    assertThrows(IOException.class, () -> fetcher.fetch(request));
+    // The failed fetch must have returned its permit, so the next attempt proceeds.
+    assertThrows(IOException.class, () -> fetcher.fetch(request));
   }
 
   private static ProxiedHttpClientFactory.ProxiedResponse response(

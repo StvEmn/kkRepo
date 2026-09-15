@@ -14,6 +14,8 @@ import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import com.github.klboke.kkrepo.cache.LocalCache;
+import com.github.klboke.kkrepo.cache.LocalCacheFactory;
 import com.github.klboke.kkrepo.server.proxy.OutboundProxyConfig;
 import com.github.klboke.kkrepo.server.proxy.ProxiedHttpClientFactory;
 import com.github.klboke.kkrepo.server.security.OutboundRequestPolicy;
@@ -36,10 +38,11 @@ public class HttpRemoteFetcher {
 
   private static final int MAX_REDIRECTS = 5;
   private static final Duration DEFAULT_SEARCH_TIMEOUT = Duration.ofSeconds(30);
-  private static final Duration DEFAULT_METADATA_TIMEOUT = Duration.ofSeconds(60);
-  private static final Duration DEFAULT_CONTENT_TIMEOUT = Duration.ofSeconds(120);
+  private static final Duration DEFAULT_METADATA_TIMEOUT = Duration.ofSeconds(15);
+  private static final Duration DEFAULT_CONTENT_TIMEOUT = Duration.ofSeconds(30);
   private static final Duration DEFAULT_HEAD_TIMEOUT = Duration.ofSeconds(5);
   private static final int DEFAULT_BODY_READ_RETRY_ATTEMPTS = 1;
+  private static final int DEFAULT_MAX_FETCHES_PER_REPOSITORY = 16;
   private static final DateTimeFormatter RFC1123 =
       DateTimeFormatter.RFC_1123_DATE_TIME.withZone(ZoneOffset.UTC);
 
@@ -51,6 +54,20 @@ public class HttpRemoteFetcher {
   private final Duration contentTimeout;
   private final Duration headTimeout;
   private final int bodyReadRetryAttempts;
+  /**
+   * Per-repository concurrency gate (bulkhead). A hanging upstream otherwise occupies one
+   * async request thread per in-flight fetch until the response timeout fires; a pnpm install
+   * fans out hundreds of concurrent fetches, exhausting the servlet/async pool and starving the
+   * admin UI (the 2026-09-15 outage). Each permit is held until the caller closes the returned
+   * {@link Result}, so slow-drip upstreams also stay accounted. Node-local only: N replicas each
+   * allow {@code maxPerRepository} in-flight upstream fetches per repository; correctness never
+   * depends on the gate (an exhausted gate fast-fails and records a circuit-breaker failure),
+   * and the limit is not shared coordination state, so the cache-module abstraction does not
+   * apply. Bound the map with a small LRU: repositories are few (tens), and evicting an idle
+   * entry only re-creates its semaphore on next use.
+   */
+  private final LocalCache<String, java.util.concurrent.Semaphore> repositoryFetchGates;
+  private final int maxPerRepository;
 
   public HttpRemoteFetcher(OutboundRequestPolicy outboundPolicy) {
     this(outboundPolicy, null);
@@ -66,7 +83,8 @@ public class HttpRemoteFetcher {
         DEFAULT_METADATA_TIMEOUT.toSeconds(),
         DEFAULT_CONTENT_TIMEOUT.toSeconds(),
         DEFAULT_HEAD_TIMEOUT.toSeconds(),
-        DEFAULT_BODY_READ_RETRY_ATTEMPTS);
+        DEFAULT_BODY_READ_RETRY_ATTEMPTS,
+        DEFAULT_MAX_FETCHES_PER_REPOSITORY);
   }
 
   @Autowired
@@ -76,10 +94,11 @@ public class HttpRemoteFetcher {
       ProxiedHttpClientFactory proxyFactory,
       @Value("${kkrepo.proxy.remote-http-version:HTTP_1_1}") String remoteHttpVersion,
       @Value("${kkrepo.proxy.search-timeout-seconds:30}") long searchTimeoutSeconds,
-      @Value("${kkrepo.proxy.metadata-timeout-seconds:60}") long metadataTimeoutSeconds,
-      @Value("${kkrepo.proxy.content-timeout-seconds:${kkrepo.proxy.get-timeout-seconds:120}}") long contentTimeoutSeconds,
+      @Value("${kkrepo.proxy.metadata-timeout-seconds:15}") long metadataTimeoutSeconds,
+      @Value("${kkrepo.proxy.content-timeout-seconds:${kkrepo.proxy.get-timeout-seconds:30}}") long contentTimeoutSeconds,
       @Value("${kkrepo.proxy.head-timeout-seconds:5}") long headTimeoutSeconds,
-      @Value("${kkrepo.proxy.body-read-retry-attempts:1}") int bodyReadRetryAttempts) {
+      @Value("${kkrepo.proxy.body-read-retry-attempts:1}") int bodyReadRetryAttempts,
+      @Value("${kkrepo.proxy.max-fetches-per-repository:16}") int maxPerRepository) {
     this.outboundPolicy = outboundPolicy;
     this.metrics = metrics;
     this.proxyFactory = proxyFactory;
@@ -88,6 +107,11 @@ public class HttpRemoteFetcher {
     this.contentTimeout = Duration.ofSeconds(Math.max(1L, contentTimeoutSeconds));
     this.headTimeout = Duration.ofSeconds(Math.max(1L, headTimeoutSeconds));
     this.bodyReadRetryAttempts = Math.max(0, bodyReadRetryAttempts);
+    this.maxPerRepository = Math.max(1, maxPerRepository);
+    this.repositoryFetchGates = LocalCacheFactory.standard()
+        .<String, java.util.concurrent.Semaphore>builder("proxy-fetch-gates")
+        .maximumSize(256)
+        .build();
     if (httpVersion(remoteHttpVersion) == HttpClient.Version.HTTP_2) {
       log.warn(
           "kkrepo.proxy.remote-http-version=HTTP_2 is ignored because DNS-pinned outbound "
@@ -98,11 +122,11 @@ public class HttpRemoteFetcher {
   /** Issues a conditional GET (or HEAD) and returns the streaming body for the caller to drain. */
   public Result fetch(Request req) throws IOException {
     if (metrics == null) {
-      return fetchInternal(req, 0);
+      return gatedFetch(req);
     }
     Timer.Sample sample = metrics.startTimer();
     try {
-      Result result = fetchInternal(req, 0);
+      Result result = gatedFetch(req);
       metrics.recordProxyRemote(
           req.repository(),
           req.format(),
@@ -122,6 +146,39 @@ public class HttpRemoteFetcher {
           e,
           sample);
       throw e;
+    }
+  }
+
+  /**
+   * Applies the per-repository bulkhead before any network work. Gate exhaustion is an upstream
+   * capacity signal: fail fast with a retryable IO error so the caller's circuit breaker records
+   * a failure and opens, instead of queueing another thread behind a hanging remote.
+   */
+  private Result gatedFetch(Request req) throws IOException {
+    String repository = req.repository();
+    if (repository == null || repository.isBlank()) {
+      return fetchInternal(req, 0);
+    }
+    java.util.concurrent.Semaphore gate =
+        repositoryFetchGates.get(repository, key -> new java.util.concurrent.Semaphore(maxPerRepository));
+    if (!gate.tryAcquire()) {
+      throw new IOException("Upstream fetch gate exhausted for repository " + repository
+          + " (" + maxPerRepository + " in-flight fetches)");
+    }
+    boolean gated = false;
+    try {
+      Result result = fetchInternal(req, 0);
+      // Hold the permit until the caller closes the body: redirects resolve inside fetchInternal
+      // (one permit covers the whole chain), and the body streams after this method returns, so
+      // the gate must be released by the body's close(), not here.
+      InputStream gatedBody = new GateReleasingInputStream(result.body(), gate);
+      result = new Result(result.status(), result.headers(), gatedBody);
+      gated = true;
+      return result;
+    } finally {
+      if (!gated) {
+        gate.release();
+      }
     }
   }
 
@@ -312,6 +369,35 @@ public class HttpRemoteFetcher {
     return message == null || message.isBlank()
         ? error.getClass().getSimpleName()
         : message;
+  }
+
+  /**
+   * Releases the per-repository bulkhead permit when the caller closes the wrapped result.
+   * {@link Result} is a record (not extendable), so the gate rides on the body stream: every
+   * Result handed out by {@link #fetchInternal} has its body wrapped by releaseOnClose, which
+   * guarantees close() runs even for entity-less responses (HEAD, 304, errors), so the permit
+   * is always released exactly once.
+   */
+  private static final class GateReleasingInputStream extends java.io.FilterInputStream {
+    private final java.util.concurrent.Semaphore gate;
+    private boolean released;
+
+    GateReleasingInputStream(InputStream delegate, java.util.concurrent.Semaphore gate) {
+      super(delegate);
+      this.gate = gate;
+    }
+
+    @Override
+    public void close() throws IOException {
+      try {
+        super.close();
+      } finally {
+        if (!released) {
+          released = true;
+          gate.release();
+        }
+      }
+    }
   }
 
   @FunctionalInterface

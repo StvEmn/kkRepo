@@ -238,7 +238,8 @@ class MavenProxyServiceTest {
         60,
         300,
         5,
-        1);
+        1,
+        16);
     CountingBlobStorage storage = new CountingBlobStorage();
     TempFileWriter writer = new TempFileWriter();
     RecordingProxyStateDao proxyState = new RecordingProxyStateDao();
