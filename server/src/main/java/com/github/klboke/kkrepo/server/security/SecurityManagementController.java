@@ -6,8 +6,6 @@ import com.github.klboke.kkrepo.server.security.SecurityPayloads.AdminBootstrapC
 import com.github.klboke.kkrepo.server.security.SecurityPayloads.AdminBootstrapStatus;
 import com.github.klboke.kkrepo.server.security.SecurityPayloads.AnonymousSettingsCommand;
 import com.github.klboke.kkrepo.server.security.SecurityPayloads.AnonymousSettingsView;
-import com.github.klboke.kkrepo.server.security.SecurityPayloads.ContentSelectorCommand;
-import com.github.klboke.kkrepo.server.security.SecurityPayloads.ContentSelectorView;
 import com.github.klboke.kkrepo.server.security.SecurityPayloads.CreatedApiKeyView;
 import com.github.klboke.kkrepo.server.security.SecurityPayloads.LdapSettingsCommand;
 import com.github.klboke.kkrepo.server.security.SecurityPayloads.LdapSettingsView;
@@ -17,8 +15,6 @@ import com.github.klboke.kkrepo.server.security.SecurityPayloads.PrivilegeComman
 import com.github.klboke.kkrepo.server.security.SecurityPayloads.PrivilegeView;
 import com.github.klboke.kkrepo.server.security.SecurityPayloads.RealmCommand;
 import com.github.klboke.kkrepo.server.security.SecurityPayloads.RealmView;
-import com.github.klboke.kkrepo.server.security.SecurityPayloads.RepositoryTargetCommand;
-import com.github.klboke.kkrepo.server.security.SecurityPayloads.RepositoryTargetView;
 import com.github.klboke.kkrepo.server.security.SecurityPayloads.RoleCommand;
 import com.github.klboke.kkrepo.server.security.SecurityPayloads.RoleView;
 import com.github.klboke.kkrepo.server.security.SecurityPayloads.SecuritySummary;
@@ -26,9 +22,7 @@ import com.github.klboke.kkrepo.server.security.SecurityPayloads.SessionView;
 import com.github.klboke.kkrepo.server.security.SecurityPayloads.UserCommand;
 import com.github.klboke.kkrepo.server.security.SecurityPayloads.UserView;
 import jakarta.servlet.http.HttpServletRequest;
-import java.util.Collection;
 import java.util.List;
-import java.util.Map;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -177,60 +171,6 @@ public class SecurityManagementController {
     securityService.deletePrivilege(privilegeId);
   }
 
-  @GetMapping("/content-selectors")
-  public List<ContentSelectorView> contentSelectors() {
-    return securityService.listRepositoryTargets().stream()
-        .filter(this::isContentSelector)
-        .map(this::toContentSelectorView)
-        .toList();
-  }
-
-  @PostMapping("/content-selectors")
-  public ContentSelectorView createContentSelector(@RequestBody ContentSelectorCommand command) {
-    String name = requireText(command.name(), "name");
-    if (securityService.findRepositoryTarget(name).filter(this::isContentSelector).isPresent()) {
-      throw new SecurityValidationException("Content selector already exists: " + name);
-    }
-    requireText(command.expression(), "expression");
-    RepositoryTargetView saved = securityService.saveRepositoryTarget(
-        new RepositoryTargetCommand(name, name, "*", command.expression(), List.of(),
-            Map.of("source", "nexus-content-selector", "type", "csel",
-                "description", defaultString(command.description(), ""))));
-    return toContentSelectorView(saved);
-  }
-
-  @PutMapping("/content-selectors/{name}")
-  public ContentSelectorView updateContentSelector(
-      @PathVariable("name") String name,
-      @RequestBody ContentSelectorCommand command) {
-    RepositoryTargetView existing = securityService.findRepositoryTarget(name)
-        .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Content selector not found: " + name));
-    if (!isContentSelector(existing)) {
-      throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Content selector not found: " + name);
-    }
-    requireText(command.expression(), "expression");
-    String type = contentSelectorType(existing);
-    RepositoryTargetView saved = securityService.saveRepositoryTarget(
-        new RepositoryTargetCommand(name, name, "*", command.expression(), List.of(),
-            Map.of("source", "nexus-content-selector", "type", type,
-                "description", defaultString(command.description(), ""))));
-    return toContentSelectorView(saved);
-  }
-
-  @DeleteMapping("/content-selectors/{name}")
-  public void deleteContentSelector(@PathVariable("name") String name) {
-    RepositoryTargetView existing = securityService.findRepositoryTarget(name)
-        .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Content selector not found: " + name));
-    if (!isContentSelector(existing)) {
-      throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Content selector not found: " + name);
-    }
-    List<String> usedBy = contentSelectorUsedBy(name);
-    if (!usedBy.isEmpty()) {
-      throw new SecurityValidationException("Selector is used by privileges: " + String.join(", ", usedBy));
-    }
-    securityService.deleteRepositoryTarget(name);
-  }
-
   @GetMapping("/realms")
   public List<RealmView> realms() {
     return securityService.listRealms();
@@ -322,74 +262,5 @@ public class SecurityManagementController {
       return authenticated;
     }
     throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Authentication required");
-  }
-
-  private boolean isContentSelector(RepositoryTargetView target) {
-    Map<String, Object> attributes = target.attributes() == null ? Map.of() : target.attributes();
-    String source = asString(attributes.get("source"));
-    if ("nexus-content-selector".equals(source)) {
-      return true;
-    }
-    String type = asString(attributes.get("type"));
-    return type != null
-        && target.contentExpression() != null
-        && (target.pathPatterns() == null || target.pathPatterns().isEmpty());
-  }
-
-  private ContentSelectorView toContentSelectorView(RepositoryTargetView target) {
-    Map<String, Object> attributes = target.attributes() == null ? Map.of() : target.attributes();
-    String description = asString(attributes.get("description"));
-    return new ContentSelectorView(
-        target.targetId(),
-        description,
-        target.contentExpression());
-  }
-
-  private String contentSelectorType(RepositoryTargetView target) {
-    Map<String, Object> attributes = target.attributes() == null ? Map.of() : target.attributes();
-    String type = asString(attributes.get("type"));
-    return type != null ? type : "csel";
-  }
-
-  private List<String> contentSelectorUsedBy(String selectorName) {
-    return securityService.listPrivileges().stream()
-        .filter(privilege -> "repository-content-selector".equals(
-            privilege.type() != null ? privilege.type() : ""))
-        .filter(privilege -> selectorName.equals(contentSelectorName(
-            privilege.properties() == null ? Map.of() : privilege.properties())))
-        .map(privilege -> privilege.name() != null ? privilege.name() : privilege.privilegeId())
-        .toList();
-  }
-
-  private static String contentSelectorName(Map<String, Object> properties) {
-    return asString(firstPresent(properties, "contentSelector", "selector", "selectorName", "contentSelectorName"));
-  }
-
-  private static Object firstPresent(Map<String, Object> map, String... keys) {
-    for (String key : keys) {
-      Object value = map.get(key);
-      if (value != null) return value;
-    }
-    return null;
-  }
-
-  private static String asString(Object value) {
-    if (value instanceof Collection<?> values) {
-      return String.join(",", values.stream().map(String::valueOf).toList());
-    }
-    return value == null ? null : String.valueOf(value);
-  }
-
-  private static String requireText(String value, String field) {
-    String normalized = value == null ? null : value.isBlank() ? null : value;
-    if (normalized == null) {
-      throw new SecurityValidationException(field + " is required");
-    }
-    return normalized;
-  }
-
-  private static String defaultString(String value, String fallback) {
-    String normalized = value == null ? null : value.isBlank() ? null : value;
-    return normalized != null ? normalized : fallback;
   }
 }

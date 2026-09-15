@@ -50,7 +50,6 @@ let fieldHelpHideTimer = null;
 let securityUsers = [];
 let securityRoles = [];
 let securityPrivileges = [];
-let securitySelectors = [];
 let securityRealms = [];
 let securityLdap = null;
 let securityOidc = null;
@@ -173,7 +172,6 @@ const viewHashRoutes = {
   "security-users": "#admin/security/users",
   "security-roles": "#admin/security/roles",
   "security-privileges": "#admin/security/privileges",
-  "security-selectors": "#admin/security/selectors",
   "security-realms": "#admin/security/realms",
   "security-ldap": "#admin/security/ldap",
   "security-oidc": "#admin/security/oidc",
@@ -201,8 +199,6 @@ const hashViewRoutes = {
   "#admin/security/users": "security-users",
   "#admin/security/roles": "security-roles",
   "#admin/security/privileges": "security-privileges",
-  "#admin/security/selectors": "security-selectors",
-  "#admin/security/content-selectors": "security-selectors",
   "#admin/security/realms": "security-realms",
   "#admin/security/ldap": "security-ldap",
   "#admin/security/oidc": "security-oidc",
@@ -440,11 +436,6 @@ const securityRoleRequiredFields = [
 const securityPrivilegeRequiredFields = [
   { id: "security-privilege-id", label: "Privilege ID" }
 ];
-const securitySelectorRequiredFields = [
-  { id: "security-selector-name", label: "Name" },
-  { id: "security-selector-expression", label: "Expression" }
-];
-let securitySelectorMode = "create";
 const ldapRequiredFields = [
   {
     id: "security-ldap-url",
@@ -3863,84 +3854,6 @@ async function deleteSecurityPrivilege(privilegeId) {
     if (!response.ok) throw new Error(await responseErrorMessage(response));
     await loadSecurityPrivileges();
     showToast("Privilege deleted.", "ok");
-  } catch (error) {
-    showToast(`Delete failed: ${error.message}`, "error");
-  }
-}
-
-async function loadSecuritySelectors() {
-  securitySelectors = await fetchJson("/internal/security/content-selectors", [], "Failed to load content selectors");
-  renderSecuritySelectors();
-}
-
-function renderSecuritySelectors() {
-  const filter = filterValue("security-selector-filter");
-  const rows = securitySelectors.filter((selector) =>
-    listContainsFilter([selector.name, selector.description, selector.expression], filter))
-    .map((selector) => `
-      <tr>
-        <td>${escapeHtml(selector.name)}</td>
-        <td>${escapeHtml(selector.description || "")}</td>
-        <td><code>${escapeHtml(selector.expression || "")}</code></td>
-        <td class="actions-column">
-          <button class="row-action edit-security-selector-button" data-name="${escapeHtml(selector.name)}" type="button">edit</button>
-          <button class="row-action delete-security-selector-button" data-name="${escapeHtml(selector.name)}" type="button">delete</button>
-        </td>
-      </tr>
-    `).join("");
-  document.getElementById("security-selector-table").innerHTML = rows
-    || '<tr><td colspan="4" class="placeholder">No content selectors.</td></tr>';
-}
-
-function showSecuritySelectorForm(selector = null) {
-  securitySelectorMode = selector ? "edit" : "create";
-  document.getElementById("security-selector-form-title").textContent = selector ? `Edit selector: ${selector.name}` : "Create selector";
-  document.getElementById("security-selector-name").value = selector?.name || "";
-  document.getElementById("security-selector-name").disabled = Boolean(selector);
-  document.getElementById("security-selector-description").value = selector?.description || "";
-  document.getElementById("security-selector-expression").value = selector?.expression || "";
-  clearRequiredFieldErrors(securitySelectorRequiredFields);
-  openFormModal("security-selector-form", selector ? "security-selector-description" : "security-selector-name");
-}
-
-function hideSecuritySelectorForm() {
-  closeFormModal("security-selector-form");
-  document.getElementById("security-selector-name").disabled = false;
-  clearRequiredFieldErrors(securitySelectorRequiredFields);
-}
-
-async function saveSecuritySelector() {
-  if (!validateRequiredFields(securitySelectorRequiredFields)) return;
-  const payload = {
-    name: document.getElementById("security-selector-name").value.trim(),
-    description: document.getElementById("security-selector-description").value.trim() || null,
-    expression: document.getElementById("security-selector-expression").value.trim()
-  };
-  const path = securitySelectorMode === "edit"
-    ? `/internal/security/content-selectors/${encodeURIComponent(payload.name)}`
-    : "/internal/security/content-selectors";
-  try {
-    const response = await fetch(path, {
-      method: securitySelectorMode === "edit" ? "PUT" : "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    });
-    if (!response.ok) throw new Error(await responseErrorMessage(response));
-    hideSecuritySelectorForm();
-    await loadSecuritySelectors();
-    showToast("Content selector saved.", "ok");
-  } catch (error) {
-    showToast(`Save failed: ${error.message}`, "error");
-  }
-}
-
-async function deleteSecuritySelector(name) {
-  if (!confirm(`Delete content selector "${name}"?`)) return;
-  try {
-    const response = await fetch(`/internal/security/content-selectors/${encodeURIComponent(name)}`, { method: "DELETE" });
-    if (!response.ok) throw new Error(await responseErrorMessage(response));
-    await loadSecuritySelectors();
-    showToast("Content selector deleted.", "ok");
   } catch (error) {
     showToast(`Delete failed: ${error.message}`, "error");
   }
@@ -7513,7 +7426,6 @@ function switchView(view, options = {}) {
   if (view === "security-users") loadSecurityUsers();
   if (view === "security-roles") loadSecurityRoles();
   if (view === "security-privileges") loadSecurityPrivileges();
-  if (view === "security-selectors") loadSecuritySelectors();
   if (view === "security-realms") loadSecurityRealms();
   if (view === "security-ldap") loadSecurityLdap();
   if (view === "security-oidc") loadSecurityOidc();
@@ -7929,26 +7841,6 @@ document.getElementById("security-privilege-table").addEventListener("click", (e
   }
   const deleteButton = event.target.closest(".delete-security-privilege-button");
   if (deleteButton) deleteSecurityPrivilege(deleteButton.dataset.id);
-});
-
-document.getElementById("security-selector-filter").addEventListener("input", renderSecuritySelectors);
-document.getElementById("create-security-selector-button").addEventListener("click", () => showSecuritySelectorForm());
-document.getElementById("cancel-security-selector-button").addEventListener("click", hideSecuritySelectorForm);
-document.getElementById("save-security-selector-button").addEventListener("click", saveSecuritySelector);
-document.getElementById("security-selector-form").addEventListener("submit", (event) => {
-  event.preventDefault();
-  saveSecuritySelector();
-});
-bindRequiredFieldErrors(securitySelectorRequiredFields);
-document.getElementById("security-selector-table").addEventListener("click", (event) => {
-  const editButton = event.target.closest(".edit-security-selector-button");
-  if (editButton) {
-    const selector = securitySelectors.find((item) => item.name === editButton.dataset.name);
-    if (selector) showSecuritySelectorForm(selector);
-    return;
-  }
-  const deleteButton = event.target.closest(".delete-security-selector-button");
-  if (deleteButton) deleteSecuritySelector(deleteButton.dataset.name);
 });
 
 document.getElementById("save-security-realms-button").addEventListener("click", saveSecurityRealms);

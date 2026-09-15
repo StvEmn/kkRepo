@@ -333,16 +333,4 @@ public final class SecurityPayloads {
       int activeRealms,
       int apiKeys) {
   }
-
-  public record ContentSelectorCommand(
-      String name,
-      String description,
-      String expression) {
-  }
-
-  public record ContentSelectorView(
-      String name,
-      String description,
-      String expression) {
-  }
 }
