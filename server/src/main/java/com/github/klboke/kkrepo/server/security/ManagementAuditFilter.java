@@ -1,5 +1,6 @@
 package com.github.klboke.kkrepo.server.security;
 
+import com.github.klboke.kkrepo.server.config.RepositoryUrlPrefix;
 import com.github.klboke.kkrepo.core.RepositoryFormat;
 import com.github.klboke.kkrepo.persistence.jdbc.api.SecurityAuditDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.SecurityAuditDao.AuditLogRecord;
@@ -22,6 +23,9 @@ import org.springframework.web.filter.OncePerRequestFilter;
 @Component
 @Order(ManagementAuditFilter.FILTER_ORDER)
 public class ManagementAuditFilter extends OncePerRequestFilter {
+  /** Trusted operation details supplied by management controllers, never request parameters. */
+  public static final String OPERATION_DETAILS_ATTRIBUTE =
+      ManagementAuditFilter.class.getName() + ".OPERATION_DETAILS";
   static final int FILTER_ORDER = SessionRepositoryFilter.DEFAULT_ORDER + 9;
   private static final Set<String> READ_METHODS = Set.of("GET", "HEAD", "OPTIONS", "TRACE");
 
@@ -44,7 +48,9 @@ public class ManagementAuditFilter extends OncePerRequestFilter {
       HttpServletResponse response,
       FilterChain filterChain) throws ServletException, IOException {
     boolean managementMutation = auditedMutation(request);
-    if (!managementMutation && !possibleRepositoryPublish(request)) {
+    boolean componentUpload = "POST".equals(request.getMethod())
+        && "/service/rest/v1/components".equals(stripContextPath(request));
+    if (!managementMutation && !possibleRepositoryPublish(request) && !componentUpload) {
       filterChain.doFilter(request, response);
       return;
     }
@@ -57,7 +63,10 @@ public class ManagementAuditFilter extends OncePerRequestFilter {
       failure = e;
       throw e;
     } finally {
-      if (managementMutation || swiftRepositoryPublish(request)) {
+      if (managementMutation || auditedRepositoryMutation(request)
+          || componentUpload
+              && request.getAttribute(RepositorySecurityFilter.REPOSITORY_RECORD_ATTRIBUTE) instanceof RepositoryRecord repository
+              && repository.format() == RepositoryFormat.OHPM) {
         record(request, wrapped.status(), failure);
       }
     }
@@ -90,23 +99,26 @@ public class ManagementAuditFilter extends OncePerRequestFilter {
     if (READ_METHODS.contains(method)) {
       return false;
     }
-    String uri = stripContextPath(request);
+    String uri = SecurityRequestPath.matchingPath(request);
     return uri.startsWith("/internal/")
+        || uri.equals("/service/rest/v1/routing-rules")
+        || uri.startsWith("/service/rest/v1/routing-rules/")
         || uri.startsWith("/service/rest/v1/security/")
         || uri.startsWith("/service/rest/v1/assets/")
         || legacyUi.auditedMutationPath(uri);
   }
 
   private static boolean possibleRepositoryPublish(HttpServletRequest request) {
-    return "PUT".equalsIgnoreCase(request.getMethod())
-        && stripContextPath(request).startsWith("/repository/");
+    return Set.of("PUT", "POST", "DELETE").contains(request.getMethod())
+        && stripContextPath(request).startsWith(RepositoryUrlPrefix.path(request));
   }
 
-  private static boolean swiftRepositoryPublish(HttpServletRequest request) {
+  private static boolean auditedRepositoryMutation(HttpServletRequest request) {
     Object value = request.getAttribute(RepositorySecurityFilter.REPOSITORY_RECORD_ATTRIBUTE);
     return possibleRepositoryPublish(request)
         && value instanceof RepositoryRecord repository
-        && repository.format() == RepositoryFormat.SWIFT;
+        && (repository.format() == RepositoryFormat.OHPM
+            || repository.format() == RepositoryFormat.SWIFT && "PUT".equalsIgnoreCase(request.getMethod()));
   }
 
   private static Map<String, Object> auditDetails(
@@ -123,6 +135,11 @@ public class ManagementAuditFilter extends OncePerRequestFilter {
       if (segments.length == 6 && "repository".equals(segments[1])) {
         details.put("coordinate", segments[3] + "." + segments[4] + "@" + segments[5]);
       }
+    }
+    if (request.getAttribute(OPERATION_DETAILS_ATTRIBUTE) instanceof Map<?, ?> operationDetails) {
+      operationDetails.forEach((key, detail) -> {
+        if (key instanceof String name && detail != null) details.put(name, detail);
+      });
     }
     if (failure != null) {
       details.put("error", failure.getClass().getSimpleName());
@@ -150,11 +167,7 @@ public class ManagementAuditFilter extends OncePerRequestFilter {
   }
 
   private static String remoteAddress(HttpServletRequest request, ForwardedHeaderPolicy forwardedHeaderPolicy) {
-    String forwarded = forwardedHeaderPolicy.trusted(request) ? request.getHeader("X-Forwarded-For") : null;
-    if (forwarded != null && !forwarded.isBlank()) {
-      return forwarded.split(",", 2)[0].trim();
-    }
-    return request.getRemoteAddr();
+    return forwardedHeaderPolicy.clientAddress(request);
   }
 
   private static class StatusCaptureResponse extends HttpServletResponseWrapper {

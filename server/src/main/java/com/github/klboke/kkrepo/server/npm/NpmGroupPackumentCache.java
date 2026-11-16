@@ -6,6 +6,7 @@ import com.github.klboke.kkrepo.persistence.jdbc.api.model.AssetRecord;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.RepositoryRecord;
 import com.github.klboke.kkrepo.protocol.npm.NpmPackageId;
 import com.github.klboke.kkrepo.server.cache.AssetMetadataCache;
+import com.github.klboke.kkrepo.server.cache.CacheInvalidation;
 import com.github.klboke.kkrepo.server.cache.CachedAssetMetadata;
 import com.github.klboke.kkrepo.server.cache.NexusCacheType;
 import com.github.klboke.kkrepo.server.cache.NexusLikeCacheController;
@@ -20,12 +21,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Consumer;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.support.TransactionSynchronization;
-import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 /**
  * Nexus-like cache metadata for npm group package roots.
@@ -39,8 +36,9 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  */
 @Service
 public class NpmGroupPackumentCache {
-  private static final Logger log = LoggerFactory.getLogger(NpmGroupPackumentCache.class);
   private static final String VARIANT_ATTRIBUTE = "packumentVariant";
+  private static final String TARBALL_PROJECTION_ATTRIBUTE = "npmTarballProjection";
+  private static final String TARBALL_PROJECTION = "relative-v1";
   private static final String POLICY_VALID_UNTIL_ATTRIBUTE = "minimumReleaseAgeValidUntil";
   private static final Object PENDING_MEMBERS_KEY =
       NpmGroupPackumentCache.class.getName() + ".PENDING_MEMBERS";
@@ -100,6 +98,12 @@ public class NpmGroupPackumentCache {
     if (!variant.assetKind().equals(snapshot.kind())) {
       return Optional.empty();
     }
+    // Older replicas stored external context paths in the shared blob. Rebuild those snapshots
+    // before extracting suffixes, including when an older writer replaces a blob during rollout.
+    if (snapshot.attributes() == null
+        || !TARBALL_PROJECTION.equals(snapshot.attributes().get(TARBALL_PROJECTION_ATTRIBUTE))) {
+      return Optional.empty();
+    }
     Instant policyValidUntil = instantAttribute(
         snapshot.attributes(), POLICY_VALID_UNTIL_ATTRIBUTE);
     if (policyValidUntil != null && !now.isBefore(policyValidUntil)) {
@@ -138,6 +142,7 @@ public class NpmGroupPackumentCache {
     }
     Map<String, Object> base = new LinkedHashMap<>();
     base.put(VARIANT_ATTRIBUTE, variant.name());
+    base.put(TARBALL_PROJECTION_ATTRIBUTE, TARBALL_PROJECTION);
     if (minimumReleaseAgeValidUntil != null) {
       base.put(POLICY_VALID_UNTIL_ATTRIBUTE, minimumReleaseAgeValidUntil.toString());
     }
@@ -175,7 +180,7 @@ public class NpmGroupPackumentCache {
     if (!enabled) {
       return;
     }
-    deferAfterCommit(PENDING_MEMBERS_KEY, memberRepositoryId, this::invalidateMemberGroups);
+    deferInvalidation(PENDING_MEMBERS_KEY, memberRepositoryId, this::invalidateMemberGroups);
   }
 
   /**
@@ -190,7 +195,7 @@ public class NpmGroupPackumentCache {
       invalidateMemberAfterCommit(memberRepositoryId);
       return;
     }
-    deferAfterCommit(
+    deferInvalidation(
         PENDING_MEMBER_PACKAGES_KEY,
         new MemberPackageInvalidation(memberRepositoryId, packageId),
         this::invalidateMemberPackage);
@@ -204,7 +209,7 @@ public class NpmGroupPackumentCache {
     if (!enabled) {
       return;
     }
-    deferAfterCommit(PENDING_GROUPS_KEY, groupId, this::invalidateGroupAndAncestors);
+    deferInvalidation(PENDING_GROUPS_KEY, groupId, this::invalidateGroupAndAncestors);
   }
 
   private void invalidateMemberGroups(long memberRepositoryId) {
@@ -255,37 +260,28 @@ public class NpmGroupPackumentCache {
   }
 
   private void invalidateGroupToken(long groupId) {
-    try {
-      cacheController.invalidateAfterCommit(groupId, NexusCacheType.METADATA);
-    } catch (RuntimeException e) {
-      log.warn("Failed invalidating npm group packument token for group {}", groupId, e);
-    }
+    cacheController.invalidateAfterCommit(groupId, NexusCacheType.METADATA);
   }
 
   private void invalidateGroupPackage(long groupId, String packageId) {
-    try {
-      for (String path : cachePaths(packageId)) {
-        Optional<AssetRecord> existing = assetDao.findAssetByPath(groupId, path);
-        if (existing.isEmpty()) {
-          continue;
-        }
-        AssetRecord asset = existing.get();
-        Map<String, Object> attributes = new LinkedHashMap<>();
-        if (asset.attributes() != null) {
-          attributes.putAll(asset.attributes());
-        }
-        Instant lastVerified = NexusLikeCacheInfo.fromAttributes(attributes)
-            .map(NexusLikeCacheInfo::lastVerified)
-            .orElse(Instant.now());
-        Map<String, Object> updated = NexusLikeCacheInfo.applyToAttributes(
-            attributes,
-            new NexusLikeCacheInfo(lastVerified, NexusLikeCacheInfo.INVALIDATED, NexusCacheType.METADATA));
-        assetDao.updateAssetAttributes(asset.id(), updated);
-        assetMetadataCache.evictAfterCommit(groupId, path);
+    for (String path : cachePaths(packageId)) {
+      Optional<AssetRecord> existing = assetDao.findAssetByPath(groupId, path);
+      if (existing.isEmpty()) {
+        continue;
       }
-    } catch (RuntimeException e) {
-      log.warn("Failed invalidating npm group packument asset for group {} package {}",
-          groupId, packageId, e);
+      AssetRecord asset = existing.get();
+      Map<String, Object> attributes = new LinkedHashMap<>();
+      if (asset.attributes() != null) {
+        attributes.putAll(asset.attributes());
+      }
+      Instant lastVerified = NexusLikeCacheInfo.fromAttributes(attributes)
+          .map(NexusLikeCacheInfo::lastVerified)
+          .orElse(Instant.now());
+      Map<String, Object> updated = NexusLikeCacheInfo.applyToAttributes(
+          attributes,
+          new NexusLikeCacheInfo(lastVerified, NexusLikeCacheInfo.INVALIDATED, NexusCacheType.METADATA));
+      assetDao.updateAssetAttributes(asset.id(), updated);
+      assetMetadataCache.evictAfterCommit(groupId, path);
     }
   }
 
@@ -302,33 +298,11 @@ public class NpmGroupPackumentCache {
     }
   }
 
-  private <T> void deferAfterCommit(Object resourceKey, T item, Consumer<T> resolver) {
-    if (!TransactionSynchronizationManager.isSynchronizationActive()) {
-      resolver.accept(item);
-      return;
-    }
-    @SuppressWarnings("unchecked")
-    Set<T> pending = (Set<T>) TransactionSynchronizationManager.getResource(resourceKey);
-    if (pending == null) {
-      pending = new HashSet<>();
-      TransactionSynchronizationManager.bindResource(resourceKey, pending);
-      Set<T> snapshot = pending;
-      TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-        @Override
-        public void afterCommit() {
-          for (T pendingItem : snapshot) {
-            resolver.accept(pendingItem);
-          }
-        }
-
-        @Override
-        public void afterCompletion(int status) {
-          TransactionSynchronizationManager.unbindResourceIfPossible(resourceKey);
-        }
-      });
-    }
-    pending.add(item);
+  private <T> void deferInvalidation(Object resourceKey, T item, Consumer<T> action) {
+    CacheInvalidation.beforeCommit(new InvalidationKey(resourceKey, item), () -> action.accept(item));
   }
+
+  private record InvalidationKey(Object owner, Object item) {}
 
   private record MemberPackageInvalidation(long memberRepositoryId, String packageId) {}
 }

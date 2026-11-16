@@ -413,6 +413,7 @@ public class NexusRestClient {
           apt: 'APT',
           alpine: 'ALPINE',
           r: 'R',
+          gitlfs: 'GITLFS',
           huggingface: 'HUGGINGFACE'
         ]
         return prefixes[format]
@@ -829,6 +830,7 @@ public class NexusRestClient {
           apt: 'APT',
           alpine: 'ALPINE',
           r: 'R',
+          gitlfs: 'GITLFS',
           huggingface: 'HUGGINGFACE'
         ]
         def upperTables = []
@@ -1593,6 +1595,34 @@ public class NexusRestClient {
           if (format == 'r' && requiredColumnsPresent) {
             contentModel.formatShape = inspectRShape(tableNames)
           }
+          if (format == 'gitlfs' && requiredColumnsPresent) {
+            def valid = true
+            def count = 0
+            def statement = connection.prepareStatement('select a.path, b.blob_size, b.checksums from '
+                + tableNames.asset + ' a left join ' + tableNames.assetBlob
+                + ' b on a.asset_blob_id = b.asset_blob_id order by a.path limit 2048')
+            try {
+              def rows = statement.executeQuery()
+              try {
+                while (rows.next()) {
+                  count++
+                  def path = rows.getString(1)
+                  def size = rows.getObject(2)
+                  def rawSums = rows.getObject(3)
+                  def sums = new groovy.json.JsonSlurper().parseText(rawSums instanceof byte[]
+                      ? new String(rawSums, 'UTF-8') : String.valueOf(rawSums))
+                  def oid = path != null && path.startsWith('/') ? path.substring(1) : path
+                  valid = (valid && oid != null && (oid ==~ /[a-f0-9]{64}/)
+                      && jdkClass('java.lang.Number').isInstance(size) && size.longValue() >= 0
+                      && sums instanceof Map && String.valueOf(sums.sha256) == oid)
+                }
+              } finally { rows.close() }
+            } catch (error) {
+              valid = false
+              out.warnings << 'Git LFS content shape probe failed: ' + errorText(error)
+            } finally { statement.close() }
+            contentModel.formatShape = [oidSizeChecksumShape: valid, sampledAssets: count]
+          }
           if (format == 'huggingface' && requiredColumnsPresent) {
             contentModel.formatShape = inspectHuggingFaceShape(tableNames)
           }
@@ -1744,13 +1774,20 @@ public class NexusRestClient {
       }
       repositoryDocuments.add(new RepositoryDocument(repository, detail));
     }
+    List<Map<String, Object>> routingRules = List.of();
+    String routingRulesError = null;
+    try { routingRules = getList("/service/rest/v1/routing-rules"); }
+    catch (IOException failure) {
+      // Never turn an inaccessible policy inventory into an empty policy set.
+      routingRulesError = "Cannot read Nexus routing rules: " + failure.getMessage();
+    }
     SecurityExportResult security = readSecurityExport(probe);
     return new NexusInventory(
         getList("/service/rest/v1/blobstores"),
         repositoryDocuments,
         security.export(),
         mergeWarnings(security.warnings(), probe == null ? List.of() : probe.warnings()),
-        probe);
+        probe, routingRules, routingRulesError);
   }
 
   private SourceProbe probeSource() throws IOException, InterruptedException {
@@ -2433,13 +2470,22 @@ public class NexusRestClient {
       List<RepositoryDocument> repositories,
       NexusSecurityExport securityExport,
       List<String> warnings,
-      SourceProbe probe) {
+      SourceProbe probe,
+      List<Map<String, Object>> routingRules,
+      String routingRulesError) {
 
     public NexusInventory {
+      routingRules = routingRules == null ? List.of() : List.copyOf(routingRules);
       blobStores = blobStores == null ? List.of() : List.copyOf(blobStores);
       repositories = repositories == null ? List.of() : List.copyOf(repositories);
       securityExport = securityExport == null ? NexusSecurityExport.empty() : securityExport;
       warnings = warnings == null ? List.of() : List.copyOf(warnings);
+    }
+
+    public NexusInventory(
+        List<Map<String, Object>> blobStores, List<RepositoryDocument> repositories,
+        NexusSecurityExport securityExport, List<String> warnings, SourceProbe probe) {
+      this(blobStores, repositories, securityExport, warnings, probe, List.of(), null);
     }
 
     public NexusInventory(

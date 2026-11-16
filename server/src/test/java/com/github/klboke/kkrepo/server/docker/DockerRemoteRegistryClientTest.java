@@ -44,6 +44,144 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 class DockerRemoteRegistryClientTest {
+  @Test
+  void rangeAndIfRangeSurviveRegistryRedirectAndBearerAuthentication() throws Exception {
+    try (TestRegistry registry = TestRegistry.start()) {
+      List<String> ranges = new ArrayList<>();
+      List<String> validators = new ArrayList<>();
+      registry.server.createContext("/v2/library/test/blobs/sha256:abc", exchange -> {
+        ranges.add(exchange.getRequestHeaders().getFirst("Range"));
+        validators.add(exchange.getRequestHeaders().getFirst("If-Range"));
+        exchange.getResponseHeaders().set("Location", registry.baseUrl + "/layer");
+        exchange.sendResponseHeaders(307, -1);
+        exchange.close();
+      });
+      registry.server.createContext("/layer", exchange -> {
+        ranges.add(exchange.getRequestHeaders().getFirst("Range"));
+        validators.add(exchange.getRequestHeaders().getFirst("If-Range"));
+        if (!"Bearer scoped-token".equals(exchange.getRequestHeaders().getFirst("Authorization"))) {
+          exchange.getResponseHeaders().set("WWW-Authenticate", "Bearer realm=\"" + registry.baseUrl
+              + "/token\",service=\"registry\",scope=\"repository:library/test:pull\"");
+          exchange.sendResponseHeaders(401, -1);
+        } else {
+          exchange.getResponseHeaders().set("Content-Range", "bytes 2-4/5");
+          exchange.sendResponseHeaders(206, 3);
+          exchange.getResponseBody().write("yer".getBytes(StandardCharsets.UTF_8));
+        }
+        exchange.close();
+      });
+      registry.server.createContext("/token", exchange -> {
+        byte[] token = "{\"token\":\"scoped-token\",\"expires_in\":300}".getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", "application/json");
+        exchange.sendResponseHeaders(200, token.length);
+        exchange.getResponseBody().write(token);
+        exchange.close();
+      });
+      try (var result = client().get(runtime(registry.baseUrl, "robot", "secret"),
+          "library/test/blobs/sha256:abc", null, "application/octet-stream",
+          new HttpRemoteFetcher.ByteRange("bytes=2-", "\"layer-v1\""))) {
+        assertEquals(206, result.status());
+        assertEquals("bytes 2-4/5", result.header("Content-Range"));
+        assertEquals("yer", new String(result.body().readAllBytes(), StandardCharsets.UTF_8));
+      }
+      assertEquals(List.of("bytes=2-", "bytes=2-", "bytes=2-"), ranges);
+      assertEquals(List.of("\"layer-v1\"", "\"layer-v1\"", "\"layer-v1\""), validators);
+    }
+  }
+
+  @Test
+  void publicHttpsRedirectStreamsUnlistedCdnWithoutRegistryCredentials() throws Exception {
+    var policy = mock(OutboundRequestPolicy.class);
+    when(policy.resolvePublicHttpsTarget(anyString(), anyString())).thenAnswer(invocation -> {
+      var target = mock(OutboundRequestPolicy.ResolvedHttpTarget.class);
+      when(target.uri()).thenReturn(URI.create(invocation.getArgument(0, String.class)));
+      return target;
+    });
+    var transport = mock(ProxiedHttpClientFactory.class);
+    var redirect = mock(ProxiedHttpClientFactory.ProxiedResponse.class);
+    when(redirect.status()).thenReturn(307);
+    when(redirect.header("Location")).thenReturn("https://changing.example.org/blob");
+    var blob = mock(ProxiedHttpClientFactory.ProxiedResponse.class);
+    when(blob.status()).thenReturn(200);
+    when(blob.headers()).thenReturn(Map.of());
+    when(blob.body()).thenReturn(new ByteArrayInputStream("layer".getBytes(StandardCharsets.UTF_8)));
+    var headers = org.mockito.ArgumentCaptor.forClass(Map.class);
+    when(transport.execute(anyString(), nullable(OutboundProxyConfig.class), eq("GET"),
+        any(OutboundRequestPolicy.ResolvedHttpTarget.class), headers.capture(), anyLong()))
+        .thenReturn(redirect, blob);
+    var runtime = mock(RepositoryRuntime.class);
+    when(runtime.name()).thenReturn("docker-proxy");
+    when(runtime.proxyRemoteUrl()).thenReturn("https://registry.example.org");
+    when(runtime.proxyRemoteUsername()).thenReturn("robot");
+    when(runtime.proxyRemotePassword()).thenReturn("secret");
+    when(runtime.contentRedirectPolicy()).thenReturn(
+        com.github.klboke.kkrepo.server.security.ProxyRedirectPolicy.PUBLIC_HTTPS);
+    var client = new DockerRemoteRegistryClient(null, policy, null, true, 300, null, transport);
+    try (var result = client.get(runtime, "library/test/blobs/sha256:abc", "application/octet-stream")) {
+      assertEquals(200, result.status());
+      assertEquals("layer", new String(result.body().readAllBytes(), StandardCharsets.UTF_8));
+    }
+    assertEquals(basic("robot", "secret"), headers.getAllValues().get(0).get("Authorization"));
+    assertNull(headers.getAllValues().get(1).get("Authorization"));
+    org.mockito.Mockito.verify(policy).resolvePublicHttpsTarget("https://changing.example.org/blob", "docker remote fetch");
+  }
+
+  @Test
+  void publicHttpsDockerRedirectRejectsHttpEvenWhenAllowlisted() throws Exception {
+    var policy = mock(OutboundRequestPolicy.class);
+    when(policy.resolvePublicHttpsTarget(anyString(), anyString())).thenAnswer(invocation -> {
+      var target = mock(OutboundRequestPolicy.ResolvedHttpTarget.class);
+      when(target.uri()).thenReturn(URI.create(invocation.getArgument(0, String.class)));
+      return target;
+    });
+    var transport = mock(ProxiedHttpClientFactory.class);
+    var redirect = mock(ProxiedHttpClientFactory.ProxiedResponse.class);
+    when(redirect.status()).thenReturn(302);
+    when(redirect.header("Location")).thenReturn("http://changing.example.org/blob");
+    when(transport.execute(anyString(), nullable(OutboundProxyConfig.class), eq("GET"),
+        any(OutboundRequestPolicy.ResolvedHttpTarget.class), anyMap(), anyLong())).thenReturn(redirect);
+    var runtime = mock(RepositoryRuntime.class);
+    when(runtime.name()).thenReturn("docker-proxy");
+    when(runtime.proxyRemoteUrl()).thenReturn("https://registry.example.org");
+    when(runtime.allowedRedirectHosts()).thenReturn(Set.of("changing.example.org"));
+    when(runtime.contentRedirectPolicy()).thenReturn(
+        com.github.klboke.kkrepo.server.security.ProxyRedirectPolicy.PUBLIC_HTTPS);
+    var client = new DockerRemoteRegistryClient(null, policy, null, true, 300, null, transport);
+    assertThrows(SecurityValidationException.class,
+        () -> client.get(runtime, "library/test/blobs/sha256:abc", "application/octet-stream"));
+    org.mockito.Mockito.verify(transport).execute(anyString(), nullable(OutboundProxyConfig.class), eq("GET"),
+        any(OutboundRequestPolicy.ResolvedHttpTarget.class), anyMap(), anyLong());
+  }
+
+  @Test
+  void publicHttpsRedirectCyclesAreBoundedWithoutLeakingSignedUrls() throws Exception {
+    var policy = mock(OutboundRequestPolicy.class);
+    when(policy.resolvePublicHttpsTarget(anyString(), anyString())).thenAnswer(invocation -> {
+      var target = mock(OutboundRequestPolicy.ResolvedHttpTarget.class);
+      when(target.uri()).thenReturn(URI.create(invocation.getArgument(0, String.class)));
+      return target;
+    });
+    var transport = mock(ProxiedHttpClientFactory.class);
+    var redirect = mock(ProxiedHttpClientFactory.ProxiedResponse.class);
+    when(redirect.status()).thenReturn(307);
+    when(redirect.header("Location")).thenReturn("https://cdn.example/blob?signature=secret");
+    when(transport.execute(anyString(), nullable(OutboundProxyConfig.class), eq("GET"),
+        any(OutboundRequestPolicy.ResolvedHttpTarget.class), anyMap(), anyLong())).thenReturn(redirect);
+    var runtime = mock(RepositoryRuntime.class);
+    when(runtime.name()).thenReturn("docker-proxy");
+    when(runtime.proxyRemoteUrl()).thenReturn("https://registry.example");
+    when(runtime.contentRedirectPolicy()).thenReturn(
+        com.github.klboke.kkrepo.server.security.ProxyRedirectPolicy.PUBLIC_HTTPS);
+    var client = new DockerRemoteRegistryClient(null, policy, null, true, 300, null, transport);
+    var error = assertThrows(IOException.class,
+        () -> client.get(runtime, "library/test/blobs/sha256:abc", "application/octet-stream"));
+    assertEquals("Too many redirects fetching Docker remote from cdn.example", error.getMessage());
+    org.mockito.Mockito.verify(transport, org.mockito.Mockito.times(6)).execute(
+        anyString(), nullable(OutboundProxyConfig.class), eq("GET"),
+        any(OutboundRequestPolicy.ResolvedHttpTarget.class), anyMap(), anyLong());
+    org.mockito.Mockito.verify(redirect, org.mockito.Mockito.times(6)).close();
+  }
+
   private final ProxiedHttpClientFactory directFactory =
       new ProxiedHttpClientFactory(60000, 10000);
 
@@ -800,6 +938,39 @@ class DockerRemoteRegistryClientTest {
       assertEquals(basic("robot", "secret"), proxy.requests().get(0).header("Authorization"));
       URI redirected = URI.create(proxy.requests().get(1).target());
       assertEquals("127.0.0.1", redirected.getHost());
+      assertEquals("/layers/abc", redirected.getRawPath());
+      assertNull(proxy.requests().get(1).header("Authorization"),
+          "registry credentials must not leak to the cross-origin storage URL");
+    }
+  }
+
+  @Test
+  void proxiedWildcardRedirectStripsRegistryCredentials() throws Exception {
+    try (FakeHttpProxyServer proxy = FakeHttpProxyServer.start(request -> {
+          if (request.target().endsWith("/v2/library/nginx/blobs/sha256:abc")) {
+            return FakeHttpProxyServer.FakeResponse.status(307,
+                Map.of("Location", "http://cdn01.quay.io/layers/abc"));
+          }
+          return FakeHttpProxyServer.FakeResponse.bytes(200,
+              Map.of("Content-Type", "application/octet-stream"),
+              "layer".getBytes(StandardCharsets.UTF_8));
+        });
+        ProxiedHttpClientFactory factory = new ProxiedHttpClientFactory(60000, 10000)) {
+      DockerRemoteRegistryClient client = proxiedClient(factory);
+
+      try (HttpRemoteFetcher.Result result = client.get(
+          proxiedRuntime("http://localhost", "robot", "secret",
+              outboundProxy(proxy.port()), Set.of("*.quay.io")),
+          "library/nginx/blobs/sha256:abc",
+          "application/octet-stream")) {
+        assertEquals(200, result.status());
+        assertEquals("layer", new String(result.body().readAllBytes(), StandardCharsets.UTF_8));
+      }
+
+      assertEquals(2, proxy.requests().size());
+      assertEquals(basic("robot", "secret"), proxy.requests().get(0).header("Authorization"));
+      URI redirected = URI.create(proxy.requests().get(1).target());
+      assertEquals("cdn01.quay.io", redirected.getHost());
       assertEquals("/layers/abc", redirected.getRawPath());
       assertNull(proxy.requests().get(1).header("Authorization"),
           "registry credentials must not leak to the cross-origin storage URL");

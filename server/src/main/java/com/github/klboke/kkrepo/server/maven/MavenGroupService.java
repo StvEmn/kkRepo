@@ -1,5 +1,6 @@
 package com.github.klboke.kkrepo.server.maven;
 
+import com.github.klboke.kkrepo.server.routingrules.RepositoryRoutingPolicy;
 import com.github.klboke.kkrepo.core.BlobReference;
 import com.github.klboke.kkrepo.core.BlobStorage;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AssetDao;
@@ -15,6 +16,7 @@ import com.github.klboke.kkrepo.server.cache.NexusCacheType;
 import com.github.klboke.kkrepo.server.cache.NexusLikeCacheController;
 import com.github.klboke.kkrepo.server.cache.NexusLikeCacheInfo;
 import com.github.klboke.kkrepo.server.blob.BlobReferenceCodec;
+import com.github.klboke.kkrepo.server.releaseage.ReleaseAgeDeniedException;
 import com.github.klboke.kkrepo.server.securityscan.ArtifactDownloadPolicy;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -43,6 +45,8 @@ import org.springframework.stereotype.Service;
 @Service
 public class MavenGroupService {
   private static final Logger log = LoggerFactory.getLogger(MavenGroupService.class);
+  /** Upper bound on merged group metadata age when a member proxy hides young versions. */
+  private static final int RELEASE_AGE_GROUP_METADATA_TTL_MINUTES = 10;
   private final MavenHostedService hosted;
   private final MavenProxyService proxy;
   private final AssetDao assetDao;
@@ -128,6 +132,7 @@ public class MavenGroupService {
       return serveGroupCached(
           dispatched.entryRepositoryId(), groupCached.get(), headOnly, path);
     }
+    ReleaseAgeDeniedException quarantined = null;
     for (RepositoryRuntime member : group.members()) {
       if (dispatched.contains(member)) {
         continue;
@@ -139,11 +144,20 @@ public class MavenGroupService {
         return response;
       } catch (MavenExceptions.MavenNotFoundException ignored) {
         // try next member
-      } catch (MavenExceptions.BadUpstreamException e) {
+      } catch (ReleaseAgeDeniedException denied) {
+        // A later member (for example a hosted repository) may legitimately hold this artifact, so
+        // keep probing. If nobody serves it, the quarantine is reported instead of a plain 404.
+        if (quarantined == null) {
+          quarantined = denied;
+        }
+      } catch (MavenExceptions.BadUpstreamException | HttpRemoteFetcher.RemoteRequestRejectedException e) {
         // Nexus group repositories only return successful member responses; keep probing.
       } catch (MavenExceptions.MethodNotAllowed ignored) {
         // member doesn't serve this kind of read; skip
       }
+    }
+    if (quarantined != null) {
+      throw quarantined;
     }
     throw new MavenExceptions.MavenNotFoundException(path.path());
   }
@@ -176,6 +190,9 @@ public class MavenGroupService {
     if (cacheController != null && cacheInfo.isPresent()) {
       return !cacheController.isStale(group.id(), NexusCacheType.CONTENT, cacheInfo.get(), ttl, now);
     }
+    if (RepositoryRoutingPolicy.filtersGroup(group.id())) {
+      return false; // Legacy group cache entries lack a policy-scoped generation.
+    }
     if (snapshot.lastUpdatedAt() == null) {
       return false;
     }
@@ -195,8 +212,12 @@ public class MavenGroupService {
           path.path(),
           () -> AssetMetadataCache.Loaded.from(
               assetDao.findAssetByPath(member.id(), path.path()), assetDao));
-      memberSnapshot.ifPresent(snapshot ->
-          writer.referenceCachedAsset(group, path, snapshot, "group", member.name()));
+      // Another request may replace a nested group's row after dispatch selected its response.
+      // Only promote a source snapshot valid for this request's nested-group policy generation;
+      // never stamp bytes selected under another projection with the outer group's current token.
+      memberSnapshot.filter(snapshot -> !member.isGroup()
+              || isGroupCacheFresh(member, path, snapshot, Instant.now()))
+          .ifPresent(snapshot -> writer.referenceCachedAsset(group, path, snapshot, "group", member.name()));
     } catch (RuntimeException e) {
       log.warn("Failed writing Maven group cache for group {} member {} path {}",
           group.name(), member.name(), path.path(), e);
@@ -216,6 +237,12 @@ public class MavenGroupService {
       RepositoryRuntime group, MavenPath path, boolean headOnly, DispatchedRepositories dispatched) {
     Instant now = Instant.now();
     int ttl = group.effectiveMetadataMaxAgeMinutesOrDefault();
+    if (containsMinimumReleaseAgeProxy(group)) {
+      // A gated proxy member hides versions until they mature. Re-merge often so a version appears
+      // in the group soon after it ages in, instead of waiting out the full metadata max age.
+      ttl = ttl < 0 ? RELEASE_AGE_GROUP_METADATA_TTL_MINUTES
+          : Math.min(ttl, RELEASE_AGE_GROUP_METADATA_TTL_MINUTES);
+    }
     Optional<CachedAssetMetadata> cached = assetMetadataCache.find(
         group.id(),
         path.path(),
@@ -254,6 +281,18 @@ public class MavenGroupService {
         blob.size(), asset.contentType(), blob.sha1(), asset.lastUpdatedAt());
   }
 
+  private static boolean containsMinimumReleaseAgeProxy(RepositoryRuntime runtime) {
+    if (runtime.minimumReleaseAgeEnabled()) {
+      return true;
+    }
+    for (RepositoryRuntime member : runtime.members()) {
+      if (containsMinimumReleaseAgeProxy(member)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private boolean isGroupMetadataFresh(
       RepositoryRuntime group,
       CachedAssetMetadata snapshot,
@@ -262,6 +301,9 @@ public class MavenGroupService {
     Optional<NexusLikeCacheInfo> cacheInfo = NexusLikeCacheInfo.fromAttributes(snapshot.attributes());
     if (cacheController != null && cacheInfo.isPresent()) {
       return !cacheController.isStale(group.id(), NexusCacheType.METADATA, cacheInfo.get(), ttl, now);
+    }
+    if (RepositoryRoutingPolicy.filtersGroup(group.id())) {
+      return false; // Legacy group cache entries lack a policy-scoped generation.
     }
     if (snapshot.lastUpdatedAt() == null) {
       return false;
@@ -289,7 +331,7 @@ public class MavenGroupService {
         body = response.body();
         if (body != null) result.add(body.readAllBytes());
       } catch (MavenExceptions.MavenNotFoundException | MavenExceptions.BadUpstreamException
-          | MavenExceptions.MethodNotAllowed ignored) {
+          | MavenExceptions.MethodNotAllowed | HttpRemoteFetcher.RemoteRequestRejectedException ignored) {
         // member doesn't have it / is down; skip
       } catch (IOException e) {
         throw new IllegalStateException("Failed reading metadata from member " + member.name(), e);

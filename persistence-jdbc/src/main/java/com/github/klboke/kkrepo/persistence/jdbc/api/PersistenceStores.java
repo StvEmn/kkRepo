@@ -38,6 +38,8 @@ public interface PersistenceStores extends AutoCloseable {
 
   HuggingFaceRegistryDao huggingFaceRegistry();
 
+  GitLfsDao gitLfs();
+
   MaintenanceCursorDao maintenanceCursors();
 
   MetadataRebuildDao metadataRebuild();
@@ -48,6 +50,12 @@ public interface PersistenceStores extends AutoCloseable {
 
   NpmReleaseIndexDao npmReleaseIndexes();
 
+  OhpmImportDao ohpmImports();
+
+  OhpmLoginDao ohpmLogin();
+
+  OhpmRepositoryDao ohpmRepository();
+
   ProxyStateDao proxyStates();
 
   RRegistryDao rRegistry();
@@ -55,6 +63,8 @@ public interface PersistenceStores extends AutoCloseable {
   PubUploadSessionDao pubUploadSessions();
 
   RepositoryDao repositories();
+
+  RoutingRuleDao routingRules();
 
   RepositoryDataMigrationDao repositoryDataMigrations();
 
@@ -65,6 +75,8 @@ public interface PersistenceStores extends AutoCloseable {
   SecurityDao security();
 
   SecurityScanDao securityScanning();
+
+  StorageStatisticsDao storageStatistics();
 
   SwiftRegistryDao swiftRegistry();
 

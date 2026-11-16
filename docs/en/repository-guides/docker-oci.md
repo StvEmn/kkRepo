@@ -46,6 +46,13 @@ docker pull nexus.example.com/docker-group/team/alpine:3.20
 
 Push only to hosted. Proxy and group are read endpoints even when the caller is authenticated.
 
+
+Image references copied from Browse contain only the registry host, optional port, repository
+routing path, image, and tag or digest. Do not include `http://`, `https://`, or the Registry API
+prefix `/v2/` in `docker pull`, `docker tag`, or `docker push` arguments. Global Search reads live
+Docker tags from the shared database, including existing tags, with repository and content-selector
+permissions applied. Search by image name, tag, or manifest digest; deleted tags disappear.
+
 ## Repository Behavior
 
 - Hosted supports blob upload sessions, manifests, tags, cross-repository blob mounts, and OCI
@@ -80,6 +87,19 @@ Start with `curl -I https://<host>/v2/` and inspect the authentication challenge
 is normal for a private registry; repeated `401` after login usually means the advertised realm or
 service does not match the client-visible host. Push failures behind a reverse proxy commonly involve
 request-body limits, timeouts, or incorrect forwarding of upload-session locations.
+
+Docker proxies release upstream 401 challenge connections before requesting or refreshing a bearer
+token, including when the token realm shares the registry host. Each replica manages its own
+rebuildable outbound connection pools. Waiting for a pool connection defaults to 10 seconds;
+configure `KKREPO_OUTBOUND_PROXY_CONNECTION_REQUEST_TIMEOUT_MS` (milliseconds) to change it.
+This setting applies to all direct and proxied outbound HTTP requests and is independent of the
+TCP connect timeout and response/download timeout.
+
+### Slow object storage and upload transactions
+
+Docker chunk reception, object-store reads/writes and digest verification run outside database transactions. Short transactions capture the shared upload offset/chunk sequence and recheck both under a session row lock before publication. Blob metadata, an optional final chunk and session completion commit atomically. This prevents slow S3/OSS transfers from occupying a database connection for the entire transfer.
+
+Replicas coordinate through the shared session and immutable chunk objects. When reusing a blob, verified bytes are temporarily staged locally and the live blob row is looked up and locked again inside the publication transaction. If deletion or GC has removed the reuse candidate, publication rolls back and a fresh object is written outside the transaction before retrying. Temporary staging is disposable; shared upload chunks remain the source for retry after a node failure. A concurrent append invalidates an older operation's captured offset/sequence; cancellation or expiry prevents late publication. Requests that lose an append race receive `BLOB_UPLOAD_INVALID` (416) and can resume from the current upload status. Transaction retries reuse verified bytes instead of repeating the transfer. Failed operations attempt to remove their unpublished objects, checking durable references first if commit acknowledgement was lost. This does not change Hikari's leak-detection threshold or remove the existing need to reconcile orphan objects after a process/storage failure.
 
 ## Related Documentation
 

@@ -18,6 +18,57 @@ helm upgrade --install kkrepo deploy/helm/kkrepo \
 
 For production, supply S3/OSS credentials through `extraEnvFrom`. File blob storage is disabled by default; with multiple replicas it requires a strong-consistency `ReadWriteMany` PVC.
 
+## Azure Blob Storage with workload identity
+
+Azure blob stores authenticate with a platform identity by default and need no credential Secret. On AKS, annotate the service account with the managed identity and label the pods so the workload identity webhook projects the `AZURE_*` variables:
+
+```bash
+helm upgrade --install kkrepo deploy/helm/kkrepo \
+  --set serviceAccount.annotations."azure\.workload\.identity/client-id"='<managed-identity-client-id>' \
+  --set podLabels."azure\.workload\.identity/use"='true'
+```
+
+Grant that identity `Storage Blob Data Contributor` on the container, then create the blob store with `credentialType: default` or `workload-identity`. See [Azure Blob Storage blob stores](../../docs/en/azure-blob-storage.md).
+
+## AWS RDS / Aurora IAM authentication
+
+Set `database.auth: iam` to omit `SPRING_DATASOURCE_PASSWORD` and the database password
+Secret reference. The application encryption Secret remains required. Enable IAM on the
+database, grant the workload role `rds-db:connect`, and configure the database user as
+described in the [database guide](../../../docs/en/database-backends.md#aws-rds--aurora-iam-authentication).
+
+For EKS with IRSA and PostgreSQL, create a ConfigMap from the AWS RDS CA bundle and use:
+
+```yaml
+database:
+  type: postgresql
+  auth: iam
+  iam:
+    region: us-east-1
+  url: jdbc:postgresql://mydb.abcdefghijkl.us-east-1.rds.amazonaws.com:5432/kkrepo?sslmode=verify-full&sslrootcert=/etc/rds/global-bundle.pem
+  username: kkrepo
+  existingSecret: ""
+serviceAccount:
+  create: true
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/kkrepo
+extraVolumes:
+  - name: rds-ca
+    configMap:
+      name: rds-ca
+extraVolumeMounts:
+  - name: rds-ca
+    mountPath: /etc/rds
+    readOnly: true
+```
+
+Create `rds-ca` with `kubectl create configmap rds-ca --from-file=global-bundle.pem=/path/to/global-bundle.pem`,
+then install with `helm upgrade --install kkrepo deploy/helm/kkrepo -f iam-values.yaml`.
+IRSA uses the EKS webhook's projected web identity token; the chart keeps ordinary Kubernetes
+API token automount disabled. EKS Pod Identity can instead supply credentials through the
+SDK container credential provider. Allow the workload to reach the relevant AWS credential
+endpoint. For MySQL, use `sslMode=VERIFY_IDENTITY` and a truststore containing the RDS CA.
+
 ## Artifact security scanning
 
 Scanning capability is disabled by default. To deploy the isolated Syft/Grype adapter and start
@@ -33,6 +84,28 @@ helm upgrade --install kkrepo deploy/helm/kkrepo \
   --set database.username=kkrepo \
   --set securityScanning.enabled=true
 ```
+
+For an HTTPS Grype database mirror, configure its URL and provide the CA certificate through a
+Secret. For an existing release, use `helm upgrade --reuse-values` so its customized values are
+preserved. The chart passes these settings only to the non-serving database updater:
+
+```bash
+kubectl create secret generic grype-mirror-ca \
+  --from-file=ca.crt=/path/to/mirror-ca.crt
+
+helm upgrade kkrepo deploy/helm/kkrepo --reuse-values \
+  --set securityScanning.enabled=true \
+  --set securityScanning.scannerDatabase.updateUrl='https://192.168.1.100/grype-db' \
+  --set securityScanning.scannerDatabase.caCert.existingSecret=grype-mirror-ca \
+  --set securityScanning.scannerDatabase.caCert.key=ca.crt \
+  --set securityScanning.networkPolicy.databaseMirror.enabled=true \
+  --set securityScanning.networkPolicy.databaseMirror.cidr='192.168.1.100/32' \
+  --set securityScanning.networkPolicy.databaseMirror.port=443
+```
+
+Leave `updateUrl` empty to retain Grype's default database endpoint. The mirror URL must also be
+allowed by the updater NetworkPolicy when it points to a private address; use
+`securityScanning.networkPolicy.databaseMirror` for that explicit egress rule.
 
 The scanner NetworkPolicy permits DNS only to pods selected by
 `securityScanning.networkPolicy.dns`. Its defaults target `kube-dns` in `kube-system`; override

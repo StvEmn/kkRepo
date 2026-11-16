@@ -2,7 +2,9 @@ package com.github.klboke.kkrepo.server.maven;
 
 import com.github.klboke.kkrepo.core.RepositoryFormat;
 import com.github.klboke.kkrepo.core.RepositoryType;
+import com.github.klboke.kkrepo.server.proxy.NtlmCredentials;
 import com.github.klboke.kkrepo.server.proxy.OutboundProxyConfig;
+import com.github.klboke.kkrepo.server.security.RedirectHosts;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -10,9 +12,9 @@ import java.util.Locale;
 import java.util.Set;
 
 /**
- * Immutable per-request snapshot of a repository's configuration relevant to serving Maven
- * traffic. Built fresh for each request by {@link RepositoryRuntimeRegistry} — no in-process
- * cache yet because round 1 must remain stateless across replicas.
+ * Immutable repository configuration snapshot shared by protocol request paths.
+ * {@link RepositoryRuntimeRegistry} caches snapshots with a bounded TTL and invalidates them
+ * locally and through catalog broadcasts when repository settings change.
  */
 public record RepositoryRuntime(
     long id,
@@ -41,7 +43,159 @@ public record RepositoryRuntime(
     List<RepositoryRuntime> members,
     OutboundProxyConfig outboundProxy,
     Integer minimumReleaseAgeMinutes,
-    Set<String> allowedRedirectHosts) {
+    Set<String> allowedRedirectHosts,
+    NtlmCredentials ntlmCredentials,
+    int yumRepodataDepth,
+    Integer conanManifestMaxEntries,
+    Integer conanManifestMaxBytes,
+    boolean streamingEnabled) {
+  /** Compatibility constructor for callers without progressive proxy delivery. */
+  public RepositoryRuntime(
+    long id,
+    String name,
+    RepositoryFormat format,
+    RepositoryType type,
+    String recipeName,
+    boolean online,
+    Long blobStoreId,
+    String writePolicy,
+    String versionPolicy,
+    String layoutPolicy,
+    boolean strictContentTypeValidation,
+    String proxyRemoteUrl,
+    Integer contentMaxAgeMinutes,
+    Integer metadataMaxAgeMinutes,
+    Boolean autoBlock,
+    String proxyRemoteUsername,
+    String proxyRemotePassword,
+    String proxyRemoteBearerToken,
+    String rawContentDisposition,
+    Boolean dockerConnectorEnabled,
+    Integer dockerConnectorPort,
+    String dockerConnectorPublicUrl,
+    Boolean cargoRequireAuthentication,
+    List<RepositoryRuntime> members,
+    OutboundProxyConfig outboundProxy,
+    Integer minimumReleaseAgeMinutes,
+    Set<String> allowedRedirectHosts,
+    NtlmCredentials ntlmCredentials,
+    int yumRepodataDepth,
+    Integer conanManifestMaxEntries,
+    Integer conanManifestMaxBytes) {
+    this(id, name, format, type, recipeName, online, blobStoreId, writePolicy, versionPolicy, layoutPolicy, strictContentTypeValidation, proxyRemoteUrl, contentMaxAgeMinutes, metadataMaxAgeMinutes, autoBlock, proxyRemoteUsername, proxyRemotePassword, proxyRemoteBearerToken, rawContentDisposition, dockerConnectorEnabled, dockerConnectorPort, dockerConnectorPublicUrl, cargoRequireAuthentication, members, outboundProxy, minimumReleaseAgeMinutes, allowedRedirectHosts, ntlmCredentials, yumRepodataDepth, conanManifestMaxEntries, conanManifestMaxBytes, false);
+  }
+
+  /** Compatibility constructor for snapshots without Conan manifest overrides. */
+  public RepositoryRuntime(
+      long id,
+      String name,
+      RepositoryFormat format,
+      RepositoryType type,
+      String recipeName,
+      boolean online,
+      Long blobStoreId,
+      String writePolicy,
+      String versionPolicy,
+      String layoutPolicy,
+      boolean strictContentTypeValidation,
+      String proxyRemoteUrl,
+      Integer contentMaxAgeMinutes,
+      Integer metadataMaxAgeMinutes,
+      Boolean autoBlock,
+      String proxyRemoteUsername,
+      String proxyRemotePassword,
+      String proxyRemoteBearerToken,
+      String rawContentDisposition,
+      Boolean dockerConnectorEnabled,
+      Integer dockerConnectorPort,
+      String dockerConnectorPublicUrl,
+      Boolean cargoRequireAuthentication,
+      List<RepositoryRuntime> members,
+      OutboundProxyConfig outboundProxy,
+      Integer minimumReleaseAgeMinutes,
+      Set<String> allowedRedirectHosts,
+      NtlmCredentials ntlmCredentials,
+      int yumRepodataDepth) {
+    this(id, name, format, type, recipeName, online, blobStoreId, writePolicy, versionPolicy,
+        layoutPolicy, strictContentTypeValidation, proxyRemoteUrl, contentMaxAgeMinutes,
+        metadataMaxAgeMinutes, autoBlock, proxyRemoteUsername, proxyRemotePassword,
+        proxyRemoteBearerToken, rawContentDisposition, dockerConnectorEnabled, dockerConnectorPort,
+        dockerConnectorPublicUrl, cargoRequireAuthentication, members, outboundProxy,
+        minimumReleaseAgeMinutes, allowedRedirectHosts, ntlmCredentials, yumRepodataDepth, null, null);
+  }
+
+  /** Compatibility constructor for callers that predate Yum repodata-depth settings. */
+  public RepositoryRuntime(
+      long id,
+      String name,
+      RepositoryFormat format,
+      RepositoryType type,
+      String recipeName,
+      boolean online,
+      Long blobStoreId,
+      String writePolicy,
+      String versionPolicy,
+      String layoutPolicy,
+      boolean strictContentTypeValidation,
+      String proxyRemoteUrl,
+      Integer contentMaxAgeMinutes,
+      Integer metadataMaxAgeMinutes,
+      Boolean autoBlock,
+      String proxyRemoteUsername,
+      String proxyRemotePassword,
+      String proxyRemoteBearerToken,
+      String rawContentDisposition,
+      Boolean dockerConnectorEnabled,
+      Integer dockerConnectorPort,
+      String dockerConnectorPublicUrl,
+      Boolean cargoRequireAuthentication,
+      List<RepositoryRuntime> members,
+      OutboundProxyConfig outboundProxy,
+      Integer minimumReleaseAgeMinutes,
+      Set<String> allowedRedirectHosts,
+      NtlmCredentials ntlmCredentials) {
+    this(id, name, format, type, recipeName, online, blobStoreId, writePolicy, versionPolicy, layoutPolicy,
+        strictContentTypeValidation, proxyRemoteUrl, contentMaxAgeMinutes, metadataMaxAgeMinutes,
+        autoBlock, proxyRemoteUsername, proxyRemotePassword, proxyRemoteBearerToken, rawContentDisposition,
+        dockerConnectorEnabled, dockerConnectorPort, dockerConnectorPublicUrl, cargoRequireAuthentication,
+        members, outboundProxy, minimumReleaseAgeMinutes, allowedRedirectHosts, ntlmCredentials, 0);
+  }
+
+  /** Compatibility constructor for callers that predate upstream NTLM authentication. */
+  public RepositoryRuntime(
+      long id,
+      String name,
+      RepositoryFormat format,
+      RepositoryType type,
+      String recipeName,
+      boolean online,
+      Long blobStoreId,
+      String writePolicy,
+      String versionPolicy,
+      String layoutPolicy,
+      boolean strictContentTypeValidation,
+      String proxyRemoteUrl,
+      Integer contentMaxAgeMinutes,
+      Integer metadataMaxAgeMinutes,
+      Boolean autoBlock,
+      String proxyRemoteUsername,
+      String proxyRemotePassword,
+      String proxyRemoteBearerToken,
+      String rawContentDisposition,
+      Boolean dockerConnectorEnabled,
+      Integer dockerConnectorPort,
+      String dockerConnectorPublicUrl,
+      Boolean cargoRequireAuthentication,
+      List<RepositoryRuntime> members,
+      OutboundProxyConfig outboundProxy,
+      Integer minimumReleaseAgeMinutes,
+      Set<String> allowedRedirectHosts) {
+    this(id, name, format, type, recipeName, online, blobStoreId, writePolicy, versionPolicy, layoutPolicy,
+        strictContentTypeValidation, proxyRemoteUrl, contentMaxAgeMinutes, metadataMaxAgeMinutes, autoBlock,
+        proxyRemoteUsername, proxyRemotePassword, proxyRemoteBearerToken, rawContentDisposition,
+        dockerConnectorEnabled, dockerConnectorPort, dockerConnectorPublicUrl, cargoRequireAuthentication,
+        members, outboundProxy, minimumReleaseAgeMinutes, allowedRedirectHosts, null);
+  }
 
   public RepositoryRuntime {
     if (allowedRedirectHosts == null || allowedRedirectHosts.isEmpty()) {
@@ -49,13 +203,18 @@ public record RepositoryRuntime(
     } else {
       LinkedHashSet<String> normalized = new LinkedHashSet<>();
       for (String host : allowedRedirectHosts) {
-        String value = normalizeRedirectHost(host);
-        // Operator configuration is exact-host only. The wildcard is reserved for explicit,
-        // protocol-owned integrity-pinned download flows and must never be activated from stored
-        // repository attributes, even if those attributes bypass RepositoryService validation.
-        if (!value.isBlank() && !"*".equals(value)) normalized.add(value);
+        try {
+          normalized.add(RedirectHosts.normalizeRule(host));
+        } catch (IllegalArgumentException ignored) {
+          // Invalid persisted rules fail closed.
+        }
       }
       allowedRedirectHosts = Set.copyOf(normalized);
+    }
+    if (allowedRedirectHosts.contains("*")
+        && (proxyRemoteUrl == null || !"https".equalsIgnoreCase(java.net.URI.create(proxyRemoteUrl).getScheme())
+            || (outboundProxy != null && outboundProxy.enabled()))) {
+      throw new IllegalArgumentException("Standalone * requires an HTTPS upstream and direct outbound transport");
     }
   }
 
@@ -442,17 +601,65 @@ public record RepositoryRuntime(
   }
 
   public boolean minimumReleaseAgeEnabled() {
-    return format == RepositoryFormat.NPM
+    return supportsMinimumReleaseAge(format)
         && isProxy()
         && minimumReleaseAgeMinutesOrDefault() > 0;
+  }
+
+  /** Formats whose proxy repositories can quarantine recently published versions. */
+  public static boolean supportsMinimumReleaseAge(RepositoryFormat format) {
+    return format == RepositoryFormat.NPM
+        || format == RepositoryFormat.GO
+        || format == RepositoryFormat.MAVEN2
+        || format == RepositoryFormat.PYPI;
+  }
+
+  /** Derived from the existing persisted allowlist; not a separate configuration property. */
+  public com.github.klboke.kkrepo.server.security.ProxyRedirectPolicy contentRedirectPolicy() {
+    return allowedRedirectHosts.contains("*")
+        ? com.github.klboke.kkrepo.server.security.ProxyRedirectPolicy.PUBLIC_HTTPS
+        : com.github.klboke.kkrepo.server.security.ProxyRedirectPolicy.ALLOWLIST;
+  }
+
+  public Set<String> strictRedirectHosts() {
+    return allowedRedirectHosts.stream().filter(host -> !"*".equals(host))
+        .collect(java.util.stream.Collectors.toUnmodifiableSet());
+  }
+
+  public boolean containsMember(long repositoryId) {
+    return members.stream().anyMatch(member -> member.id() == repositoryId || member.containsMember(repositoryId));
+  }
+
+  /** Copy only the ordered member tree for a request-scoped routing decision. */
+  public RepositoryRuntime withMembers(List<RepositoryRuntime> replacement) {
+    return new RepositoryRuntime(
+        id, name, format, type, recipeName, online, blobStoreId, writePolicy, versionPolicy,
+        layoutPolicy, strictContentTypeValidation, proxyRemoteUrl, contentMaxAgeMinutes,
+        metadataMaxAgeMinutes, autoBlock, proxyRemoteUsername, proxyRemotePassword,
+        proxyRemoteBearerToken, rawContentDisposition, dockerConnectorEnabled, dockerConnectorPort,
+        dockerConnectorPublicUrl, cargoRequireAuthentication, replacement, outboundProxy,
+        minimumReleaseAgeMinutes, allowedRedirectHosts, ntlmCredentials, yumRepodataDepth,
+        conanManifestMaxEntries, conanManifestMaxBytes);
+  }
+
+  /** Authentication and discovery never inherit the content-only standalone star. */
+  public RepositoryRuntime withoutPublicContentRedirects() {
+    return new RepositoryRuntime(
+        id, name, format, type,
+        recipeName, online, blobStoreId, writePolicy,
+        versionPolicy, layoutPolicy, strictContentTypeValidation, proxyRemoteUrl,
+        contentMaxAgeMinutes, metadataMaxAgeMinutes, autoBlock, proxyRemoteUsername,
+        proxyRemotePassword, proxyRemoteBearerToken, rawContentDisposition, dockerConnectorEnabled,
+        dockerConnectorPort, dockerConnectorPublicUrl, cargoRequireAuthentication, members,
+        outboundProxy, minimumReleaseAgeMinutes, strictRedirectHosts(), ntlmCredentials);
   }
 
   /** Combines operator-configured hosts with protocol-owned redirect destinations. */
   public Set<String> allowedRedirectHostsWith(Set<String> protocolRedirectHosts) {
     if (protocolRedirectHosts == null || protocolRedirectHosts.isEmpty()) {
-      return allowedRedirectHosts;
+      return strictRedirectHosts();
     }
-    LinkedHashSet<String> merged = new LinkedHashSet<>(allowedRedirectHosts);
+    LinkedHashSet<String> merged = new LinkedHashSet<>(strictRedirectHosts());
     for (String host : protocolRedirectHosts) {
       String value = normalizeRedirectHost(host);
       if (!value.isBlank()) merged.add(value);
@@ -461,7 +668,7 @@ public record RepositoryRuntime(
   }
 
   public boolean allowsRedirectHost(String host) {
-    return allowedRedirectHosts.contains(normalizeRedirectHost(host));
+    return RedirectHosts.matches(allowedRedirectHosts, host);
   }
 
   private static String normalizeRedirectHost(String host) {

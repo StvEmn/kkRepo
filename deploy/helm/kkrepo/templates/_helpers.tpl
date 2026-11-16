@@ -87,7 +87,15 @@ http://{{ $scannerName }}-{{ $index }}.{{ $headlessName }}:{{ $root.Values.secur
 {{- end }}
 {{- end }}
 
+{{/* Releases predating IAM have no database.auth when upgraded with --reuse-values. */}}
+{{- define "kkrepo.databaseAuth" -}}
+{{- default "password" .Values.database.auth -}}
+{{- end }}
+
 {{- define "kkrepo.validate" -}}
+{{- if not (has (include "kkrepo.databaseAuth" .) (list "password" "iam")) }}
+{{- fail "database.auth must be password or iam" }}
+{{- end }}
 {{- if not (has .Values.database.type (list "mysql" "postgresql")) }}
 {{- fail "database.type must be mysql or postgresql" }}
 {{- end }}
@@ -103,6 +111,9 @@ http://{{ $scannerName }}-{{ $index }}.{{ $headlessName }}:{{ $root.Values.secur
 {{- if and .Values.securityScanning.enabled (not .Values.securityScanning.serviceCredential.existingSecret) }}
 {{- fail "securityScanning.serviceCredential.existingSecret is required when scanning is enabled" }}
 {{- end }}
+{{- if and .Values.securityScanning.enabled .Values.securityScanning.scannerDatabase.caCert.existingSecret (not .Values.securityScanning.scannerDatabase.caCert.key) }}
+{{- fail "securityScanning.scannerDatabase.caCert.key is required when a CA Secret is configured" }}
+{{- end }}
 {{- if and .Values.securityScanning.enabled (lt (int .Values.securityScanning.replicaCount) 1) }}
 {{- fail "securityScanning.replicaCount must be at least 1 when scanning is enabled" }}
 {{- end }}
@@ -117,5 +128,11 @@ http://{{ $scannerName }}-{{ $index }}.{{ $headlessName }}:{{ $root.Values.secur
 {{- end }}
 {{- if and .Values.securityScanning.enabled (gt (int .Values.securityScanning.replicaCount) 1) .Values.securityScanning.scannerDatabase.persistence.enabled (not .Values.securityScanning.scannerDatabase.persistence.existingClaim) }}
 {{- fail "multiple scanner replicas with persistence require scannerDatabase.persistence.existingClaim backed by ReadWriteMany storage" }}
+{{- end }}
+{{- if and .Values.securityScanning.enabled .Values.securityScanning.networkPolicy.databaseMirror.enabled (not .Values.securityScanning.networkPolicy.databaseMirror.cidr) }}
+{{- fail "securityScanning.networkPolicy.databaseMirror.cidr is required when databaseMirror.enabled=true" }}
+{{- end }}
+{{- if and .Values.securityScanning.enabled .Values.securityScanning.networkPolicy.databaseMirror.enabled (not .Values.securityScanning.networkPolicy.databaseMirror.port) }}
+{{- fail "securityScanning.networkPolicy.databaseMirror.port is required when databaseMirror.enabled=true" }}
 {{- end }}
 {{- end }}

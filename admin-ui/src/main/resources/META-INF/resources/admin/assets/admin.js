@@ -1,12 +1,38 @@
+const {
+  close: closeUserMenu,
+  open: openUserMenu,
+  scheduleClose: scheduleCloseUserMenu,
+  toggle: toggleUserMenu,
+} = window.nexusPlusAccountMenu;
+
 if (window.location.hash === "#browse" || window.location.hash.startsWith("#browse/")) {
   window.location.replace(`/browse/${window.location.hash}`);
 }
 
-installCsrfFetch();
+// Proxy formats that support the minimum release age (quarantine) policy.
+const MINIMUM_RELEASE_AGE_FORMATS = new Set(["npm", "go", "maven2", "pypi"]);
 
 let repositories = [];
+let repositoryUsage;
+let repositoryLoadVersion = 0;
 let repositoryRecipes = [];
+let conanManifestDefaults = null;
+let repositoryConanOverrides = {};
+let repositoryConanSavedOverrides = {};
+const conanManifestFields = [
+  { key: "manifestMaxEntries", id: "repository-conan-manifest-max-entries",
+    property: "kkrepo.conan.manifest.max-entries", env: "KKREPO_CONAN_MANIFEST_MAX_ENTRIES",
+    description: "Maximum entries in a manifest." },
+  { key: "manifestMaxBytes", id: "repository-conan-manifest-max-bytes",
+    property: "kkrepo.conan.manifest.max-bytes", env: "KKREPO_CONAN_MANIFEST_MAX_BYTES",
+    description: "Maximum manifest text size in bytes, not the package archive size." }
+];
 let blobStores = [];
+let blobStoreUsage;
+let blobStoreLoadVersion = 0;
+let blobStoreSort = { key: "name", direction: "asc" };
+let blobActionMenuStoreId = null;
+let blobActionMenuTrigger = null;
 let cleanupPolicies = [];
 let cleanupCapabilities = [];
 let cleanupRuns = [];
@@ -65,6 +91,8 @@ let securityScanState = {
   findings: [],
   repositories: [],
   policies: [],
+  repositoryPolicyOptions: [],
+  repositoryEditRequest: 0,
   waivers: []
 };
 const SECURITY_SCAN_DEFAULT_PAGE_SIZE = 10;
@@ -85,6 +113,9 @@ let securityScanPages = Object.fromEntries(
       page: 0,
       size: SECURITY_SCAN_DEFAULT_PAGE_SIZE,
       query: "",
+      currentOnly: key === "findings",
+      direction: "desc",
+      requestVersion: 0,
       nextAfter: null
     }
   ]));
@@ -93,10 +124,12 @@ let editingSecurityScanPolicyId = null;
 let editingSecurityScanPolicyEnabled = true;
 let editingSecurityScanPolicyPlatforms = ["linux/amd64"];
 let securityScanWaiverContext = null;
+let securityScanFindingArtifactDetail = null;
 const AUDIT_LOG_DEFAULT_PAGE_SIZE = 15;
 let auditLogPage = { total: 0, page: 0, size: AUDIT_LOG_DEFAULT_PAGE_SIZE, items: [] };
 let currentSession = null;
 let currentAdminPermissions = [];
+let initialDataLoaded = false;
 let blobStoreHealth = {};
 let dockerOperations = null;
 let blobStoreFormMode = "create";
@@ -122,37 +155,6 @@ const securityScanWaiverRequiredFields = [
   { id: "security-scan-waiver-reason", label: "Reason" }
 ];
 
-function installCsrfFetch() {
-  if (window.__nexusPlusCsrfFetchInstalled) return;
-  window.__nexusPlusCsrfFetchInstalled = true;
-  const nativeFetch = window.fetch.bind(window);
-  window.fetch = (input, init = {}) => {
-    const method = String(init.method || "GET").toUpperCase();
-    if (["POST", "PUT", "PATCH", "DELETE", "MKCOL"].includes(method) && sameOrigin(input)) {
-      const token = csrfToken();
-      if (token) {
-        const headers = new Headers(init.headers || {});
-        headers.set("X-Nexus-Plus-CSRF-Token", token);
-        init = { ...init, headers };
-      }
-    }
-    return nativeFetch(input, init);
-  };
-}
-
-function sameOrigin(input) {
-  const url = typeof input === "string" ? input : input.url;
-  return new URL(url, window.location.origin).origin === window.location.origin;
-}
-
-function csrfToken() {
-  return document.cookie
-    .split(";")
-    .map((part) => part.trim())
-    .find((part) => part.startsWith("KKREPO_CSRF="))
-    ?.substring("KKREPO_CSRF=".length) || "";
-}
-
 const SECURITY_SCAN_ROUTE_BASE = "#admin/security/artifact-scanning";
 const SECURITY_SCAN_ROUTE_ALIASES =
   [SECURITY_SCAN_ROUTE_BASE, "#admin/security/scanning"];
@@ -167,6 +169,7 @@ const viewHashRoutes = {
   repositories: "#admin/repository/repositories",
   "cleanup-policies": CLEANUP_ROUTE_BASE,
   "content-selectors": "#admin/repository/content-selectors",
+  "routing-rules": "#admin/repository/routingrules",
   blobstores: "#admin/repository/blobstores",
   "docker-registry": "#admin/repository/docker",
   "security-users": "#admin/security/users",
@@ -177,11 +180,13 @@ const viewHashRoutes = {
   "security-oidc": "#admin/security/oidc",
   "security-anonymous": "#admin/security/anonymous",
   "security-api-keys": "#admin/security/api-keys",
+  "ohpm-login": "#admin/security/ohpm-login",
   "security-scanning": SECURITY_SCAN_ROUTE_BASE,
   "security-audit-log": "#admin/security/audit-log",
   "ui-settings": "#admin/system/ui-settings",
   "nexus-migration": "#admin/migration/nexus",
   "repository-data-migration": "#admin/migration/repository-data",
+  "ohpm-import": "#admin/migration/ohpm",
 };
 
 const hashViewRoutes = {
@@ -191,6 +196,7 @@ const hashViewRoutes = {
   "#admin/repository/cleanup-policies": "cleanup-policies",
   "#admin/repository/cleanup": "cleanup-policies",
   "#admin/repository/content-selectors": "content-selectors",
+  "#admin/repository/routingrules": "routing-rules",
   "#admin/repository/blobstores": "blobstores",
   "#admin/repository/blob-stores": "blobstores",
   "#admin/repository/docker": "docker-registry",
@@ -205,6 +211,7 @@ const hashViewRoutes = {
   "#admin/security/anonymous": "security-anonymous",
   "#admin/security/api-keys": "security-api-keys",
   "#admin/security/apikeys": "security-api-keys",
+  "#admin/security/ohpm-login": "ohpm-login",
   "#admin/security/artifact-scanning": "security-scanning",
   "#admin/security/scanning": "security-scanning",
   "#admin/security/audit-log": "security-audit-log",
@@ -215,6 +222,7 @@ const hashViewRoutes = {
   "#admin/migration": "nexus-migration",
   "#admin/migration/nexus": "nexus-migration",
   "#admin/migration/repository-data": "repository-data-migration",
+  "#admin/migration/ohpm": "ohpm-import",
 };
 
 const memberTransfer = {
@@ -348,6 +356,8 @@ function trapFocusInFormModal(event) {
 }
 
 function handleFormModalKeydown(event) {
+  // A native confirmation dialog owns keyboard input above the form modal.
+  if (event.target?.closest?.("dialog[open]")) return true;
   if (event.key === "Tab") {
     return trapFocusInFormModal(event);
   }
@@ -371,9 +381,27 @@ const blobStoreFileRequiredFields = [
   { id: "blobstore-name", label: "Name" },
   { id: "blobstore-path", label: "Path" }
 ];
+const blobStoreAzureRequiredFields = [
+  { id: "blobstore-name", label: "Name" },
+  { id: "blobstore-account-name", label: "Account name" },
+  { id: "blobstore-bucket", label: "Container" },
+  { id: "blobstore-azure-account-key", label: "Account key" },
+  { id: "blobstore-azure-sas-token", label: "SAS token" }
+];
+const blobStoreAzureFields = [
+  { id: "blobstore-account-name", label: "Account name" },
+  { id: "blobstore-azure-client-id", label: "Client ID" },
+  { id: "blobstore-azure-tenant-id", label: "Tenant ID" },
+  { id: "blobstore-azure-token-file", label: "Token file path" },
+  { id: "blobstore-azure-account-key", label: "Account key" },
+  { id: "blobstore-azure-sas-token", label: "SAS token" }
+];
+// Pre-filled for new S3 stores only; it is never a valid Azure endpoint for token credentials.
+const blobStoreS3DefaultEndpoint = "http://127.0.0.1:9000";
 const blobStoreFormFields = [
   ...blobStoreS3RequiredFields,
-  { id: "blobstore-path", label: "Path" }
+  { id: "blobstore-path", label: "Path" },
+  ...blobStoreAzureFields
 ];
 const repositoryRequiredFields = [
   {
@@ -519,6 +547,7 @@ const FORMAT_ICON_NAMES = Object.freeze({
   alpine: "alpine",
   r: "r",
   huggingface: "huggingface",
+  gitlfs: "gitlfs",
   raw: "raw",
 });
 
@@ -544,6 +573,7 @@ const FORMAT_DISPLAY_NAMES = Object.freeze({
   alpine: "Alpine / APK",
   r: "R / CRAN",
   huggingface: "Hugging Face Models",
+  gitlfs: "Git LFS",
   raw: "Raw",
 });
 
@@ -570,11 +600,16 @@ function pathStyleBadge(enabled) {
 function engineLabel(engine) {
   if (engine === "file") return "File";
   if (engine === "oss-native") return "OSS Native SDK";
+  if (lowerOrEmpty(engine).startsWith("azure")) return "Azure Blob Storage";
   return "AWS S3 SDK";
 }
 
 function isFileBlobStore(store) {
   return lowerOrEmpty(store?.engine) === "file" || lowerOrEmpty(store?.type) === "file";
+}
+
+function isAzureBlobStore(store) {
+  return lowerOrEmpty(store?.type).startsWith("azure") || lowerOrEmpty(store?.engine).startsWith("azure");
 }
 
 function healthBadge(store) {
@@ -614,8 +649,7 @@ function currentReturnTo() {
 }
 
 function safeLocalReturnTo(value) {
-  if (!value || !value.startsWith("/") || value.startsWith("//")) return "";
-  return value;
+  return window.kkrepoSafeReturnTo(value, "");
 }
 
 function authRequiredWelcome(returnTo = currentReturnTo()) {
@@ -703,6 +737,7 @@ function setSideGroupOpen(button, open, persist = false) {
 }
 
 function sideGroupForView(view) {
+  if (view === "ohpm-login") view = "security-api-keys";
   const item = Array.from(document.querySelectorAll(".side-item[data-view]"))
     .find((candidate) => candidate.dataset.view === view);
   return item?.closest(".side-group-items")?.dataset.sideGroupItems || "";
@@ -744,6 +779,7 @@ function updateHashForView(view, replace = false) {
 
 function updateHashForSecurityScanTab(tab, replace = false) {
   const selected = SECURITY_SCAN_TABS.has(tab) ? tab : "overview";
+  if (selected !== "repositories") ++securityScanState.repositoryEditRequest;
   const hash = selected === "overview"
     ? SECURITY_SCAN_ROUTE_BASE
     : `${SECURITY_SCAN_ROUTE_BASE}/${selected}`;
@@ -813,50 +849,6 @@ function hydrateSessionControls() {
   } catch {
     sessionStorage.removeItem(AUTH_SNAPSHOT_KEY);
   }
-}
-
-let userMenuCloseTimer = null;
-
-function closeUserMenu() {
-  if (userMenuCloseTimer) {
-    clearTimeout(userMenuCloseTimer);
-    userMenuCloseTimer = null;
-  }
-  const trigger = document.getElementById("user-menu-trigger");
-  const popover = document.getElementById("user-menu-popover");
-  if (!trigger || !popover) return;
-  trigger.setAttribute("aria-expanded", "false");
-  popover.classList.remove("is-open");
-  popover.setAttribute("aria-hidden", "true");
-}
-
-function openUserMenu() {
-  if (userMenuCloseTimer) {
-    clearTimeout(userMenuCloseTimer);
-    userMenuCloseTimer = null;
-  }
-  const menu = document.getElementById("user-menu");
-  const trigger = document.getElementById("user-menu-trigger");
-  const popover = document.getElementById("user-menu-popover");
-  if (!menu || !trigger || !popover || menu.hidden) return;
-  trigger.setAttribute("aria-expanded", "true");
-  popover.classList.add("is-open");
-  popover.setAttribute("aria-hidden", "false");
-}
-
-function scheduleCloseUserMenu() {
-  if (userMenuCloseTimer) clearTimeout(userMenuCloseTimer);
-  userMenuCloseTimer = setTimeout(() => {
-    userMenuCloseTimer = null;
-    closeUserMenu();
-  }, 120);
-}
-
-function toggleUserMenu() {
-  const popover = document.getElementById("user-menu-popover");
-  if (!popover) return;
-  if (!popover.classList.contains("is-open")) openUserMenu();
-  else closeUserMenu();
 }
 
 async function loadCurrentSession(options = {}) {
@@ -1292,13 +1284,18 @@ function setCheckboxValue(id, value, fallback = false) {
 
 function filteredRepositories() {
   const filter = document.getElementById("repository-filter").value.trim().toLowerCase();
+  const store = document.getElementById("repository-store-filter").value;
   return repositories.filter((repo) => {
+    if (store && repo.blobStoreName !== store) return false;
     if (!filter) return true;
     return `${repo.name} ${lowerOrEmpty(repo.type)} ${lowerOrEmpty(repo.format)} ${lowerOrEmpty(repo.recipe)} ${lowerOrEmpty(repo.blobStoreName)} ${lowerOrEmpty(repositoryDisplayUrl(repo))}`.includes(filter);
   });
 }
 
 function repositorySortValue(repo, key) {
+  if (["assetCount", "totalBytes"].includes(key)) {
+    return lowerOrEmpty(repo.type) === "group" ? null : inventoryValue(repositoryUsage, repo.id, key);
+  }
   if (key === "recipe") return repo.recipe || "";
   if (key === "type") return lowerOrEmpty(repo.type);
   if (key === "format") return lowerOrEmpty(repo.format);
@@ -1309,7 +1306,8 @@ function sortRepositories(rows) {
   return [...rows].sort((a, b) => {
     const left = repositorySortValue(a, repositorySort.key);
     const right = repositorySortValue(b, repositorySort.key);
-    const primary = left.localeCompare(right, undefined, { numeric: true, sensitivity: "base" });
+    if (left == null || right == null) return left == null ? (right == null ? 0 : 1) : -1;
+    const primary = typeof left === "bigint" ? (left < right ? -1 : left > right ? 1 : 0) : left.localeCompare(right, undefined, { numeric: true, sensitivity: "base" });
     const fallback = (a.name || "").localeCompare(b.name || "", undefined, { numeric: true, sensitivity: "base" });
     const result = primary || fallback;
     return repositorySort.direction === "asc" ? result : -result;
@@ -1323,18 +1321,23 @@ function toggleRepositorySort(key) {
       direction: repositorySort.direction === "asc" ? "desc" : "asc",
     };
   } else {
-    repositorySort = { key, direction: "asc" };
+    repositorySort = { key, direction: ["assetCount", "totalBytes"].includes(key) ? "desc" : "asc" };
   }
   renderRepositories();
 }
 
 function updateRepositorySortHeaders() {
-  document.querySelectorAll("[data-repository-sort]").forEach((button) => {
-    const active = button.dataset.repositorySort === repositorySort.key;
-    const direction = active ? repositorySort.direction : null;
+  updateTableSortHeaders("repository", repositorySort);
+}
+
+function updateTableSortHeaders(kind, sort) {
+  document.querySelectorAll(`[data-${kind}-sort]`).forEach((button) => {
+    const active = button.dataset[`${kind}Sort`] === sort.key;
+    const direction = active ? sort.direction : null;
     const indicator = button.querySelector(".repo-sort-indicator");
     button.classList.toggle("is-active", active);
-    button.setAttribute("aria-label", `${button.dataset.repositorySort} sort ${direction || "none"}`);
+    const label = button.querySelector("span:last-child").textContent;
+    button.setAttribute("aria-label", `${label} sort ${!active ? "none" : direction === "asc" ? "ascending" : "descending"}`);
     button.closest("th").setAttribute(
       "aria-sort",
       !active ? "none" : direction === "asc" ? "ascending" : "descending",
@@ -1361,7 +1364,9 @@ function filteredBlobStores() {
 
 function renderRepositories() {
   updateRepositorySortHeaders();
-  const rows = sortRepositories(filteredRepositories()).map((repo) => {
+  const filtered = filteredRepositories();
+  renderUsageSummary("repository", filtered, repositoryUsage);
+  const rows = sortRepositories(filtered).map((repo) => {
     const status = repo.online ? "Online" : "Offline";
     const tone = repo.online ? "ok" : "warn";
     const displayUrl = repositoryDisplayUrl(repo);
@@ -1377,7 +1382,9 @@ function renderRepositories() {
         <td>${formatBadge(repo.format)}</td>
         <td><span class="state-badge compact ${tone}">${status}</span></td>
         <td>${blobStore}</td>
-        <td><code>${escapeHtml(displayUrl)}</code></td>
+        <td class="inventory-count">${renderRepositoryMetric(repositoryUsage, repo, "assetCount")}</td>
+        <td class="inventory-count">${renderRepositoryMetric(repositoryUsage, repo, "totalBytes", true)}</td>
+        <td class="usage-location">${renderCopyableLocation(displayUrl, "Copy URL")}</td>
         <td class="actions-column">
           <button class="row-action edit-repository-button" data-name="${escapeHtml(repo.name)}" type="button">edit</button>
           <button class="row-action delete-repository-button" data-name="${escapeHtml(repo.name)}" type="button">delete</button>
@@ -1389,7 +1396,7 @@ function renderRepositories() {
     `;
   }).join("");
   document.getElementById("repository-table").innerHTML = rows
-    || '<tr><td colspan="9" class="placeholder">No repositories yet. Create your first one.</td></tr>';
+    || '<tr><td colspan="11" class="placeholder">No matching repositories.</td></tr>';
 }
 
 function repositoryDisplayUrl(repo) {
@@ -1512,51 +1519,241 @@ async function clearDockerCache() {
   }
 }
 
+function blobStoreSortValue(store, key) {
+  return key === "name" ? store.name || "" : inventoryValue(blobStoreUsage, store.id, key);
+}
+
+function sortBlobStores(rows) {
+  return [...rows].sort((a, b) => {
+    const left = blobStoreSortValue(a, blobStoreSort.key);
+    const right = blobStoreSortValue(b, blobStoreSort.key);
+    if (left == null || right == null) return left == null ? (right == null ? 0 : 1) : -1;
+    const primary = typeof left === "bigint" ? (left < right ? -1 : left > right ? 1 : 0) : left.localeCompare(right, undefined, { numeric: true, sensitivity: "base" });
+    const fallback = (a.name || "").localeCompare(b.name || "", undefined, { numeric: true, sensitivity: "base" });
+    return blobStoreSort.direction === "asc" ? primary || fallback : -(primary || fallback);
+  });
+}
+
+function toggleBlobStoreSort(key) {
+  blobStoreSort = {
+    key,
+    direction: blobStoreSort.key === key ? (blobStoreSort.direction === "asc" ? "desc" : "asc")
+      : key === "name" ? "asc" : "desc",
+  };
+  renderBlobStores();
+}
+
 function renderBlobStores() {
-  document.getElementById("blobstore-table").innerHTML = filteredBlobStores().map((store) => {
+  const actionMenu = document.getElementById("blobstore-action-menu");
+  const focusedTriggerId = actionMenu?.contains(document.activeElement)
+    ? actionMenu.getAttribute("aria-labelledby")
+    : document.activeElement?.closest?.(".blobstore-more-actions")?.id;
+  closeBlobStoreActionMenu();
+  updateTableSortHeaders("blobstore", blobStoreSort);
+  const filtered = filteredBlobStores();
+  renderUsageSummary("blobstore", filtered, blobStoreUsage);
+  const rows = sortBlobStores(filtered);
+  document.getElementById("blobstore-table").innerHTML = rows.map((store) => {
     const fileStore = isFileBlobStore(store);
-    const target = fileStore
-      ? `<code>${escapeHtml(store.path || "")}</code>`
-      : escapeHtml(store.bucket || "");
-    const secondary = fileStore
-      ? `<code title="${escapeHtml(store.resolvedPath || "")}">${escapeHtml(store.resolvedPath || "")}</code>`
-      : (store.prefix ? `<code>${escapeHtml(store.prefix)}</code>` : '<span class="health-muted">-</span>');
-    const endpoint = fileStore
-      ? '<span class="health-muted">-</span>'
-      : `<code>${escapeHtml(store.endpoint || "")}</code>`;
-    const pathStyle = fileStore
-      ? '<span class="health-muted">-</span>'
-      : pathStyleBadge(Boolean(store.pathStyleAccess));
+    const azureStore = isAzureBlobStore(store);
+    const target = fileStore ? store.path : store.bucket;
+    // Azure derives its endpoint from the account when none is stored, so fall back to the account.
+    const origin = azureStore && !store.endpoint ? store.accountName : store.endpoint;
+    const detail = fileStore ? store.resolvedPath : [origin, store.prefix].filter(Boolean).join(" / ");
     return `
       <tr>
         <td class="icon-column">${blobStoreIcon(store.type)}</td>
         <td>${escapeHtml(store.name)}</td>
-        <td>${escapeHtml(store.type)}</td>
-        <td>${engineLabel(store.engine)}</td>
+        <td>${engineLabel(store.engine)}${fileStore ? "" : `<small class="usage-secondary">${escapeHtml(store.type)}</small>`}</td>
         <td>${healthBadge(store)}</td>
-        <td>${target}</td>
-        <td>${secondary}</td>
-        <td>${endpoint}</td>
-        <td>${pathStyle}</td>
-        <td class="actions-column">
+        <td class="inventory-count">${renderInventoryMetric(blobStoreUsage, store.id, "blobCount")}</td>
+        <td class="inventory-count">${renderInventoryMetric(blobStoreUsage, store.id, "totalBytes", true)}</td>
+        <td class="inventory-count">${renderInventoryMetric(blobStoreUsage, store.id, "pendingDeletionBytes", true)}
+          <small class="usage-secondary">${renderInventoryMetric(blobStoreUsage, store.id, "pendingDeletionCount")} <span>blobs</span></small></td>
+        <td class="usage-location">${renderCopyableLocation(target, "Copy storage location")}
+          ${detail && detail !== target ? `<div class="usage-secondary">${renderCopyableLocation(detail, "Copy storage location")}</div>` : ""}
+          ${fileStore || azureStore ? "" : pathStyleBadge(Boolean(store.pathStyleAccess))}</td>
+        <td class="actions-column"><div class="cleanup-policy-actions">
           ${store.id == null ? '<span class="health-muted">-</span>' : `
-            <button class="row-action edit-blobstore-button" data-id="${store.id}" type="button">edit</button>
-            <button class="row-action check-blobstore-button" data-id="${store.id}" data-name="${escapeHtml(store.name)}" type="button">check</button>
+            <button class="row-action edit-blobstore-button" data-id="${store.id}" type="button">Edit</button>
+            <button class="row-action cleanup-policy-more-actions blobstore-more-actions" id="blobstore-more-actions-${store.id}" data-id="${store.id}" type="button" aria-label="More actions for ${escapeHtml(store.name)}" aria-haspopup="menu" aria-controls="blobstore-action-menu" aria-expanded="false" title="More actions"><span aria-hidden="true">⋯</span></button>
           `}
-        </td>
+        </div></td>
       </tr>
     `;
-  }).join("");
+  }).join("") || '<tr><td colspan="9" class="placeholder">No blob stores found.</td></tr>';
+  if (focusedTriggerId) document.getElementById(focusedTriggerId)?.focus();
+}
+
+function renderCopyableLocation(value, copyLabel) {
+  if (!value) return '<span class="health-muted">—</span>';
+  const text = escapeHtml(value);
+  return `<div class="usage-location-value">
+    <details class="usage-location-details">
+      <summary title="Expand or collapse full value"><code title="${text}">${text}</code></summary>
+      <code class="usage-location-full">${text}</code>
+    </details>
+    <button class="usage-location-copy" type="button" data-copy-value="${text}" title="${escapeHtml(copyLabel)}" aria-label="${escapeHtml(copyLabel)}"><span class="lucide-icon icon-copy" aria-hidden="true"></span></button>
+  </div>`;
+}
+
+async function copyLocationValue(button) {
+  const value = button.dataset.copyValue;
+  if (!value) return;
+  try {
+    await copyLocationText(value);
+    showToast("Copied", "ok");
+  } catch {
+    showToast("Copy failed. Expand the value to select and copy it manually.", "error");
+  }
+}
+
+async function copyLocationText(value) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch {
+      // HTTP deployments and denied Clipboard API permission use the selection fallback.
+    }
+  }
+  const previousFocus = document.activeElement;
+  const selection = window.getSelection();
+  const ranges = selection ? Array.from({ length: selection.rangeCount }, (_, i) => selection.getRangeAt(i).cloneRange()) : [];
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.readOnly = true;
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  try {
+    textarea.select();
+    if (!document.execCommand("copy")) throw new Error("Copy unavailable");
+  } finally {
+    textarea.remove();
+    previousFocus?.focus({ preventScroll: true });
+    if (selection) {
+      selection.removeAllRanges();
+      ranges.forEach((range) => selection.addRange(range));
+    }
+  }
+}
+
+// undefined = loading; null = unavailable. A successful response contains explicit
+// zeros for empty entities; missing or invalid values must never masquerade as zero.
+function inventoryValue(snapshot, id, key) {
+  const value = snapshot?.usage?.[String(id)]?.[key];
+  if (typeof value === "bigint") return value >= 0n ? value : null;
+  if (typeof value === "string" && /^(0|[1-9][0-9]*)$/.test(value)) return BigInt(value);
+  // Accept older servers during rollout, but never trust an already-rounded JSON number.
+  return Number.isSafeInteger(value) && value >= 0 ? BigInt(value) : null;
+}
+
+function formatInventoryBytes(value) {
+  const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+  const bytes = BigInt(value);
+  const locale = document.documentElement.lang || undefined;
+  let unit = 0, divisor = 1n;
+  while (bytes >= divisor * 1024n && unit < units.length - 1) {
+    divisor *= 1024n;
+    unit++;
+  }
+  if (unit === 0) return `${bytes.toLocaleString(locale)} B`;
+  // Round to one decimal using integer arithmetic, including totals above Long.MAX_VALUE.
+  const tenths = (bytes * 10n + divisor / 2n) / divisor;
+  const whole = tenths / 10n, fraction = tenths % 10n;
+  const formatted = fraction === 0n ? whole.toLocaleString(locale)
+    : new Intl.NumberFormat(locale, { minimumFractionDigits: 1, maximumFractionDigits: 1 })
+      .formatToParts(whole).map((part) => part.type === "fraction"
+        ? fraction.toLocaleString(locale) : part.value).join("");
+  return `${formatted} ${units[unit]}`;
+}
+
+function renderInventoryMetric(snapshot, id, key, bytes = false) {
+  if (snapshot === undefined) return '<span class="health-muted" title="Loading usage…">…</span>';
+  const value = inventoryValue(snapshot, id, key);
+  if (value == null) return '<span class="health-muted" title="Usage unavailable. Refresh to retry.">—</span>';
+  const formatted = bytes ? formatInventoryBytes(value) : value.toLocaleString(document.documentElement.lang || undefined);
+  const unknown = bytes && key === "totalBytes" && inventoryValue(snapshot, id, "unknownSizeCount") > 0n;
+  return unknown ? `<span title="Some asset sizes are unknown; this is a lower bound.">≥ ${escapeHtml(formatted)}</span>` : escapeHtml(formatted);
+}
+
+function renderGroupUsage() {
+  return '<span class="health-muted" title="Not applicable to group repositories. Inspect member repositories for usage.">—</span>';
+}
+
+function renderRepositoryMetric(snapshot, repo, key, bytes = false) {
+  return lowerOrEmpty(repo.type) === "group" ? renderGroupUsage()
+    : renderInventoryMetric(snapshot, repo.id, key, bytes);
+}
+
+function renderUsageSummary(kind, rows, snapshot) {
+  const blob = kind === "blobstore";
+  // Groups are routing views, so their persisted cache entries are not presented
+  // as independent repository usage. Physical blobs remain in blob-store totals.
+  const usageRows = blob ? rows : rows.filter((row) => lowerOrEmpty(row.type) !== "group");
+  const groupOnly = !blob && rows.length > 0 && usageRows.length === 0;
+  const keys = blob ? ["blobCount", "totalBytes", "pendingDeletionBytes"] : ["assetCount", "totalBytes"];
+  const totals = {};
+  keys.forEach((key) => {
+    const values = usageRows.map((row) => inventoryValue(snapshot, row.id, key));
+    totals[key] = values.some((value) => value == null) ? null : values.reduce((a, b) => a + b, 0n);
+  });
+  totals.unknownSizeCount = usageRows.some((row) => inventoryValue(snapshot, row.id, "unknownSizeCount") > 0n) ? 1n : 0n;
+  const totalSnapshot = snapshot === undefined ? undefined : snapshot === null ? null : { usage: { all: totals } };
+  document.getElementById(`${kind}-usage-matching`).textContent = rows.length.toLocaleString();
+  document.getElementById(`${kind}-usage-count`).innerHTML = groupOnly ? renderGroupUsage() : renderInventoryMetric(totalSnapshot, "all", keys[0]);
+  document.getElementById(`${kind}-usage-size`).innerHTML = groupOnly ? renderGroupUsage() : renderInventoryMetric(totalSnapshot, "all", "totalBytes", true);
+  if (blob) document.getElementById("blobstore-usage-pending").innerHTML = renderInventoryMetric(totalSnapshot, "all", "pendingDeletionBytes", true);
+  // Keep the summary DOM (including its bound help trigger) stable during refreshes.
+  const time = snapshot?.calculatedAt ? new Date(snapshot.calculatedAt) : null;
+  const validTime = time && !Number.isNaN(time.valueOf());
+  const updated = document.getElementById(`${kind}-usage-updated`);
+  updated.textContent = snapshot === undefined ? "…"
+    : validTime ? time.toLocaleTimeString(document.documentElement.lang || undefined) : "—";
+  updated.title = snapshot === undefined ? "Loading usage…"
+    : validTime ? time.toLocaleString(document.documentElement.lang || undefined) : "Usage unavailable. Refresh to retry.";
+}
+
+function refreshRepositoryStoreFilter() {
+  const select = document.getElementById("repository-store-filter");
+  const selected = select.value;
+  const names = [...new Set(repositories.map((repo) => repo.blobStoreName).filter(Boolean))].sort();
+  // Preserve a drill-down to a store with no visible repositories.
+  if (selected && !names.includes(selected)) names.push(selected);
+  select.innerHTML = '<option value="">All blob stores</option>'
+    + names.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("");
+  select.value = selected;
+}
+
+async function fetchInventoryUsage(url) {
+  const response = await fetch(url, { cache: "no-store" });
+  if (!response.ok) throw new Error(await responseErrorMessage(response));
+  return response.json();
 }
 
 async function loadBlobStores(options = {}) {
+  const version = ++blobStoreLoadVersion;
+  blobStoreUsage = undefined;
   try {
     const response = await fetch("/internal/blob-stores", { cache: "no-store" });
     if (!response.ok) throw new Error(await responseErrorMessage(response));
     const payload = await response.json();
+    if (version !== blobStoreLoadVersion) return;
     blobStores = payload.stores || [];
+    // Deliberately do not await inventory: a cold aggregate must not delay the grid.
+    if (!blobStores.length) blobStoreUsage = { usage: {}, calculatedAt: new Date().toISOString() };
+    if (blobStores.length) {
+      fetchInventoryUsage("/internal/blob-stores/statistics/usage").catch(() => null).then((snapshot) => {
+        if (version !== blobStoreLoadVersion) return;
+        blobStoreUsage = snapshot;
+        renderBlobStores();
+      });
+    }
   } catch (error) {
+    if (version !== blobStoreLoadVersion) return;
     blobStores = [];
+    blobStoreUsage = null;
     showToast(`Failed to load blob stores: ${error.message}`, "error");
   }
   renderBlobStores();
@@ -1579,20 +1776,36 @@ async function loadRepositoryRecipes() {
 }
 
 async function loadRepositories() {
+  const version = ++repositoryLoadVersion;
+  repositoryUsage = undefined;
   try {
     const response = await fetch("/internal/repositories?purpose=admin", { cache: "no-store" });
     if (!response.ok) throw new Error(await responseErrorMessage(response));
-    repositories = await response.json();
+    const payload = await response.json();
+    if (version !== repositoryLoadVersion) return;
+    repositories = payload;
+    if (!repositories.length) repositoryUsage = { usage: {}, calculatedAt: new Date().toISOString() };
+    if (repositories.length) {
+      fetchInventoryUsage("/internal/repositories/statistics/usage").catch(() => null).then((snapshot) => {
+        if (version !== repositoryLoadVersion) return;
+        repositoryUsage = snapshot;
+        renderRepositories();
+      });
+    }
   } catch (error) {
+    if (version !== repositoryLoadVersion) return;
     repositories = [];
+    repositoryUsage = null;
     showToast(`Failed to load repositories: ${error.message}`, "error");
   }
+  refreshRepositoryStoreFilter();
   renderRepositories();
   refreshRepositoryMemberOptions();
 }
 
 function blobStoreFormPayload() {
   const engine = document.getElementById("blobstore-engine").value;
+  if (engine === "azure") return azureBlobStoreFormPayload();
   return {
     name: document.getElementById("blobstore-name").value.trim(),
     type: engine === "file" ? "file" : "s3",
@@ -1602,19 +1815,86 @@ function blobStoreFormPayload() {
     bucket: document.getElementById("blobstore-bucket").value.trim(),
     prefix: document.getElementById("blobstore-prefix").value.trim(),
     path: document.getElementById("blobstore-path").value.trim(),
-    accessKey: document.getElementById("blobstore-access-key").value.trim(),
-    secretKey: document.getElementById("blobstore-secret-key").value,
+    credentialSource: blobStoreCredentialSource(),
+    accessKey: blobStoreCredentialSource() === "default" ? "" : document.getElementById("blobstore-access-key").value.trim(),
+    secretKey: blobStoreCredentialSource() === "default" ? "" : document.getElementById("blobstore-secret-key").value,
     pathStyleAccess: document.getElementById("blobstore-path-style").checked
   };
 }
 
+function azureBlobStoreFormPayload() {
+  const credentialType = blobStoreAzureCredentialType();
+  // Secrets are sent only for the mode that uses them, so switching to a platform identity
+  // clears the stored value instead of leaving an unusable secret behind.
+  return {
+    name: document.getElementById("blobstore-name").value.trim(),
+    type: "azure",
+    engine: "azure",
+    endpoint: document.getElementById("blobstore-endpoint").value.trim(),
+    accountName: document.getElementById("blobstore-account-name").value.trim(),
+    bucket: document.getElementById("blobstore-bucket").value.trim(),
+    prefix: document.getElementById("blobstore-prefix").value.trim(),
+    credentialType,
+    accountKey: credentialType === "account-key" ? document.getElementById("blobstore-azure-account-key").value : "",
+    sasToken: credentialType === "sas" ? document.getElementById("blobstore-azure-sas-token").value : "",
+    clientId: azureIdentityFieldsVisible(credentialType)
+      ? document.getElementById("blobstore-azure-client-id").value.trim() : "",
+    tenantId: azureWorkloadFieldsVisible(credentialType)
+      ? document.getElementById("blobstore-azure-tenant-id").value.trim() : "",
+    tokenFilePath: azureTokenFileVisible(credentialType)
+      ? document.getElementById("blobstore-azure-token-file").value.trim() : ""
+  };
+}
+
+function blobStoreAzureCredentialType() {
+  return document.getElementById("blobstore-azure-credential-type").value || "default";
+}
+
+function azureIdentityFieldsVisible(credentialType) {
+  return credentialType === "default" || credentialType === "managed-identity"
+    || credentialType === "workload-identity";
+}
+
+function azureWorkloadFieldsVisible(credentialType) {
+  return credentialType === "default" || credentialType === "workload-identity";
+}
+
+/** DefaultAzureCredential reads the federated token file only from AZURE_FEDERATED_TOKEN_FILE. */
+function azureTokenFileVisible(credentialType) {
+  return credentialType === "workload-identity";
+}
+
+function blobStoreCredentialSource() {
+  return document.getElementById("blobstore-engine").value === "aws-s3"
+    ? document.getElementById("blobstore-credential-source").value : "static";
+}
+
 function activeBlobStoreRequiredFields() {
-  const fileMode = document.getElementById("blobstore-engine").value === "file";
+  const engine = document.getElementById("blobstore-engine").value;
+  if (engine === "azure") return activeAzureBlobStoreRequiredFields();
+  const fileMode = engine === "file";
   return (fileMode ? blobStoreFileRequiredFields : blobStoreS3RequiredFields)
     .filter((field) => !(
       (field.id === "blobstore-access-key" || field.id === "blobstore-secret-key")
-      && blobStoreFormMode === "edit"
+      && (blobStoreCredentialSource() === "default"
+        || (blobStoreFormMode === "edit" && document.getElementById(field.id).dataset.configured === "true"))
     ));
+}
+
+function activeAzureBlobStoreRequiredFields() {
+  const credentialType = blobStoreAzureCredentialType();
+  return blobStoreAzureRequiredFields.filter((field) => {
+    if (field.id === "blobstore-azure-account-key") return azureSecretRequired(credentialType, "account-key");
+    if (field.id === "blobstore-azure-sas-token") return azureSecretRequired(credentialType, "sas");
+    return true;
+  });
+}
+
+/** An already-stored secret may be kept by leaving the field blank while editing. */
+function azureSecretRequired(credentialType, usedBy) {
+  if (credentialType !== usedBy) return false;
+  const id = usedBy === "sas" ? "blobstore-azure-sas-token" : "blobstore-azure-account-key";
+  return !(blobStoreFormMode === "edit" && document.getElementById(id).dataset.configured === "true");
 }
 
 function refreshBlobStoreRequiredMarkers() {
@@ -1693,38 +1973,118 @@ function setAccessFieldMode(required, placeholder = "") {
   refreshBlobStoreRequiredMarkers();
 }
 
+/** Selectors that decide which blob store fields apply; changing any of them re-renders the form. */
+const blobStoreFormModeControls = [
+  "blobstore-engine",
+  "blobstore-credential-source",
+  "blobstore-azure-credential-type",
+];
+
+function bindBlobStoreFormModeControls() {
+  blobStoreFormModeControls.forEach((id) => {
+    document.getElementById(id).addEventListener("change", refreshBlobStoreEngineControls);
+  });
+}
+
 function refreshBlobStoreEngineControls() {
   const engine = document.getElementById("blobstore-engine").value;
   const fileMode = engine === "file";
+  const azureMode = engine === "azure";
+  const source = document.getElementById("blobstore-credential-source");
+  source.disabled = engine !== "aws-s3";
+  if (engine === "oss-native") source.value = "static";
+  const defaultCredentials = blobStoreCredentialSource() === "default";
+  const credentialType = blobStoreAzureCredentialType();
   const pathStyle = document.getElementById("blobstore-path-style");
   const pathInput = document.getElementById("blobstore-path");
+  refreshBlobStoreEndpointDefault(azureMode);
   document.querySelectorAll(".s3-only").forEach((element) => {
+    element.hidden = fileMode || azureMode;
+  });
+  document.querySelectorAll(".azure-only").forEach((element) => {
+    element.hidden = !azureMode;
+  });
+  document.querySelectorAll(".object-store-only").forEach((element) => {
     element.hidden = fileMode;
   });
   document.querySelectorAll(".file-only").forEach((element) => {
     element.hidden = !fileMode;
   });
-  [
-    "blobstore-endpoint",
-    "blobstore-region",
-    "blobstore-bucket",
-    "blobstore-prefix",
-    "blobstore-access-key",
-    "blobstore-secret-key",
-    "blobstore-path-style"
-  ].forEach((id) => {
+  document.querySelectorAll(".azure-identity-fields").forEach((element) => {
+    element.hidden = !azureMode || !azureIdentityFieldsVisible(credentialType);
+  });
+  document.querySelectorAll(".azure-workload-fields").forEach((element) => {
+    element.hidden = !azureMode || !azureWorkloadFieldsVisible(credentialType);
+  });
+  document.querySelectorAll(".azure-token-file-fields").forEach((element) => {
+    element.hidden = !azureMode || !azureTokenFileVisible(credentialType);
+  });
+  document.querySelectorAll(".azure-account-key-fields").forEach((element) => {
+    element.hidden = !azureMode || credentialType !== "account-key";
+  });
+  document.querySelectorAll(".azure-sas-fields").forEach((element) => {
+    element.hidden = !azureMode || credentialType !== "sas";
+  });
+  ["blobstore-endpoint", "blobstore-bucket", "blobstore-prefix"].forEach((id) => {
     document.getElementById(id).disabled = fileMode;
+  });
+  ["blobstore-region", "blobstore-access-key", "blobstore-secret-key", "blobstore-path-style"].forEach((id) => {
+    document.getElementById(id).disabled = fileMode || azureMode;
+  });
+  document.querySelectorAll(".static-credentials").forEach((element) => {
+    element.hidden = fileMode || azureMode || defaultCredentials;
+  });
+  ["blobstore-access-key", "blobstore-secret-key"].forEach((id) => {
+    const input = document.getElementById(id);
+    input.disabled = fileMode || azureMode || defaultCredentials;
+    input.classList.remove("is-invalid");
+    input.setAttribute("aria-invalid", "false");
+  });
+  document.getElementById("blobstore-account-name").disabled = !azureMode;
+  document.getElementById("blobstore-azure-credential-type").disabled = !azureMode;
+  document.getElementById("blobstore-azure-client-id").disabled = !azureMode || !azureIdentityFieldsVisible(credentialType);
+  document.getElementById("blobstore-azure-tenant-id").disabled =
+    !azureMode || !azureWorkloadFieldsVisible(credentialType);
+  document.getElementById("blobstore-azure-token-file").disabled =
+    !azureMode || !azureTokenFileVisible(credentialType);
+  document.getElementById("blobstore-azure-account-key").disabled = !azureMode || credentialType !== "account-key";
+  document.getElementById("blobstore-azure-sas-token").disabled = !azureMode || credentialType !== "sas";
+  setBlobStoreFieldLabel("blobstore-bucket-label", azureMode ? "Container" : "Bucket");
+  document.getElementById("blobstore-azure-client-id").placeholder = credentialType === "managed-identity"
+    ? "User-assigned identity; blank uses system-assigned"
+    : "Blank uses AZURE_CLIENT_ID from the service account";
+  const requiredFields = new Set(activeBlobStoreRequiredFields().map((field) => field.id));
+  blobStoreFormFields.forEach((field) => {
+    setFieldRequired(document.getElementById(field.id), requiredFields.has(field.id));
   });
   pathInput.disabled = !fileMode;
   pathInput.required = fileMode;
   pathInput.setAttribute("aria-required", String(fileMode));
-  pathStyle.disabled = fileMode;
-  if (fileMode) {
-    pathStyle.title = "";
-  } else {
-    pathStyle.title = "";
-  }
+  pathStyle.disabled = fileMode || azureMode;
+  pathStyle.title = "";
   refreshBlobStoreRequiredMarkers();
+}
+
+/**
+ * Azure derives its endpoint from the account name, and the SDK refuses bearer tokens over plain
+ * HTTP, so the S3 placeholder endpoint is dropped in Azure mode and restored if the operator
+ * switches back to an S3 engine without typing another endpoint.
+ */
+function refreshBlobStoreEndpointDefault(azureMode) {
+  const endpoint = document.getElementById("blobstore-endpoint");
+  if (azureMode && endpoint.value.trim() === blobStoreS3DefaultEndpoint) {
+    endpoint.value = "";
+    endpoint.dataset.clearedS3Default = "true";
+  } else if (!azureMode && endpoint.dataset.clearedS3Default === "true") {
+    if (!endpoint.value.trim()) endpoint.value = blobStoreS3DefaultEndpoint;
+    endpoint.dataset.clearedS3Default = "false";
+  }
+  endpoint.placeholder = azureMode ? "Blank uses https://<account>.blob.core.windows.net" : "";
+}
+
+function setBlobStoreFieldLabel(id, label) {
+  const element = document.getElementById(id);
+  if (element) element.textContent = label;
 }
 
 function showCreateBlobStoreForm() {
@@ -1736,7 +2096,11 @@ function showCreateBlobStoreForm() {
   document.getElementById("blobstore-name").disabled = false;
   document.getElementById("blobstore-name").value = "";
   document.getElementById("blobstore-engine").value = "aws-s3";
-  document.getElementById("blobstore-endpoint").value = "http://127.0.0.1:9000";
+  document.getElementById("blobstore-credential-source").value = "default";
+  document.getElementById("blobstore-access-key").dataset.configured = "false";
+  document.getElementById("blobstore-secret-key").dataset.configured = "false";
+  document.getElementById("blobstore-endpoint").value = blobStoreS3DefaultEndpoint;
+  document.getElementById("blobstore-endpoint").dataset.clearedS3Default = "false";
   document.getElementById("blobstore-region").value = "cn-hangzhou";
   document.getElementById("blobstore-bucket").value = "";
   document.getElementById("blobstore-prefix").value = "";
@@ -1744,6 +2108,13 @@ function showCreateBlobStoreForm() {
   document.getElementById("blobstore-access-key").value = "";
   document.getElementById("blobstore-secret-key").value = "";
   document.getElementById("blobstore-path-style").checked = true;
+  document.getElementById("blobstore-account-name").value = "";
+  document.getElementById("blobstore-azure-credential-type").value = "default";
+  ["blobstore-azure-client-id", "blobstore-azure-tenant-id", "blobstore-azure-token-file",
+    "blobstore-azure-account-key", "blobstore-azure-sas-token"].forEach((id) => {
+    document.getElementById(id).value = "";
+    document.getElementById(id).dataset.configured = "false";
+  });
   refreshBlobStoreEngineControls();
   clearBlobStoreFormErrors();
   openFormModal("blobstore-form", "blobstore-name");
@@ -1763,6 +2134,9 @@ function showEditBlobStoreForm(id) {
   document.getElementById("blobstore-name").disabled = true;
   document.getElementById("blobstore-name").value = store.name || "";
   document.getElementById("blobstore-engine").value = normalizeBlobStoreEngine(store.engine);
+  document.getElementById("blobstore-credential-source").value = store.credentialSource || "static";
+  document.getElementById("blobstore-access-key").dataset.configured = String(!!store.accessKeyConfigured);
+  document.getElementById("blobstore-secret-key").dataset.configured = String(!!store.secretConfigured);
   document.getElementById("blobstore-endpoint").value = store.endpoint || "";
   document.getElementById("blobstore-region").value = store.region || "cn-hangzhou";
   document.getElementById("blobstore-bucket").value = store.bucket || "";
@@ -1771,14 +2145,37 @@ function showEditBlobStoreForm(id) {
   document.getElementById("blobstore-access-key").value = "";
   document.getElementById("blobstore-secret-key").value = "";
   document.getElementById("blobstore-path-style").checked = store.pathStyleAccess !== false;
+  document.getElementById("blobstore-account-name").value = store.accountName || "";
+  // Azure reports its credential mode through the shared credentialSource field.
+  document.getElementById("blobstore-azure-credential-type").value =
+    isAzureBlobStore(store) ? (store.credentialSource || "default") : "default";
+  document.getElementById("blobstore-azure-client-id").value = store.clientId || "";
+  document.getElementById("blobstore-azure-tenant-id").value = store.tenantId || "";
+  document.getElementById("blobstore-azure-token-file").value = store.tokenFilePath || "";
+  ["blobstore-azure-account-key", "blobstore-azure-sas-token"].forEach((id) => {
+    document.getElementById(id).value = "";
+  });
+  document.getElementById("blobstore-azure-account-key").dataset.configured = String(!!store.accountKeyConfigured);
+  document.getElementById("blobstore-azure-sas-token").dataset.configured = String(!!store.sasTokenConfigured);
+  document.getElementById("blobstore-azure-account-key").placeholder =
+    store.accountKeyConfigured ? "Leave blank to keep existing" : "";
+  document.getElementById("blobstore-azure-sas-token").placeholder =
+    store.sasTokenConfigured ? "Leave blank to keep existing" : "";
   refreshBlobStoreEngineControls();
   clearBlobStoreFormErrors();
-  openFormModal("blobstore-form", isFileBlobStore(store) ? "blobstore-path" : "blobstore-endpoint");
+  openFormModal("blobstore-form", blobStoreInitialFocusField(store));
+}
+
+function blobStoreInitialFocusField(store) {
+  if (isFileBlobStore(store)) return "blobstore-path";
+  if (isAzureBlobStore(store)) return "blobstore-account-name";
+  return "blobstore-endpoint";
 }
 
 function normalizeBlobStoreEngine(engine) {
   const normalized = lowerOrEmpty(engine);
   if (normalized === "file" || normalized === "oss-native") return normalized;
+  if (normalized.startsWith("azure")) return "azure";
   return "aws-s3";
 }
 
@@ -1892,9 +2289,6 @@ async function responseErrorMessage(response) {
     window.location.href = authRequiredWelcome();
     return "Authentication required.";
   }
-  if (response.status === 409) {
-    return "Name already exists.";
-  }
   try {
     const text = await response.text();
     if (!text) return `HTTP ${response.status}`;
@@ -1945,6 +2339,117 @@ async function saveBlobStore(event) {
 async function checkBlobStore(id, name) {
   const store = blobStores.find((item) => String(item.id) === String(id)) || { id, name };
   await runBlobStoreCheck(store, { toast: true });
+}
+
+async function deleteBlobStore(id) {
+  const store = blobStores.find((item) => String(item.id) === String(id));
+  if (!store || !await window.kkrepoConfirmDelete({
+    title: "Delete blob store?",
+    description: "This removes the configuration only. Storage files and buckets are not deleted.",
+    details: [{ label: "Blob store", value: store.name }]
+  })) return;
+  showToast(`Deleting blob store ${store.name}...`);
+  try {
+    const response = await fetch(`/internal/blob-stores/${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (!response.ok) throw new Error(await responseErrorMessage(response));
+    await loadBlobStores();
+    showToast(`Blob store ${store.name} deleted.`, "ok");
+  } catch (error) {
+    showToast(`Delete failed: ${error.message}`, "error");
+  }
+}
+
+function showBlobStoreRepositories(name) {
+  const select = document.getElementById("repository-store-filter");
+  select.innerHTML = `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`;
+  select.value = name;
+  document.getElementById("repository-filter").value = "";
+  repositorySort = { key: "totalBytes", direction: "desc" };
+  switchView("repositories");
+}
+
+function blobActionMenuItems() {
+  return Array.from(document.querySelectorAll("#blobstore-action-menu [role='menuitem']"));
+}
+
+function positionBlobStoreActionMenu() {
+  const menu = document.getElementById("blobstore-action-menu");
+  const trigger = blobActionMenuTrigger;
+  if (!trigger?.isConnected || menu.hidden) return;
+  const triggerRect = trigger.getBoundingClientRect();
+  if (triggerRect.bottom < 0 || triggerRect.top > window.innerHeight) {
+    closeBlobStoreActionMenu();
+    return;
+  }
+  const menuRect = menu.getBoundingClientRect();
+  const padding = 10, gap = 6;
+  menu.style.left = `${Math.round(Math.max(padding, Math.min(
+    triggerRect.right - menuRect.width, window.innerWidth - menuRect.width - padding)))}px`;
+  const above = triggerRect.top - menuRect.height - gap;
+  menu.style.top = `${Math.round(triggerRect.bottom + menuRect.height + gap > window.innerHeight - padding
+    && above >= padding ? above : triggerRect.bottom + gap)}px`;
+}
+
+function closeBlobStoreActionMenu(options = {}) {
+  const menu = document.getElementById("blobstore-action-menu");
+  const trigger = blobActionMenuTrigger;
+  if (trigger) trigger.setAttribute("aria-expanded", "false");
+  blobActionMenuStoreId = null;
+  blobActionMenuTrigger = null;
+  menu.hidden = true;
+  menu.setAttribute("aria-hidden", "true");
+  menu.removeAttribute("aria-labelledby");
+  menu.innerHTML = "";
+  if (options.restoreFocus && trigger?.isConnected) trigger.focus();
+}
+
+function openBlobStoreActionMenu(id, trigger, focusTarget = null) {
+  const store = blobStores.find((item) => String(item.id) === String(id));
+  if (!store) return;
+  const menu = document.getElementById("blobstore-action-menu");
+  if (!menu.hidden && String(blobActionMenuStoreId) === String(id)) {
+    if (focusTarget === "first") blobActionMenuItems()[0]?.focus();
+    else if (focusTarget === "last") blobActionMenuItems().at(-1)?.focus();
+    else closeBlobStoreActionMenu({ restoreFocus: true });
+    return;
+  }
+  closeBlobStoreActionMenu();
+  closeCleanupPolicyActionMenu();
+  blobActionMenuStoreId = id;
+  blobActionMenuTrigger = trigger;
+  menu.innerHTML = `
+    <button class="cleanup-policy-action-menu-item" data-blobstore-action="repositories" type="button" role="menuitem">Repositories</button>
+    <button class="cleanup-policy-action-menu-item" data-blobstore-action="check" type="button" role="menuitem">Check</button>
+    <div class="cleanup-policy-action-menu-separator" role="separator"></div>
+    <button class="cleanup-policy-action-menu-item is-danger" data-blobstore-action="delete" type="button" role="menuitem">Delete blob store</button>`;
+  trigger.setAttribute("aria-expanded", "true");
+  menu.setAttribute("aria-hidden", "false");
+  menu.setAttribute("aria-labelledby", trigger.id);
+  menu.hidden = false;
+  positionBlobStoreActionMenu();
+  if (focusTarget === "first") blobActionMenuItems()[0]?.focus();
+  if (focusTarget === "last") blobActionMenuItems().at(-1)?.focus();
+}
+
+function handleBlobStoreActionMenuKeydown(event) {
+  const menu = document.getElementById("blobstore-action-menu");
+  if (menu.hidden || !menu.contains(event.target)) return false;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeBlobStoreActionMenu({ restoreFocus: true });
+    return true;
+  }
+  const items = blobActionMenuItems();
+  const current = items.indexOf(document.activeElement);
+  let next = null;
+  if (event.key === "ArrowDown") next = (current + 1) % items.length;
+  if (event.key === "ArrowUp") next = (current - 1 + items.length) % items.length;
+  if (event.key === "Home") next = 0;
+  if (event.key === "End") next = items.length - 1;
+  if (next == null) return false;
+  event.preventDefault();
+  items[next]?.focus();
+  return true;
 }
 
 // ---- Repository form -----------------------------------------------------
@@ -2394,24 +2899,35 @@ function refreshRepositoryRecipeControls() {
   const recipe = currentRecipe();
   const type = recipe ? recipe.type : null;
   const format = recipe ? recipe.format : null;
+  const strict = document.getElementById("repository-strict");
+  strict.disabled = format === "gitlfs";
+  if (format === "gitlfs") strict.checked = false;
   document.getElementById("repository-hosted-fields").hidden = type !== "HOSTED";
   document.getElementById("repository-proxy-fields").hidden = type !== "PROXY";
+  const ntlmAvailable = type === "PROXY" && format === "nuget";
+  document.getElementById("repository-remote-authentication-field").hidden = !ntlmAvailable;
+  if (!ntlmAvailable) document.getElementById("repository-remote-authentication-type").value = "auto";
+  const ntlmSelected = ntlmAvailable && document.getElementById("repository-remote-authentication-type").value === "ntlm";
+  document.getElementById("repository-remote-ntlm-domain-field").hidden = !ntlmSelected;
+  document.getElementById("repository-remote-ntlm-host-field").hidden = !ntlmSelected;
   document.getElementById("repository-outbound-proxy-fields").hidden = type !== "PROXY";
   document.getElementById("repository-group-fields").hidden = type !== "GROUP";
+  document.getElementById("repository-raw-fields").hidden = format !== "raw";
   document.getElementById("repository-docker-fields").hidden = format !== "docker";
   document.getElementById("repository-cargo-fields").hidden =
     format !== "cargo";
-  document.getElementById("repository-conan-fields").hidden = format !== "conan";
-  document.getElementById("repository-conan-operations").hidden =
+  document.getElementById("repository-conan-limits").hidden = format !== "conan" || type === "GROUP";
+  document.getElementById("repository-conan-fields").hidden =
     format !== "conan" || repositoryFormMode !== "edit";
   document.getElementById("repository-apt-fields").hidden = format !== "apt";
   document.getElementById("repository-alpine-fields").hidden = format !== "alpine";
   document.getElementById("repository-swift-proxy-note").hidden =
     !(format === "swift" && type === "PROXY");
+  document.getElementById("repository-yum-depth-field").hidden = format !== "yum" || type !== "HOSTED";
   const pypiIndexPathVisible = format === "pypi" && type === "PROXY";
   document.getElementById("repository-pypi-index-path-field").hidden =
     !pypiIndexPathVisible;
-  const minimumReleaseAgeVisible = format === "npm" && type === "PROXY";
+  const minimumReleaseAgeVisible = MINIMUM_RELEASE_AGE_FORMATS.has(format) && type === "PROXY";
   document.getElementById("repository-minimum-release-age-field").hidden =
     !minimumReleaseAgeVisible;
   document.getElementById("repository-minimum-release-age-note").hidden =
@@ -2507,6 +3023,66 @@ function refreshAlpineControls() {
   document.getElementById("repository-alpine-operations").hidden =
     !alpine || repositoryFormMode !== "edit";
   updateRequiredMarkers(repositoryRequiredFields);
+}
+
+async function loadConanManifestDefaults() {
+  try {
+    const response = await fetch("/internal/repositories/conan/defaults", { cache: "no-store" });
+    if (!response.ok) throw new Error(await responseErrorMessage(response));
+    const defaults = await response.json();
+    if (!conanManifestFields.every(({ key, id }) => Number.isInteger(defaults[key])
+        && defaults[key] >= 1 && defaults[key] <= Number(document.getElementById(id).max))) {
+      throw new Error("Invalid Conan manifest defaults");
+    }
+    conanManifestDefaults = defaults;
+  } catch (error) {
+    // An older/unavailable server must never make the UI invent effective values or pin defaults.
+    conanManifestDefaults = null;
+  }
+}
+
+function setConanManifestSettings(settings = {}) {
+  repositoryConanOverrides = {};
+  for (const { key, id } of conanManifestFields) {
+    repositoryConanOverrides[key] = settings?.[key] ?? null;
+    const input = document.getElementById(id);
+    input.value = repositoryConanOverrides[key] ?? conanManifestDefaults?.[key] ?? "";
+    input.disabled = !conanManifestDefaults;
+  }
+  repositoryConanSavedOverrides = { ...repositoryConanOverrides };
+  updateConanManifestHelp();
+}
+
+function updateConanManifestSetting(field, restoreDefault = false) {
+  if (!conanManifestDefaults) return;
+  const input = document.getElementById(field.id);
+  const value = input.value === "" ? null : Number(input.value);
+  const originalValue = repositoryConanSavedOverrides[field.key] ?? conanManifestDefaults[field.key];
+  repositoryConanOverrides[field.key] = value === originalValue
+    ? repositoryConanSavedOverrides[field.key] : value;
+  if (restoreDefault && value === null && !input.validity.badInput) {
+    input.value = conanManifestDefaults[field.key];
+  }
+  updateConanManifestHelp();
+}
+
+function updateConanManifestHelp() {
+  const text = value => window.kkrepoI18n?.text(value) ?? value;
+  for (const field of conanManifestFields) {
+    const help = document.getElementById(`${field.id}-help`);
+    let explanation = text("Effective Conan limits unavailable. Reload the page to retry; saved overrides are unchanged.");
+    if (conanManifestDefaults) {
+      const changed = repositoryConanOverrides[field.key] !== repositoryConanSavedOverrides[field.key];
+      const source = repositoryConanOverrides[field.key] == null ? "Server default" : "Repository override";
+      explanation = [text(field.description),
+        `${text(changed ? "Source after saving" : "Current source")}: ${text(source)}.`,
+        `${text("Server default")}: ${conanManifestDefaults[field.key]} (${field.property}; ${field.env}).`,
+        text("Clear this field to inherit the server default; its value reappears when you leave the field."),
+        text("Saving applies to subsequent manifest validations without a restart.")].join(" ");
+    }
+    help.dataset.tooltip = explanation;
+    help.setAttribute("aria-label", explanation);
+  }
 }
 
 async function loadConanStatus(name = editingRepositoryName) {
@@ -2757,15 +3333,22 @@ function repositoryFormPayload() {
     const minimumReleaseAge = document.getElementById("repository-minimum-release-age").value;
     const allowedRedirectHosts = document.getElementById("repository-allowed-redirect-hosts").value
       .split(",").map((value) => value.trim()).filter(Boolean);
+    if (!document.getElementById("repository-routing-rule").disabled) {
+      payload.routingRuleName = document.getElementById("repository-routing-rule").value;
+    }
     payload.proxy = {
       remoteUrl: document.getElementById("repository-remote-url").value.trim(),
       allowedRedirectHosts,
       contentMaxAgeMinutes: content === "" ? null : Number(content),
       metadataMaxAgeMinutes: metadata === "" ? null : Number(metadata),
-      minimumReleaseAgeMinutes: recipe.format === "npm"
+      minimumReleaseAgeMinutes: MINIMUM_RELEASE_AGE_FORMATS.has(recipe.format)
         ? (minimumReleaseAge === "" ? 0 : Number(minimumReleaseAge))
         : null,
       autoBlock: document.getElementById("repository-auto-block").checked,
+      streamingEnabled: document.getElementById("repository-streaming-enabled").checked,
+      remoteAuthenticationType: textInputValue("repository-remote-authentication-type"),
+      remoteNtlmDomain: textInputValue("repository-remote-ntlm-domain"),
+      remoteNtlmHost: textInputValue("repository-remote-ntlm-host"),
       remoteUsername: textInputValue("repository-remote-username"),
       remotePassword: textInputValue("repository-remote-password"),
       remotePasswordConfigured: document.getElementById("repository-remote-password-clear").checked ? false : null,
@@ -2791,6 +3374,16 @@ function repositoryFormPayload() {
     payload.group = {
       memberNames: [...memberTransfer.selected]
     };
+  }
+  if (recipe?.format === "conan" && type !== "GROUP") {
+    // Display values and durable nullable overrides are deliberately separate.
+    if (conanManifestDefaults) payload.conan = { ...repositoryConanOverrides };
+  }
+  if (recipe?.format === "yum" && type === "HOSTED") {
+    payload.yum = { repodataDepth: Number(document.getElementById("repository-yum-depth").value) };
+  }
+  if (recipe?.format === "raw") {
+    payload.raw = { contentDisposition: document.getElementById("repository-raw-content-disposition").value };
   }
   if (recipe?.format === "docker") {
     const connectorPort = document.getElementById("repository-docker-connector-port").value;
@@ -2846,6 +3439,7 @@ function repositoryFormPayload() {
 }
 
 function setRepositoryFormDefaults() {
+  setConanManifestSettings();
   document.getElementById("repository-name").value = "";
   document.getElementById("repository-online").checked = true;
   document.getElementById("repository-strict").checked = true;
@@ -2853,8 +3447,12 @@ function setRepositoryFormDefaults() {
   document.getElementById("repository-version-policy").value = "RELEASE";
   document.getElementById("repository-layout-policy").value = "STRICT";
   document.getElementById("repository-remote-url").value = "";
+  document.getElementById("repository-yum-depth").value = "0";
   document.getElementById("repository-pypi-index-path").value = "/simple";
   document.getElementById("repository-allowed-redirect-hosts").value = "";
+  document.getElementById("repository-remote-authentication-type").value = "auto";
+  document.getElementById("repository-remote-ntlm-domain").value = "";
+  document.getElementById("repository-remote-ntlm-host").value = "";
   document.getElementById("repository-remote-username").value = "";
   document.getElementById("repository-remote-password").value = "";
   document.getElementById("repository-remote-password").placeholder = "";
@@ -2873,6 +3471,8 @@ function setRepositoryFormDefaults() {
   document.getElementById("repository-metadata-max-age").value = "1440";
   document.getElementById("repository-minimum-release-age").value = "0";
   document.getElementById("repository-auto-block").checked = true;
+  document.getElementById("repository-streaming-enabled").checked = false;
+  document.getElementById("repository-raw-content-disposition").value = "ATTACHMENT";
   document.getElementById("repository-docker-connector-enabled").checked = false;
   document.getElementById("repository-docker-connector-port").value = "";
   document.getElementById("repository-docker-connector-public-url").value = "";
@@ -2923,6 +3523,7 @@ function showCreateRepositoryForm() {
   repositoryFormMode = "create";
   editingRepositoryName = null;
   editingRepositoryBlobStoreName = null;
+  window.KkRoutingRules.loadOptions();
   document.getElementById("repository-form-title").textContent = "Create repository";
   document.getElementById("save-repository-button").textContent = "Create repository";
   document.getElementById("repository-name").disabled = false;
@@ -2947,6 +3548,7 @@ function showEditRepositoryForm(name) {
   }
   repositoryFormMode = "edit";
   editingRepositoryName = repo.name;
+  window.KkRoutingRules.loadOptions(repo.routingRuleName || "");
   editingRepositoryBlobStoreName = repo.blobStoreName || null;
   document.getElementById("repository-form-title").textContent = `Edit repository: ${repo.name}`;
   document.getElementById("save-repository-button").textContent = "Save changes";
@@ -2957,6 +3559,7 @@ function showEditRepositoryForm(name) {
   document.getElementById("repository-recipe").value = repo.recipe;
   document.getElementById("repository-online").checked = Boolean(repo.online);
   document.getElementById("repository-strict").checked = Boolean(repo.strictContentTypeValidation);
+  document.getElementById("repository-raw-content-disposition").value = repo.raw?.contentDisposition || "ATTACHMENT";
   refreshRepositoryBlobStoreOptions();
   if (repo.blobStoreName) {
     document.getElementById("repository-blobstore").value = repo.blobStoreName;
@@ -2970,6 +3573,9 @@ function showEditRepositoryForm(name) {
     document.getElementById("repository-remote-url").value = repo.proxy.remoteUrl || "";
     document.getElementById("repository-allowed-redirect-hosts").value =
       Array.isArray(repo.proxy.allowedRedirectHosts) ? repo.proxy.allowedRedirectHosts.join(", ") : "";
+    document.getElementById("repository-remote-authentication-type").value = repo.proxy.remoteAuthenticationType || "auto";
+    document.getElementById("repository-remote-ntlm-domain").value = repo.proxy.remoteNtlmDomain || "";
+    document.getElementById("repository-remote-ntlm-host").value = repo.proxy.remoteNtlmHost || "";
     document.getElementById("repository-remote-username").value = repo.proxy.remoteUsername || "";
     document.getElementById("repository-remote-password").value = "";
     document.getElementById("repository-remote-password").placeholder =
@@ -2996,7 +3602,10 @@ function showEditRepositoryForm(name) {
     document.getElementById("repository-minimum-release-age").value =
       repo.proxy.minimumReleaseAgeMinutes ?? "0";
     document.getElementById("repository-auto-block").checked = repo.proxy.autoBlock !== false;
+    document.getElementById("repository-streaming-enabled").checked = repo.proxy.streamingEnabled === true;
   }
+  document.getElementById("repository-yum-depth").value = repo.yum?.repodataDepth ?? 0;
+  setConanManifestSettings(repo.conan);
   document.getElementById("repository-pypi-index-path").value =
     repo.pypi?.indexPath ?? "/simple";
   if (repo.type === "GROUP" && repo.group && Array.isArray(repo.group.memberNames)) {
@@ -3080,6 +3689,12 @@ async function saveRepository() {
   if (!validateRequiredFields(repositoryRequiredFields)) {
     return;
   }
+  if (recipe.format === "conan" && recipe.type !== "GROUP" && conanManifestDefaults) {
+    for (const field of conanManifestFields) {
+      const input = document.getElementById(field.id);
+      if (!input.reportValidity()) return;
+    }
+  }
   const payload = repositoryFormPayload();
   const creating = repositoryFormMode === "create";
   const path = creating
@@ -3102,7 +3717,12 @@ async function saveRepository() {
 }
 
 async function deleteRepository(name) {
-  if (!confirm(`Delete repository "${name}"? This cannot be undone.`)) return;
+  if (!await window.kkrepoConfirmDelete({
+    title: "Delete repository?",
+    description: "The repository configuration and its repository-specific privileges will be removed. Repositories that still contain components cannot be deleted.",
+    details: [{ label: "Repository", value: name }],
+    confirmationText: name
+  })) return;
   showToast(`Deleting ${name}...`);
   try {
     const response = await fetch(`/internal/repositories/${encodeURIComponent(name)}`, {
@@ -3632,7 +4252,11 @@ async function saveSecurityUser() {
 }
 
 async function deleteSecurityUser(source, userId) {
-  if (!confirm(`Delete user "${displaySource(source)}/${userId}"?`)) return;
+  if (!await window.kkrepoConfirmDelete({
+    title: "Delete user?",
+    description: "This removes the user's kkRepo account and API keys. It does not delete accounts from an external identity provider.",
+    details: [{ label: "User", value: displaySource(source) + "/" + userId }]
+  })) return;
   try {
     const response = await fetch(`/internal/security/users/${encodeURIComponent(source)}/${encodeURIComponent(userId)}`, {
       method: "DELETE"
@@ -3755,7 +4379,11 @@ async function saveSecurityRole() {
 }
 
 async function deleteSecurityRole(roleId) {
-  if (!confirm(`Delete role "${roleId}"?`)) return;
+  if (!await window.kkrepoConfirmDelete({
+    title: "Delete role?",
+    description: "Users and roles that rely on this role may lose access.",
+    details: [{ label: "Role", value: roleId }]
+  })) return;
   try {
     const response = await fetch(`/internal/security/roles/${encodeURIComponent(roleId)}`, { method: "DELETE" });
     if (!response.ok) throw new Error(await responseErrorMessage(response));
@@ -3848,7 +4476,11 @@ async function saveSecurityPrivilege() {
 }
 
 async function deleteSecurityPrivilege(privilegeId) {
-  if (!confirm(`Delete privilege "${privilegeId}"?`)) return;
+  if (!await window.kkrepoConfirmDelete({
+    title: "Delete privilege?",
+    description: "Roles that rely on this privilege may lose access.",
+    details: [{ label: "Privilege", value: privilegeId }]
+  })) return;
   try {
     const response = await fetch(`/internal/security/privileges/${encodeURIComponent(privilegeId)}`, { method: "DELETE" });
     if (!response.ok) throw new Error(await responseErrorMessage(response));
@@ -4189,37 +4821,44 @@ function renderSecurityApiKeys() {
       <td>${escapeHtml(key.ownerSource)}/${escapeHtml(key.ownerUserId)}</td>
       <td><span class="state-badge compact ${key.status === "ACTIVE" ? "ok" : "warn"}">${escapeHtml(key.status || "")}</span></td>
       <td><code>${escapeHtml(key.tokenPrefix || "")}</code></td>
-      <td>${escapeHtml((key.scopes || []).join(", "))}</td>
       <td class="actions-column"><button class="row-action delete-security-api-key-button" data-id="${key.id}" type="button">delete</button></td>
     </tr>
   `).join("");
   document.getElementById("security-api-key-table").innerHTML = rows
-    || '<tr><td colspan="6" class="placeholder">No API keys.</td></tr>';
+    || '<tr><td colspan="5" class="placeholder">No API keys.</td></tr>';
 }
 
+let apiKeyOwnerPicker;
+
 function showSecurityApiKeyForm() {
+  apiKeyOwnerPicker ||= window.KkUserPicker.create({
+    source: document.getElementById("security-api-key-owner-source"),
+    user: document.getElementById("security-api-key-owner-user-id"),
+    status: document.getElementById("security-api-key-owner-status")
+  });
   document.getElementById("security-api-key-domain").value = "NpmToken";
   document.getElementById("security-api-key-owner-source").value = "Local";
   document.getElementById("security-api-key-owner-user-id").value = "";
   document.getElementById("security-api-key-display-name").value = "";
-  document.getElementById("security-api-key-scopes").value = "";
   clearRequiredFieldErrors(securityApiKeyRequiredFields);
-  openFormModal("security-api-key-form", "security-api-key-owner-user-id");
+  apiKeyOwnerPicker.open();
+  openFormModal("security-api-key-form", "security-api-key-domain");
 }
 
 function hideSecurityApiKeyForm() {
+  apiKeyOwnerPicker?.close();
   closeFormModal("security-api-key-form");
   clearRequiredFieldErrors(securityApiKeyRequiredFields);
 }
 
 async function saveSecurityApiKey() {
+  if (!apiKeyOwnerPicker?.validate()) return;
   if (!validateRequiredFields(securityApiKeyRequiredFields)) return;
   const payload = {
     domain: document.getElementById("security-api-key-domain").value.trim() || "NpmToken",
     ownerSource: document.getElementById("security-api-key-owner-source").value.trim() || "Local",
     ownerUserId: document.getElementById("security-api-key-owner-user-id").value.trim(),
-    displayName: document.getElementById("security-api-key-display-name").value.trim() || null,
-    scopes: commaList(document.getElementById("security-api-key-scopes").value)
+    displayName: document.getElementById("security-api-key-display-name").value.trim() || null
   };
   try {
     const response = await fetch("/internal/security/api-keys", {
@@ -4238,7 +4877,11 @@ async function saveSecurityApiKey() {
 }
 
 async function deleteSecurityApiKey(id) {
-  if (!confirm("Delete this API key?")) return;
+  if (!await window.kkrepoConfirmDelete({
+    title: "Delete API key?",
+    description: "Clients and CI jobs using this key will no longer be able to authenticate with it.",
+    details: [{ label: "API key ID", value: String(id) }]
+  })) return;
   try {
     const response = await fetch(`/internal/security/api-keys/${encodeURIComponent(id)}`, { method: "DELETE" });
     if (!response.ok) throw new Error(await responseErrorMessage(response));
@@ -4501,6 +5144,7 @@ function renderMigrationResult(payload, title) {
   const blobStorePlans = preflight.blobStorePlans || [];
   const repositoriesToMigrate = preflight.repositoriesToMigrate || [];
   const groupRepositories = preflight.groupRepositories || [];
+  const routingRules = preflight.routingRules || {};
   const unsupported = preflight.unsupported || [];
   const proxyRisks = preflight.proxyRemoteRisks || [];
   const sourceProfile = preflight.sourceProfile || payload.sourceProfile || null;
@@ -4530,6 +5174,18 @@ function renderMigrationResult(payload, title) {
     ${renderMigrationPlan(migrationPlan)}
     ${renderMigrationPlanItems(migrationPlan)}
     ${renderMigrationList("Warnings", warnings)}
+    ${renderMigrationList("Routing rule migration blockers", routingRules.errors || [])}
+    ${renderMigrationSection("Routing Rules", renderCompactTable([
+      { label: "Name", value: (rule) => rule.name },
+      { label: "Mode", value: (rule) => rule.mode },
+      { label: "Matchers", value: (rule) => (rule.matchers || []).join("\n") },
+      { label: "Description", value: (rule) => rule.description }
+    ], routingRules.rules || [], "No routing rules found."))}
+    ${renderMigrationSection("Routing rule bindings", renderCompactTable([
+      { label: "Repository", value: (binding) => binding.repository },
+      { label: "Routing Rule", value: (binding) => binding.rule }
+    ], routingRules.bindings || []))}
+    ${routingRules.checksum ? renderMigrationSection("Routing policy checksum", renderMigrationHash(routingRules.checksum)) : ""}
     ${renderMigrationSection("Blob stores", renderCompactTable([
       { label: "Source", value: (store) => store.sourceName || "" },
       { label: "Source type", value: (store) => store.sourceType || "" },
@@ -5019,6 +5675,10 @@ function renderSecurityScanSeverity(severity) {
     </span>`;
 }
 
+function securityScanCanMutate(permission = "nexus:security-scanning:update") {
+  return securityScanState.summary?.deploymentEnabled === true && canAdmin(permission);
+}
+
 function applySecurityScanDeploymentState(enabled, options = {}) {
   const view = document.getElementById("security-scanning-view");
   const content = document.getElementById("security-scan-capability-content");
@@ -5051,6 +5711,11 @@ function applySecurityScanDeploymentState(enabled, options = {}) {
     }
   });
 
+  // Keep authorization separate from temporary deployment disabling. A refresh must
+  // never reveal a mutation control to a reader when the deployment becomes ready.
+  view.querySelectorAll("[data-scan-permission]").forEach((control) => {
+    control.hidden = !canAdmin(control.dataset.scanPermission);
+  });
   banner.hidden = available;
   banner.classList.toggle("is-pending", pending);
   banner.classList.toggle("is-disabled", !available && !pending);
@@ -5169,33 +5834,61 @@ function renderSecurityScanRuns() {
 function renderSecurityScanTasks() {
   document.getElementById("security-scan-task-table").innerHTML =
     securityScanState.tasks.map((task) => {
-      const retry = ["FAILED", "CANCELLED"].includes(task.status)
+      const retry = task.canManage === true && ["FAILED", "CANCELLED"].includes(task.status)
         ? `<button class="row-action security-scan-task-retry" data-id="${task.id}" type="button">retry</button>`
         : "";
-      const cancel = ["PENDING", "RETRY_WAIT", "RUNNING"].includes(task.status)
+      const cancel = task.canManage === true && ["PENDING", "RETRY_WAIT", "RUNNING"].includes(task.status)
         ? `<button class="row-action security-scan-task-cancel" data-id="${task.id}" type="button">cancel</button>`
         : "";
-      const rescan = task.assetId
+      const rescan = task.canRescan === true && task.assetId
         ? `<button class="row-action security-scan-asset-rescan" data-id="${task.assetId}" type="button">rescan</button>`
         : "";
       return `
         <tr>
           <td>${escapeHtml(task.id)}</td>
           <td>${escapeHtml(task.repository || `#${task.repositoryId}`)}</td>
-          <td>${escapeHtml(task.assetId ?? "-")}</td>
+          <td>${renderSecurityScanTaskAsset(task)}</td>
           <td>${escapeHtml(task.stage)}</td>
           <td>${escapeHtml(task.reason)}</td>
           <td><span class="state-badge compact ${securityScanTone(task.status)}">${escapeHtml(task.status)}</span></td>
           <td>${escapeHtml(`${task.attempts}/${task.maxAttempts}`)}</td>
           <td>${escapeHtml(formatDateTime(task.leaseUntil))}</td>
+          <td>${escapeHtml(formatDateTime(task.finishedAt))}</td>
           <td title="${escapeHtml(task.lastErrorSummary || "")}">${escapeHtml(task.lastErrorCode || "-")}</td>
           <td class="actions-column">${retry}${cancel}${rescan}</td>
         </tr>`;
     }).join("")
-      || '<tr><td colspan="10" class="placeholder">No scan tasks are visible.</td></tr>';
+      || '<tr><td colspan="11" class="placeholder">No scan tasks are visible.</td></tr>';
+}
+
+function renderSecurityScanTaskAsset(task) {
+  if (task.assetId == null) return '<span class="security-scan-task-asset">Asset unavailable</span>';
+  const path = task.browsePath || task.assetPath;
+  const identity = `<small>Asset ID: ${escapeHtml(task.assetId)}</small>`;
+  if (!path) {
+    return `<span class="security-scan-task-asset">${identity}<span>Asset unavailable</span></span>`;
+  }
+  const label = task.browseRepository
+    ? `<a href="${escapeHtml(securityScanFindingArtifactBrowseUrl({
+        repository: task.browseRepository,
+        sourceRepository: task.repository,
+        browsePath: path
+      }))}" title="${escapeHtml(`Open ${task.repository}: ${path} in Repository Browser`)}">${escapeHtml(path)}</a>`
+    : `<span>${escapeHtml(path)}</span>`;
+  return `<span class="security-scan-task-asset">${label}${identity}</span>`;
 }
 
 function renderSecurityScanFindingRepositories(finding) {
+  const artifacts = Array.isArray(finding.affectedArtifacts)
+    ? finding.affectedArtifacts.filter((artifact) => artifact?.repository && artifact?.browsePath)
+    : [];
+  if (artifacts.length > 0) {
+    const artifact = artifacts[0];
+    const count = Number(finding.affectedArtifactCount || artifacts.length);
+    const label = `${artifact.repository}: ${artifact.browsePath}`;
+    const more = count > 1 ? ` +${count - 1}` : "";
+    return `<span class="security-scan-finding-artifacts-preview"><a href="${escapeHtml(securityScanFindingArtifactBrowseUrl(artifact))}" title="${escapeHtml(`Open ${label} in Repository Browser`)}">${escapeHtml(label)}</a>${escapeHtml(more)}</span>`;
+  }
   const repositories = Array.isArray(finding.repositories)
     ? finding.repositories.filter(Boolean)
     : [];
@@ -5205,6 +5898,17 @@ function renderSecurityScanFindingRepositories(finding) {
     ? `${repositories[0]} +${repositories.length - 1}`
     : repositories[0];
   return `<span class="security-scan-finding-repositories" title="${escapeHtml(fullLabel)}">${escapeHtml(visibleLabel)}</span>`;
+}
+
+function securityScanFindingArtifactBrowseUrl(artifact) {
+  const repository = String(artifact?.repository || "");
+  const path = String(artifact?.browsePath || artifact?.assetPath || "");
+  const source = String(artifact?.sourceRepository || "");
+  const params = new URLSearchParams();
+  if (path) params.set("path", path);
+  if (source && source !== repository) params.set("source", source);
+  const query = params.toString();
+  return `/browse/#browse/browse:${encodeURIComponent(repository)}${query ? `?${query}` : ""}`;
 }
 
 function securityScanExternalHttpUrl(value) {
@@ -5275,6 +5979,7 @@ function renderSecurityScanFindingWaiverStatus(finding) {
 }
 
 function renderSecurityScanFindingWaiverAction(finding) {
+  if (finding.canCreateWaiver !== true) return "";
   const targetCount = Number(finding.waiverTargetCount || 0);
   const waivedTargetCount = Number(finding.waivedTargetCount || 0);
   const fullyWaived = targetCount > 0 && waivedTargetCount >= targetCount;
@@ -5301,33 +6006,84 @@ function renderSecurityScanRepositoryStatus(enabled) {
     </span>`;
 }
 
+function renderSecurityScanSetting(label, explanation) {
+  return `<span class="security-scan-setting">${escapeHtml(label)}<span class="field-help" tabindex="0" role="note" aria-label="${escapeHtml(explanation)}" data-tooltip="${escapeHtml(explanation)}"><span class="lucide-icon icon-info" aria-hidden="true"></span></span></span>`;
+}
+
+function renderSecurityScanResultValidity(repository) {
+  const validity = repository.resultValidity;
+  if (!validity) return renderSecurityScanSetting("Unavailable", "Effective result validity is unavailable. Refresh after the server update completes.");
+  const label = formatSecurityScanValidity(validity.maxResultAgeSeconds) || "No expiry";
+  const sources = {
+    POLICY: "Inherited from the assigned scan policy.",
+    REPOSITORY: "Set by the repository.",
+    BOTH: "The shorter of the repository and assigned policy validity periods applies.",
+    NO_EXPIRY: "Neither the repository nor an enabled assigned policy imposes an age limit. This does not mean the artifact is safe or its scan is current."
+  };
+  const context = repository.config?.policyId == null
+    ? " No scan policy is assigned."
+    : repository.policyEnabled === false ? " The assigned policy is disabled." : "";
+  const effective = validity.source === "NO_EXPIRY" ? "No expiry." : `Effective validity: ${label}.`;
+  return renderSecurityScanSetting(label, `${effective} ${sources[validity.source] || ""}${context} Age is measured from scan completion. Expired results use pending handling; policy or scanner changes can also require reevaluation.`);
+}
+
+function renderSecurityScanExceptionHandling(repository) {
+  const config = repository.config || {};
+  const inactive = config.enabled !== true || securityScanState.summary?.deploymentEnabled === false;
+  const audit = config.enforcementMode !== "ENFORCE";
+  const context = inactive
+    ? "Scanning is disabled for this repository or deployment; these actions are not applied here."
+    : audit
+      ? "AUDIT records decisions without blocking downloads."
+      : "ENFORCE applies these actions to downloads.";
+  const actions = [
+    ["Pending", "pendingAction", "Missing, running, stale, or expired results."],
+    ["Failure", "failureAction", "Failed or cancelled scans, unavailable profiles, or artifacts rejected by scan limits."],
+    ["Partial", "partialAction", "Incomplete scan coverage or missing required platforms. With an enabled policy, Allow continues vulnerability evaluation; it does not guarantee a download is allowed."]
+  ];
+  return `<div class="security-scan-exception-handling">${actions.map(([label, key, explanation]) => {
+    const configured = config[key] === "BLOCK" ? "Block" : "Allow";
+    const policyDisabled = key === "partialAction" && repository.policyEnabled === false;
+    const action = policyDisabled ? "Allow" : configured;
+    const effective = inactive ? `${action} (inactive)` : audit ? `${action} (audit)` : action;
+    const detail = `${label}: ${effective}. Configured action: ${configured}. ${explanation} ${context}${policyDisabled ? " The scan policy is disabled, so partial-result checks are bypassed; pending and failure actions still apply." : ""} Other applicable repository policies may still block a download.`;
+    return renderSecurityScanSetting(`${label}: ${effective}`, detail);
+  }).join("")}</div>`;
+}
+
 function renderSecurityScanRepositories() {
-  document.getElementById("security-scan-repository-table").innerHTML =
+  const table = document.getElementById("security-scan-repository-table");
+  table.innerHTML =
     securityScanState.repositories.map((repository) => {
       const config = repository.config;
+      const policy = repository.config?.policyId == null
+        ? renderSecurityScanSetting("Built-in rules (unassigned)", "No policy is assigned. The built-in Critical severity rules are not a policy record in the Policies tab. Configure this repository to assign a named policy.")
+        : escapeHtml(repository.policyName || "Unavailable assigned policy");
       return `
         <tr>
           <td>${renderSecurityScanRepositoryStatus(config?.enabled === true)}</td>
-          <td>${escapeHtml(repository.name)}</td>
-          <td>${escapeHtml(repository.format)}</td>
-          <td>${escapeHtml(repository.type)}</td>
+          <td>${renderSecurityScanSetting(repository.name, `Format: ${repository.format}. Type: ${repository.type}.`)}</td>
           <td>${escapeHtml(repository.profileName || "Unavailable profile")}</td>
-          <td>${escapeHtml(repository.policyName || "Built-in critical baseline")}</td>
+          <td>${policy}${repository.policyEnabled === false ? " (disabled)" : ""}</td>
           <td>${escapeHtml(config?.enforcementMode || "AUDIT")}</td>
-          <td class="actions-column"><button class="row-action security-scan-repository-edit" data-id="${repository.id}" type="button">configure</button></td>
+          <td>${renderSecurityScanResultValidity(repository)}</td>
+          <td>${renderSecurityScanExceptionHandling(repository)}</td>
+          <td class="actions-column">${repository.canConfigure === true ? `<button class="row-action security-scan-repository-edit" data-id="${repository.id}" type="button">configure</button>` : ""}</td>
         </tr>`;
     }).join("")
       || '<tr><td colspan="8" class="placeholder">No repositories are visible.</td></tr>';
+  table.querySelectorAll(".field-help").forEach(bindFieldHelpTrigger);
 }
 
 function renderSecurityScanPolicies() {
   document.getElementById("security-scan-policy-table").innerHTML =
     securityScanState.policies.map((policy) => `
       <tr><td>${escapeHtml(policy.name)}</td>
-      <td>${escapeHtml(policy.revision)}</td><td>${escapeHtml(policy.blockSeverity)}</td>
+      <td>${escapeHtml(policy.revision)}${typeof policy.latestRevision === "boolean" ? ` <span class="state-badge compact">${policy.latestRevision ? "Latest" : "Historical"}</span>` : ""}</td><td>${escapeHtml(policy.blockSeverity)}</td>
       <td>${policy.requireCompleteInventory ? "yes" : "no"}</td>
       <td>${escapeHtml(formatSecurityScanValidity(policy.maxResultAgeSeconds) || "No expiry")}</td>
-      <td class="actions-column"><button class="row-action security-scan-policy-edit" data-id="${escapeHtml(policy.id)}" type="button">edit</button></td></tr>`).join("")
+      <td class="actions-column">${canAdmin("nexus:security-scanning:update") ? `<button class="row-action security-scan-policy-edit" data-id="${escapeHtml(policy.id)}" type="button">edit</button>
+      <button class="row-action security-scan-policy-delete" data-id="${escapeHtml(policy.id)}" title="${policy.latestRevision === false ? "Historical revisions cannot be deleted individually. Delete the policy and all revisions from its latest revision." : "Delete this policy and all its revisions. The server checks the latest revision and references."}" ${policy.latestRevision === false ? "disabled" : ""} type="button">delete policy</button>` : ""}</td></tr>`).join("")
       || '<tr><td colspan="6" class="placeholder">No policies are visible.</td></tr>';
 }
 
@@ -5342,7 +6098,7 @@ function renderSecurityScanWaivers() {
         <td>${escapeHtml(waiver.exception || (waiver.findingId ? `Finding #${waiver.findingId}` : "-"))}</td>
         <td>${escapeHtml(waiver.expiresAt ? formatDateTime(waiver.expiresAt) : "Never expires")}</td>
         <td>${escapeHtml(waiver.approvedBy || "-")}</td><td>${escapeHtml(waiver.reason)}</td>
-        <td class="actions-column"><button class="row-action security-scan-waiver-delete" data-id="${waiver.id}" type="button">delete</button></td></tr>`;
+        <td class="actions-column">${waiver.canDelete === true ? `<button class="row-action security-scan-waiver-delete" data-id="${waiver.id}" type="button">delete</button>` : ""}</td></tr>`;
     }).join("")
       || '<tr><td colspan="9" class="placeholder">No waivers are visible.</td></tr>';
 }
@@ -5350,18 +6106,28 @@ function renderSecurityScanWaivers() {
 function securityScanPageParams(key) {
   const page = securityScanPages[key];
   const params = new URLSearchParams();
-  params.set("after", String(page.after || 0));
+  if (key === "tasks" || key === "runs") {
+    params.set("sort", key === "tasks" ? "finished_at" : "completed_at");
+    params.set("direction", page.direction);
+    if (page.after) params.set("cursor", page.after);
+  } else {
+    params.set("after", String(page.after || 0));
+  }
   params.set("limit", String(page.size || SECURITY_SCAN_DEFAULT_PAGE_SIZE));
   if (page.query) params.set("q", page.query);
+  if (key === "findings") params.set("currentOnly", String(page.currentOnly));
   return params;
 }
 
 async function fetchSecurityScanPage(key) {
+  if (key === "repositories") ++securityScanState.repositoryEditRequest;
   const endpoint = securityScanListEndpoints[key];
-  return fetchJson(
+  const requestVersion = ++securityScanPages[key].requestVersion;
+  const payload = await fetchJson(
     `/internal/security/scanning/${endpoint}?${securityScanPageParams(key).toString()}`,
     { items: [], nextAfter: null },
     `Failed to load scan ${key}`);
+  return { ...payload, requestVersion };
 }
 
 function resetSecurityScanPage(key) {
@@ -5412,6 +6178,7 @@ async function loadSecurityScanList(key) {
   const payload = await fetchSecurityScanPage(key);
   const items = Array.isArray(payload?.items) ? payload.items : [];
   const page = securityScanPages[key];
+  if (payload.requestVersion !== page.requestVersion) return;
   if (items.length === 0 && page.page > 0) {
     page.cursors.pop();
     page.page -= 1;
@@ -5419,7 +6186,7 @@ async function loadSecurityScanList(key) {
     return loadSecurityScanList(key);
   }
   securityScanState[key] = items;
-  page.nextAfter = payload?.nextAfter ?? null;
+  page.nextAfter = payload?.nextCursor ?? payload?.nextAfter ?? null;
   renderSecurityScanList(key);
 }
 
@@ -5452,6 +6219,23 @@ async function moveSecurityScanPage(key, direction) {
     page.after = page.cursors.at(-1) || 0;
   }
   await loadSecurityScanList(key);
+}
+
+async function sortSecurityScanPage(key, direction) {
+  securityScanPages[key].direction = direction;
+  updateTableSortHeaders(key, {
+    key: key === "tasks" ? "finished_at" : "completed_at",
+    direction,
+  });
+  resetSecurityScanPage(key);
+  await loadSecurityScanList(key);
+}
+
+async function filterCurrentSecurityScanFindings(currentOnly) {
+  securityScanPages.findings.currentOnly = currentOnly;
+  hideSecurityScanFindingDetail();
+  resetSecurityScanPage("findings");
+  await loadSecurityScanList("findings");
 }
 
 async function resizeSecurityScanPage(key, size) {
@@ -5488,8 +6272,9 @@ async function loadSecurityScanning() {
   securityScanState.summary = summary;
   keys.forEach((key, index) => {
     const payload = pages[index];
+    if (payload.requestVersion !== securityScanPages[key].requestVersion) return;
     securityScanState[key] = Array.isArray(payload?.items) ? payload.items : [];
-    securityScanPages[key].nextAfter = payload?.nextAfter ?? null;
+    securityScanPages[key].nextAfter = payload?.nextCursor ?? payload?.nextAfter ?? null;
   });
   renderSecurityScanning();
   const emptyLaterPages = keys.filter(
@@ -5505,6 +6290,7 @@ async function loadSecurityScanning() {
 
 function selectSecurityScanTab(tab, options = {}) {
   const selected = SECURITY_SCAN_TABS.has(tab) ? tab : "overview";
+  if (selected !== "repositories") ++securityScanState.repositoryEditRequest;
   if (options.updateHash !== false) {
     updateHashForSecurityScanTab(selected, Boolean(options.replaceHash));
   }
@@ -5603,22 +6389,101 @@ function applySecurityScanRepositoryScope(repository, config) {
   }
 }
 
-function editSecurityScanRepository(repositoryId) {
+async function loadSecurityScanPolicyOptions(assignedId) {
+  // Page policy heads, not their immutable revision history. The server also
+  // includes an older assigned revision so opening the form preserves its binding.
+  const policies = [];
+  let after = 0;
+  do {
+    const params = new URLSearchParams({ limit: "100", after: String(after) });
+    if (assignedId != null) params.set("assignedPolicyId", String(assignedId));
+    const response = await fetch(`/internal/security/scanning/policies/options?${params}`, { cache: "no-store" });
+    if (!response.ok) {
+      const error = new Error(`HTTP ${response.status}`);
+      error.response = response;
+      throw error;
+    }
+    const page = await response.json();
+    if (!Array.isArray(page?.items)) throw new Error("Invalid scan policy response");
+    policies.push(...page.items);
+    const next = page.nextAfter;
+    if (next != null && (!Number.isFinite(Number(next)) || Number(next) <= after)) throw new Error("Invalid scan policy cursor");
+    after = next == null ? null : Number(next);
+  } while (after != null);
+  // A policy may be revised between option pages. Discard a superseded head,
+  // while keeping the revision this repository already uses.
+  const latest = new Map();
+  for (const policy of policies) {
+    const name = policy.name.toLowerCase();
+    if (!latest.has(name) || Number(policy.revision) > Number(latest.get(name).revision)) {
+      latest.set(name, policy);
+    }
+  }
+  return policies.filter((policy) => latest.get(policy.name.toLowerCase()) === policy
+    || Number(policy.id) === Number(assignedId))
+    .sort((left, right) => left.name.localeCompare(right.name) || right.revision - left.revision);
+}
+
+function updateSecurityScanRepositoryPolicyHelp() {
+  const policyId = optionalNumber("security-scan-policy-id");
+  const policy = securityScanState.repositoryPolicyOptions.find((item) => Number(item.id) === policyId);
+  const policyHelp = document.getElementById("security-scan-policy-help");
+  if (policyId == null) {
+    policyHelp.textContent = "No policy is assigned. Built-in rules flag Critical vulnerabilities and have no age limit. They are not listed in Policies. Mode and exception handling still apply.";
+  } else if (!policy) {
+    policyHelp.textContent = "The assigned policy is unavailable. The current assignment is preserved; select a policy to replace it.";
+  } else {
+    policyHelp.textContent = policy.enabled
+      ? "Rules come from this policy in Security Scanning → Policies. Creating or editing another policy does not assign it here."
+      : "This policy is disabled: vulnerability and partial-result checks are bypassed, and its age limit is ignored. Pending and failure handling still apply.";
+  }
+  const repositoryAge = optionalNumber("security-scan-max-age");
+  const policyAge = policy?.enabled ? policy.maxResultAgeSeconds : null;
+  const limits = [repositoryAge, policyAge].filter((age) => Number(age) > 0).map(Number);
+  const validity = limits.length ? formatSecurityScanValidity(Math.min(...limits)) : "No expiry";
+  document.getElementById("security-scan-validity-help").textContent = policyId != null && !policy
+    ? "Effective validity is unavailable until the assigned policy can be loaded."
+    : `Effective validity: ${validity}. Uses the shorter repository/policy limit, measured from scan completion. Expired results use pending handling. With no limit, results do not expire by age; policy or scanner changes can still require reevaluation.`;
+}
+
+async function editSecurityScanRepository(repositoryId) {
   const repository = securityScanState.repositories.find((item) => Number(item.id) === Number(repositoryId));
-  if (!repository) return;
+  if (!securityScanCanMutate() || repository?.canConfigure !== true) return;
+  const request = ++securityScanState.repositoryEditRequest;
+  let policies;
+  try {
+    policies = await loadSecurityScanPolicyOptions(repository.config?.policyId);
+  } catch (error) {
+    if (request !== securityScanState.repositoryEditRequest) return;
+    // Error reporting and authentication redirects belong only to the current editor.
+    const message = error.response ? await responseErrorMessage(error.response) : error.message;
+    if (request === securityScanState.repositoryEditRequest) {
+      showToast(`Failed to load scan policies: ${message}`, "error");
+    }
+    return;
+  }
+  if (request !== securityScanState.repositoryEditRequest
+      || securityScanState.summary?.deploymentEnabled !== true
+      || !document.getElementById("security-scanning-view").classList.contains("is-active")) return;
+  securityScanState.repositoryPolicyOptions = policies;
   const config = repository.config || {};
   document.getElementById("security-scan-repository-id").value = repository.id;
   document.getElementById("security-scan-repository-name").value = repository.name;
   document.getElementById("security-scan-profile-name").value = repository.profileName || "Unavailable profile";
   document.getElementById("security-scan-profile-id").value = config.profileId || "";
-  document.getElementById("security-scan-repository-policy-name").value =
-    repository.policyName || "Built-in critical baseline";
-  document.getElementById("security-scan-policy-id").value = config.policyId || "";
+  const policySelect = document.getElementById("security-scan-policy-id");
+  policySelect.innerHTML = '<option value="">Built-in rules (no assigned policy)</option>'
+    + policies.map((policy) => `<option value="${escapeHtml(policy.id)}">${escapeHtml(policy.name)} (revision ${escapeHtml(policy.revision)})${policy.enabled ? "" : " (disabled)"}</option>`).join("");
+  if (config.policyId != null && !policies.some((policy) => Number(policy.id) === Number(config.policyId))) {
+    policySelect.innerHTML += `<option value="${escapeHtml(config.policyId)}">${escapeHtml(repository.policyName || "Unavailable assigned policy")} (current assignment)</option>`;
+  }
+  policySelect.value = config.policyId == null ? "" : String(config.policyId);
   document.getElementById("security-scan-enforcement-mode").value = config.enforcementMode || "AUDIT";
   document.getElementById("security-scan-pending-action").value = config.pendingAction || "ALLOW";
   document.getElementById("security-scan-failure-action").value = config.failureAction || "ALLOW";
   document.getElementById("security-scan-partial-action").value = config.partialAction || "ALLOW";
   setSecurityScanResultValidity(config.maxResultAgeSeconds);
+  updateSecurityScanRepositoryPolicyHelp();
   document.getElementById("security-scan-enabled").checked = Boolean(config.enabled);
   applySecurityScanRepositoryScope(repository, config);
   document.getElementById("security-scan-advanced").open =
@@ -5627,6 +6492,7 @@ function editSecurityScanRepository(repositoryId) {
 }
 
 function hideSecurityScanRepositoryForm() {
+  ++securityScanState.repositoryEditRequest;
   document.getElementById("security-scan-repository-id").value = "";
   closeFormModal("security-scan-repository-form");
 }
@@ -5638,6 +6504,9 @@ function optionalNumber(id) {
 
 async function saveSecurityScanRepository(event) {
   event.preventDefault();
+  const selected = securityScanState.repositories.find((item) =>
+    String(item.id) === String(document.getElementById("security-scan-repository-id").value));
+  if (!securityScanCanMutate() || selected?.canConfigure !== true) return;
   const form = document.getElementById("security-scan-repository-form");
   const repositoryId = Number(document.getElementById("security-scan-repository-id").value);
   const repositoryType = form.dataset.repositoryType;
@@ -5671,6 +6540,7 @@ async function saveSecurityScanRepository(event) {
 }
 
 function showCreateSecurityScanPolicyForm() {
+  if (!securityScanCanMutate()) return;
   securityScanPolicyFormMode = "create";
   editingSecurityScanPolicyId = null;
   editingSecurityScanPolicyEnabled = true;
@@ -5689,6 +6559,7 @@ function showCreateSecurityScanPolicyForm() {
 }
 
 function showEditSecurityScanPolicyForm(policyId) {
+  if (!securityScanCanMutate()) return;
   const policy = securityScanState.policies.find(
     (item) => Number(item.id) === Number(policyId));
   if (!policy) {
@@ -5734,6 +6605,7 @@ function hideSecurityScanPolicyForm() {
 
 async function saveSecurityScanPolicy(event) {
   event.preventDefault();
+  if (!securityScanCanMutate()) return;
   if (!validateRequiredFields(
       securityScanPolicyRequiredFields,
       { prefix: "Policy fields missing" })) return;
@@ -5766,6 +6638,33 @@ async function saveSecurityScanPolicy(event) {
     selectSecurityScanTab("policies");
   } catch (error) {
     showToast(`Policy save failed: ${error.message}`, "error");
+  }
+}
+
+async function deleteSecurityScanPolicy(policyId, button) {
+  if (!securityScanCanMutate()) return;
+  if (button?.disabled) return;
+  const policy = securityScanState.policies.find((item) => String(item.id) === String(policyId));
+  // Older replicas omit revision metadata during rolling upgrades; the server still fences deletion.
+  if (!policy || policy.latestRevision === false) return;
+  if (button) button.disabled = true;
+  try {
+    if (!await window.kkrepoConfirmDelete({
+      title: "Delete scan policy?",
+      description: "This deletes the policy and all its revisions. Referenced policies cannot be deleted.",
+      details: [{ label: "Policy", value: policy.name }],
+      confirmationText: policy.name
+    })) return;
+    const response = await fetch(
+      `/internal/security/scanning/policies/${encodeURIComponent(policy.id)}`, { method: "DELETE" });
+    if (!response.ok) throw new Error(await responseErrorMessage(response));
+    showToast("Security scan policy and all revisions deleted.", "ok");
+    resetSecurityScanPage("policies");
+    await loadSecurityScanList("policies");
+  } catch (error) {
+    showToast(`Policy deletion failed: ${error.message}`, "error");
+  } finally {
+    if (button) button.disabled = false;
   }
 }
 
@@ -5824,7 +6723,7 @@ async function showSecurityScanWaiverDetail(findingId) {
   openFormModal("security-scan-waiver-detail", "security-scan-close-waiver-detail-button");
   try {
     const response = await fetch(
-      `/internal/security/scanning/findings/${encodeURIComponent(findingId)}/waivers`,
+      `/internal/security/scanning/findings/${encodeURIComponent(findingId)}/waivers?currentOnly=${securityScanPages.findings.currentOnly}`,
       { cache: "no-store" });
     if (!response.ok) throw new Error(await responseErrorMessage(response));
     renderSecurityScanWaiverDetail(await response.json());
@@ -5863,6 +6762,93 @@ function renderSecurityScanFindingDetailSection(title, fields) {
     </section>`;
 }
 
+function renderSecurityScanFindingArtifactDetail(finding) {
+  const count = Number(finding.affectedArtifactCount || 0);
+  return `
+    <section class="security-scan-finding-detail-section security-scan-finding-artifact-section">
+      <div class="security-scan-finding-artifact-heading">
+        <h3>Affected artifacts</h3>
+        <span>${escapeHtml(count)} visible</span>
+      </div>
+      <div class="security-scan-finding-artifact-list" id="security-scan-finding-artifact-list">
+        <div class="placeholder">Loading affected artifacts…</div>
+      </div>
+      <button class="row-action security-scan-finding-artifacts-more" id="security-scan-finding-artifacts-more" type="button" hidden>Show more</button>
+    </section>`;
+}
+
+function renderSecurityScanFindingArtifactItems() {
+  const state = securityScanFindingArtifactDetail;
+  if (!state) return;
+  const list = document.getElementById("security-scan-finding-artifact-list");
+  const more = document.getElementById("security-scan-finding-artifacts-more");
+  if (!list || !more) return;
+  list.innerHTML = state.items.map((artifact) => {
+    const source = artifact.sourceRepository && artifact.sourceRepository !== artifact.repository
+      ? `<span>Source: ${escapeHtml(artifact.sourceRepository)}</span>`
+      : "";
+    return `
+      <a class="security-scan-finding-artifact-link"
+         href="${escapeHtml(securityScanFindingArtifactBrowseUrl(artifact))}">
+        <strong>${escapeHtml(artifact.repository)}</strong>
+        <code>${escapeHtml(artifact.browsePath || artifact.assetPath)}</code>
+        ${source}
+        ${lucideIcon("external-link")}
+      </a>`;
+  }).join("") || '<div class="placeholder">No currently visible artifact is associated with this finding.</div>';
+  more.hidden = state.nextRepositoryId == null || state.nextAssetId == null;
+  more.disabled = state.loading;
+  more.textContent = state.loading ? "Loading…" : "Show more";
+}
+
+async function loadSecurityScanFindingArtifacts(findingId, reset = false) {
+  if (reset || !securityScanFindingArtifactDetail
+      || Number(securityScanFindingArtifactDetail.findingId) !== Number(findingId)) {
+    securityScanFindingArtifactDetail = {
+      findingId: Number(findingId),
+      currentOnly: securityScanPages.findings.currentOnly,
+      items: [],
+      nextRepositoryId: 0,
+      nextAssetId: 0,
+      loading: false
+    };
+  }
+  const state = securityScanFindingArtifactDetail;
+  if (state.loading || state.nextRepositoryId == null || state.nextAssetId == null) return;
+  state.loading = true;
+  renderSecurityScanFindingArtifactItems();
+  const params = new URLSearchParams({
+    currentOnly: String(state.currentOnly),
+    afterRepositoryId: String(state.nextRepositoryId),
+    afterAssetId: String(state.nextAssetId),
+    limit: "25"
+  });
+  try {
+    const response = await fetch(
+      `/internal/security/scanning/findings/${encodeURIComponent(findingId)}/artifacts?${params.toString()}`,
+      { cache: "no-store" });
+    if (!response.ok) throw new Error(await responseErrorMessage(response));
+    const page = await response.json();
+    const seen = new Set(state.items.map(
+      (artifact) => `${artifact.repositoryId}:${artifact.assetId}`));
+    for (const artifact of page.items || []) {
+      const key = `${artifact.repositoryId}:${artifact.assetId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      state.items.push(artifact);
+    }
+    state.nextRepositoryId = page.nextRepositoryId ?? null;
+    state.nextAssetId = page.nextAssetId ?? null;
+  } catch (error) {
+    showToast(`Unable to load affected artifacts: ${error.message}`, "error");
+    state.nextRepositoryId = null;
+    state.nextAssetId = null;
+  } finally {
+    state.loading = false;
+    renderSecurityScanFindingArtifactItems();
+  }
+}
+
 function showSecurityScanFindingDetail(findingId) {
   const finding = securityScanState.findings.find(
     (item) => Number(item.id) === Number(findingId));
@@ -5892,6 +6878,7 @@ function showSecurityScanFindingDetail(findingId) {
       <div><span>Fixed versions</span><strong>${escapeHtml(securityScanFindingDetailValue(finding.fixedVersions))}</strong></div>
       <div><span>Waiver coverage</span><strong>${escapeHtml(waiverCoverage)}</strong></div>
     </div>
+    ${renderSecurityScanFindingArtifactDetail(finding)}
     <div class="security-scan-finding-detail-sections">
       ${renderSecurityScanFindingDetailSection("Vulnerability", [
         ["Aliases", finding.aliases],
@@ -5910,20 +6897,25 @@ function showSecurityScanFindingDetail(findingId) {
       ])}
     </div>`;
   openFormModal("security-scan-finding-detail", "security-scan-close-finding-detail-button");
+  loadSecurityScanFindingArtifacts(finding.id, true);
 }
 
 function hideSecurityScanFindingDetail() {
+  securityScanFindingArtifactDetail = null;
   closeFormModal("security-scan-finding-detail");
 }
 
 async function showCreateSecurityScanWaiverForm(findingId) {
+  const finding = securityScanState.findings.find((item) => String(item.id) === String(findingId));
+  if (!securityScanCanMutate("nexus:security-scanning-waivers:create")
+      || finding?.canCreateWaiver !== true) return;
   const form = document.getElementById("security-scan-waiver-form");
   form.reset();
   clearRequiredFieldErrors(securityScanWaiverRequiredFields);
   securityScanWaiverContext = null;
   try {
     const response = await fetch(
-      `/internal/security/scanning/findings/${encodeURIComponent(findingId)}/waiver-context`,
+      `/internal/security/scanning/findings/${encodeURIComponent(findingId)}/waiver-context?currentOnly=${securityScanPages.findings.currentOnly}`,
       { cache: "no-store" });
     if (!response.ok) throw new Error(await responseErrorMessage(response));
     const context = await response.json();
@@ -5965,6 +6957,7 @@ function hideSecurityScanWaiverForm() {
 
 async function createSecurityScanWaiver(event) {
   event.preventDefault();
+  if (!securityScanCanMutate("nexus:security-scanning-waivers:create")) return;
   if (!validateRequiredFields(
       securityScanWaiverRequiredFields,
       { prefix: "Waiver fields missing" })) return;
@@ -6019,6 +7012,8 @@ async function createSecurityScanWaiver(event) {
 }
 
 async function securityScanTaskAction(kind, id) {
+  const task = securityScanState.tasks.find((item) => String(item.id) === String(id));
+  if (!securityScanCanMutate() || task?.canManage !== true) return;
   try {
     const response = await fetch(`/internal/security/scanning/tasks/${id}/${kind}`, { method: "POST" });
     if (!response.ok) throw new Error(await responseErrorMessage(response));
@@ -6031,6 +7026,8 @@ async function securityScanTaskAction(kind, id) {
 }
 
 async function securityScanRescan(assetId) {
+  if (!securityScanCanMutate() || !securityScanState.tasks.some((task) =>
+      String(task.assetId) === String(assetId) && task.canRescan === true)) return;
   try {
     const response = await fetch(`/internal/security/scanning/assets/${assetId}/rescan`, { method: "POST" });
     if (!response.ok) throw new Error(await responseErrorMessage(response));
@@ -6043,7 +7040,14 @@ async function securityScanRescan(assetId) {
 }
 
 async function deleteSecurityScanWaiver(waiverId) {
-  if (!window.confirm(`Delete security scan waiver ${waiverId}?`)) return;
+  const waiver = securityScanState.waivers.find((item) => String(item.id) === String(waiverId));
+  if (!securityScanCanMutate("nexus:security-scanning-waivers:delete")
+      || waiver?.canDelete !== true) return;
+  if (!await window.kkrepoConfirmDelete({
+    title: "Delete security scan waiver?",
+    description: "The waived findings will be subject to the scan policy again, which may block downloads.",
+    details: [{ label: "Waiver ID", value: String(waiverId) }]
+  })) return;
   try {
     const response = await fetch(`/internal/security/scanning/waivers/${waiverId}`, { method: "DELETE" });
     if (!response.ok) throw new Error(await responseErrorMessage(response));
@@ -6107,7 +7111,9 @@ function handleCleanupTabKeydown(event) {
 }
 
 function cleanupRuleBadges(criteria = {}) {
-  const rules = [];
+  const snapshot = criteria.mode === "MAVEN_SNAPSHOT_BUILDS";
+  criteria = snapshot ? (criteria.snapshot || {}) : criteria;
+  const rules = snapshot ? ["snapshot builds"] : [];
   if (criteria.pattern) rules.push(`${criteria.patternType === "REGEX" ? "regex" : "glob"}: ${criteria.pattern}`);
   if (criteria.publishedOlderThanDays != null) rules.push(`published > ${criteria.publishedOlderThanDays}d`);
   if (criteria.lastDownloadedOlderThanDays != null) rules.push(`downloaded > ${criteria.lastDownloadedOlderThanDays}d`);
@@ -6173,6 +7179,7 @@ function openCleanupPolicyActionMenu(policyId, trigger, focusTarget = null) {
     return;
   }
   closeCleanupPolicyActionMenu();
+  closeBlobStoreActionMenu();
   cleanupActionMenuPolicyId = numericPolicyId;
   cleanupActionMenuTrigger = trigger;
   const executeSupported = Boolean(view.capability?.executeSupported);
@@ -6453,7 +7460,9 @@ function cleanupRepositoryCandidates() {
   const format = document.getElementById("cleanup-policy-format").value;
   return repositories
     .filter((repository) => lowerOrEmpty(repository.format) === lowerOrEmpty(format))
-    .filter((repository) => ["hosted", "proxy"].includes(lowerOrEmpty(repository.type)))
+    .filter((repository) => document.getElementById("cleanup-policy-mode")?.value === "MAVEN_SNAPSHOT_BUILDS"
+      ? lowerOrEmpty(repository.type) === "hosted"
+      : ["hosted", "proxy"].includes(lowerOrEmpty(repository.type)))
     .sort((left, right) => left.name.localeCompare(right.name));
 }
 
@@ -6633,11 +7642,19 @@ function bindCleanupRepositoryPicker() {
 function refreshCleanupCapabilityHelp() {
   const format = document.getElementById("cleanup-policy-format").value;
   const capability = cleanupCapability(format);
+  const mode = document.getElementById("cleanup-policy-mode");
+  if (format.toLowerCase() !== "maven2") mode.value = "COMPONENT";
+  document.getElementById("cleanup-policy-mode-field").hidden = format.toLowerCase() !== "maven2";
+  const snapshot = mode.value === "MAVEN_SNAPSHOT_BUILDS";
+  document.getElementById("cleanup-policy-snapshot-help").hidden = !snapshot;
+  document.getElementById("cleanup-policy-retain-label").textContent = snapshot ? "Keep newest builds per SNAPSHOT" : "Keep newest versions";
   const retainInput = document.getElementById("cleanup-policy-retain-count");
   retainInput.disabled = !capability?.retainCountSupported;
+  retainInput.min = snapshot ? "1" : "0";
+  retainInput.required = snapshot;
   if (retainInput.disabled) retainInput.value = "";
   setCleanupFieldHelp("cleanup-policy-retain-help", capability?.retainCountSupported
-    ? "Uses this format's protocol version comparator."
+    ? (snapshot ? "Retains at least this many timestamped builds within each base SNAPSHOT version." : "Uses this format's protocol version comparator.")
     : "Version retention is not enabled for this format yet; pattern and age rules remain available.");
   const downloadedInput = document.getElementById("cleanup-policy-downloaded-days");
   downloadedInput.disabled = !capability?.lastDownloadedSupported;
@@ -6645,7 +7662,7 @@ function refreshCleanupCapabilityHelp() {
     downloadedInput.value = "";
   }
   setCleanupFieldHelp("cleanup-policy-downloaded-help", capability?.lastDownloadedSupported
-    ? "Successful authorized GET requests persist a shared download watermark; HEAD requests do not count. Artifacts without a download timestamp are skipped."
+    ? (snapshot ? "Successful artifact GET requests count as downloads. Never-downloaded builds use their publication time. A full observation window is required after enabling usage tracking." : "Successful authorized GET requests persist a shared download watermark; HEAD requests do not count. Artifacts without a download timestamp are skipped.")
     : "Last-download retention is disabled until this format records a validated shared download watermark.");
   document.getElementById("cleanup-policy-execute-help").textContent = capability?.executeSupported
     ? editingCleanupPolicyId == null
@@ -6719,17 +7736,23 @@ function scheduleFieldHelpPopoverHide() {
   }, 220);
 }
 
+function bindFieldHelpTrigger(trigger) {
+  trigger.addEventListener("mouseenter", () => showFieldHelpPopover(trigger));
+  trigger.addEventListener("mouseleave", scheduleFieldHelpPopoverHide);
+  trigger.addEventListener("focus", () => showFieldHelpPopover(trigger));
+  trigger.addEventListener("blur", scheduleFieldHelpPopoverHide);
+  trigger.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !document.getElementById("field-help-popover").hidden) {
+      event.preventDefault();
+      event.stopPropagation();
+      hideFieldHelpPopover();
+    }
+  });
+}
+
 function bindFieldHelpTooltips() {
   const popover = document.getElementById("field-help-popover");
-  document.querySelectorAll(".field-help").forEach((trigger) => {
-    trigger.addEventListener("mouseenter", () => showFieldHelpPopover(trigger));
-    trigger.addEventListener("mouseleave", scheduleFieldHelpPopoverHide);
-    trigger.addEventListener("focus", () => showFieldHelpPopover(trigger));
-    trigger.addEventListener("blur", scheduleFieldHelpPopoverHide);
-    trigger.addEventListener("keydown", (event) => {
-      if (event.key === "Escape") hideFieldHelpPopover();
-    });
-  });
+  document.querySelectorAll(".field-help").forEach(bindFieldHelpTrigger);
   popover.addEventListener("mouseenter", clearFieldHelpHideTimer);
   popover.addEventListener("mouseleave", scheduleFieldHelpPopoverHide);
   document.addEventListener("scroll", () => {
@@ -6876,8 +7899,10 @@ function showEditCleanupPolicyForm(policyId) {
   editingCleanupPolicyId = Number(policyId);
   populateCleanupTimeZoneOptions();
   const policy = view.policy;
-  const criteria = policy.criteria || {};
+  const snapshot = policy.criteria?.mode === "MAVEN_SNAPSHOT_BUILDS";
+  const criteria = snapshot ? (policy.criteria.snapshot || {}) : (policy.criteria || {});
   populateCleanupFormatOptions(policy.format);
+  document.getElementById("cleanup-policy-mode").value = snapshot ? "MAVEN_SNAPSHOT_BUILDS" : "COMPONENT";
   document.getElementById("cleanup-policy-name").value = policy.name || "";
   document.getElementById("cleanup-policy-pattern-type").value = criteria.patternType || "GLOB";
   document.getElementById("cleanup-policy-pattern").value = criteria.pattern || "";
@@ -6936,7 +7961,8 @@ function cleanupPolicyPayload() {
     name: document.getElementById("cleanup-policy-name").value.trim(),
     format: document.getElementById("cleanup-policy-format").value,
     notes: document.getElementById("cleanup-policy-notes").value.trim() || null,
-    criteria,
+    criteria: document.getElementById("cleanup-policy-mode")?.value === "MAVEN_SNAPSHOT_BUILDS"
+      ? { mode: "MAVEN_SNAPSHOT_BUILDS", snapshot: criteria } : criteria,
     repositoryIds: cleanupSelectedRepositoryIds(),
     scanLimitPerRepository: current?.scanLimitPerRepository ?? null,
     deleteLimitPerRepository: current?.deleteLimitPerRepository ?? null,
@@ -7136,15 +8162,21 @@ async function submitCleanupTryRun(event) {
   }
 }
 
-function startCleanupRun(policyId, mode, trigger = null) {
+async function startCleanupRun(policyId, mode, trigger = null) {
   const view = cleanupPolicyView(policyId);
   if (!view) return;
   if (mode === "TRY_RUN") {
     showCleanupTryRunDialog(policyId, trigger);
     return;
   }
-  if (!window.confirm(`Run cleanup policy "${view.policy.name}" now? Matching artifacts can be deleted.`)) return;
-  queueCleanupRun(policyId, mode);
+  if (!await window.kkrepoConfirmDelete({
+    title: "Run cleanup policy?",
+    description: "Artifacts matching this policy may be permanently deleted. Review a Try Run before continuing.",
+    details: [{ label: "Policy", value: view.policy.name }],
+    confirmationText: view.policy.name,
+    confirmLabel: "Run cleanup"
+  })) return;
+  await queueCleanupRun(policyId, mode);
 }
 
 async function monitorCleanupRun(runId, label) {
@@ -7246,6 +8278,8 @@ async function loadCleanupRunDetails(runId) {
 }
 
 function cleanupRunRuleSnapshot(criteria = {}) {
+  const snapshot = criteria.mode === "MAVEN_SNAPSHOT_BUILDS";
+  criteria = snapshot ? (criteria.snapshot || {}) : criteria;
   const pattern = criteria.pattern
     ? `${criteria.patternType === "REGEX" ? "Regular expression" : "Wildcard"} · ${criteria.pattern}`
     : "All names and paths";
@@ -7254,7 +8288,7 @@ function cleanupRunRuleSnapshot(criteria = {}) {
       <div><dt>Name/path pattern</dt><dd>${escapeHtml(pattern)}</dd></div>
       <div><dt>Published age</dt><dd>${criteria.publishedOlderThanDays == null ? "Not configured" : `Older than ${escapeHtml(criteria.publishedOlderThanDays)} days`}</dd></div>
       <div><dt>Download activity</dt><dd>${criteria.lastDownloadedOlderThanDays == null ? "Not configured" : `Last downloaded more than ${escapeHtml(criteria.lastDownloadedOlderThanDays)} days ago`}</dd></div>
-      <div><dt>Version retention</dt><dd>${criteria.retainCount == null ? "Not configured" : `Keep newest ${escapeHtml(criteria.retainCount)} versions per family`}</dd></div>
+      <div><dt>Version retention</dt><dd>${criteria.retainCount == null ? "Not configured" : `Keep newest ${escapeHtml(criteria.retainCount)} ${snapshot ? "builds per SNAPSHOT" : "versions per family"}`}</dd></div>
     </dl>`;
 }
 
@@ -7385,7 +8419,11 @@ async function renderCleanupRun(view, options = {}) {
 
 async function deleteCleanupPolicy(policyId) {
   const view = cleanupPolicyView(policyId);
-  if (!view || !window.confirm(`Delete cleanup policy "${view.policy.name}"? Historical runs remain available.`)) return;
+  if (!view || !await window.kkrepoConfirmDelete({
+    title: "Delete cleanup policy?",
+    description: "This removes the cleanup policy. Historical runs remain available.",
+    details: [{ label: "Policy", value: view.policy.name }]
+  })) return;
   try {
     const response = await fetch(`/internal/cleanup/policies/${policyId}?revision=${view.policy.revision}`, { method: "DELETE" });
     if (!response.ok) throw new Error(await responseErrorMessage(response));
@@ -7396,9 +8434,58 @@ async function deleteCleanupPolicy(policyId) {
   }
 }
 
+function permissionPartMatches(grantedPart, requestedPart, action = false) {
+  const normalize = (part) => {
+    const value = (part || "*").trim().toLowerCase();
+    if (!action) return value;
+    if (value === "create") return "add";
+    if (value === "update") return "edit";
+    return value === "all" ? "*" : value;
+  };
+  const requested = normalize(requestedPart);
+  return (grantedPart || "*").split(",").some((part) => {
+    // Backend ALL grants concrete actions, but only a literal * satisfies a wildcard request.
+    if (action && (requestedPart || "*").trim() === "*") return part.trim() === "*";
+    const normalized = normalize(part);
+    return normalized === "*" || normalized === requested;
+  });
+}
+
+function permissionMatches(granted, requested) {
+  const grantedParts = (granted || "").toLowerCase().split(":");
+  const requestedParts = (requested || "").toLowerCase().split(":");
+  const domain = requestedParts[1];
+  const actionIndex = ["repository-view", "repository-admin"].includes(domain) ? 4
+    : domain === "repository-content-selector" ? 5
+    : grantedParts[0] === "nexus" && requestedParts[0] === "nexus" ? 2 : -1;
+  const length = Math.max(grantedParts.length, requestedParts.length);
+  for (let index = 0; index < length; index += 1) {
+    if (!permissionPartMatches(grantedParts[index], requestedParts[index], index === actionIndex)) return false;
+  }
+  return true;
+}
+
+function canAdmin(permission) {
+  return currentAdminPermissions.some((granted) => permissionMatches(granted, permission));
+}
+
+function canAccessAdminView(view) {
+  if (canAdmin("nexus:*")) return view !== "loading";
+  if (view === "security-scanning") return canAdmin("nexus:security-scanning:read");
+  return view === "content-selectors" && ["read", "create", "update", "delete"]
+    .some((action) => canAdmin(`nexus:selectors:${action}`));
+}
+
 function switchView(view, options = {}) {
-  if (!currentAdminPermissions.includes("nexus:*") && view !== "content-selectors") return false;
   if (!document.getElementById(`${view}-view`)) return false;
+  if (!initialDataLoaded) {
+    // Keep the URL as the pending selection; bootstrap will apply it after authorization.
+    // This also lets Back/Forward supersede a click made while discovery was pending.
+    if (options.updateHash !== false) updateHashForView(view, Boolean(options.replaceHash));
+    return false;
+  }
+  if (!canAccessAdminView(view)) return false;
+  if (view !== "security-scanning") ++securityScanState.repositoryEditRequest;
   if (options.updateHash !== false) {
     updateHashForView(view, Boolean(options.replaceHash));
   }
@@ -7406,7 +8493,7 @@ function switchView(view, options = {}) {
     item.classList.toggle("is-active", item.id === `${view}-view`);
   });
   document.querySelectorAll(".side-item").forEach((item) => {
-    item.classList.toggle("is-active", item.dataset.view === view);
+    item.classList.toggle("is-active", item.dataset.view === (view === "ohpm-login" ? "security-api-keys" : view));
   });
   updateCurrentSideGroup(view);
   if (view === "blobstores") {
@@ -7422,6 +8509,7 @@ function switchView(view, options = {}) {
     loadCleanupPolicies();
   }
   if (view === "content-selectors") window.KkContentSelectors.load();
+  if (view === "routing-rules") window.KkRoutingRules.load();
   if (view === "docker-registry") loadDockerOperations();
   if (view === "security-users") loadSecurityUsers();
   if (view === "security-roles") loadSecurityRoles();
@@ -7440,12 +8528,15 @@ function switchView(view, options = {}) {
   if (view === "security-audit-log") loadAuditLogs(0);
   if (view === "ui-settings") loadUiSettings();
   if (view === "repository-data-migration") loadRepositoryDataMigrationJobs();
+  if (view === "ohpm-import") window.KkOhpmImport.load();
+  if (view === "ohpm-login") window.KkOhpmLogin.load();
   return true;
 }
 
 function applyHashRoute() {
+  if (!initialDataLoaded) return false;
   const view = viewFromHash();
-  if (!view) return false;
+  if (!view || !canAccessAdminView(view)) return false;
   if (view === "cleanup-policies"
       && document.getElementById("cleanup-policies-view").classList.contains("is-active")) {
     selectCleanupTab(
@@ -7490,10 +8581,21 @@ window.addEventListener("hashchange", applyHashRoute);
 window.addEventListener("popstate", applyHashRoute);
 
 document.getElementById("repository-filter").addEventListener("input", renderRepositories);
+document.getElementById("repository-store-filter").addEventListener("change", renderRepositories);
+document.getElementById("repository-usage-refresh").addEventListener("click", () => loadRepositories());
+document.getElementById("blobstore-usage-refresh").addEventListener("click", () => loadBlobStores());
+document.getElementById("blobstore-table").addEventListener("click", (event) => {
+  const copyButton = event.target.closest(".usage-location-copy");
+  if (copyButton) {
+    copyLocationValue(copyButton);
+    return;
+  }
+});
 document.addEventListener("click", (event) => {
   const sortButton = event.target.closest("[data-repository-sort]");
-  if (!sortButton) return;
-  toggleRepositorySort(sortButton.dataset.repositorySort);
+  if (sortButton) toggleRepositorySort(sortButton.dataset.repositorySort);
+  const blobSortButton = event.target.closest("[data-blobstore-sort]");
+  if (blobSortButton) toggleBlobStoreSort(blobSortButton.dataset.blobstoreSort);
 });
 document.getElementById("blobstore-filter").addEventListener("input", renderBlobStores);
 document.getElementById("user-menu").addEventListener("mouseenter", openUserMenu);
@@ -7522,20 +8624,27 @@ document.addEventListener("click", (event) => {
   const actionMenu = document.getElementById("cleanup-policy-action-menu");
   if (!actionMenu.hidden
       && !actionMenu.contains(event.target)
-      && !event.target.closest(".cleanup-policy-more-actions")) {
+      && !event.target.closest(".cleanup-policy-more-actions:not(.blobstore-more-actions)")) {
     closeCleanupPolicyActionMenu();
+  }
+  const blobMenu = document.getElementById("blobstore-action-menu");
+  if (!blobMenu.hidden
+      && !blobMenu.contains(event.target)
+      && !event.target.closest(".blobstore-more-actions")) {
+    closeBlobStoreActionMenu();
   }
 });
 document.addEventListener("keydown", (event) => {
   if (handleFormModalKeydown(event)) return;
   if (handleCleanupPolicyActionMenuKeydown(event)) return;
+  if (handleBlobStoreActionMenuKeydown(event)) return;
   if (event.key === "Escape") closeUserMenu();
 });
 document.getElementById("create-blobstore-button").addEventListener("click", showCreateBlobStoreForm);
 document.getElementById("cancel-blobstore-button").addEventListener("click", hideBlobStoreForm);
 document.getElementById("blobstore-form").addEventListener("submit", saveBlobStore);
 document.getElementById("save-blobstore-button").addEventListener("click", saveBlobStore);
-document.getElementById("blobstore-engine").addEventListener("change", refreshBlobStoreEngineControls);
+bindBlobStoreFormModeControls();
 blobStoreFormFields.forEach((field) => {
   document.getElementById(field.id).addEventListener("input", clearBlobStoreFieldError);
 });
@@ -7545,10 +8654,41 @@ document.getElementById("blobstore-table").addEventListener("click", (event) => 
     showEditBlobStoreForm(editButton.dataset.id);
     return;
   }
-  const checkButton = event.target.closest(".check-blobstore-button");
-  if (!checkButton) return;
-  checkBlobStore(checkButton.dataset.id, checkButton.dataset.name);
+  const moreButton = event.target.closest(".blobstore-more-actions");
+  if (moreButton) {
+    openBlobStoreActionMenu(moreButton.dataset.id, moreButton, event.detail === 0 ? "first" : null);
+  }
 });
+document.getElementById("blobstore-table").addEventListener("keydown", (event) => {
+  const moreButton = event.target.closest(".blobstore-more-actions");
+  if (!moreButton || !["ArrowDown", "ArrowUp"].includes(event.key)) return;
+  event.preventDefault();
+  openBlobStoreActionMenu(moreButton.dataset.id, moreButton,
+    event.key === "ArrowDown" ? "first" : "last");
+});
+document.getElementById("blobstore-action-menu").addEventListener("click", (event) => {
+  const item = event.target.closest("[data-blobstore-action]");
+  if (!item || blobActionMenuStoreId == null) return;
+  const id = blobActionMenuStoreId;
+  const store = blobStores.find((entry) => String(entry.id) === String(id));
+  const action = item.dataset.blobstoreAction;
+  closeBlobStoreActionMenu({ restoreFocus: true });
+  if (!store) return;
+  if (action === "repositories") showBlobStoreRepositories(store.name);
+  if (action === "check") checkBlobStore(id, store.name);
+  if (action === "delete") deleteBlobStore(id);
+});
+document.getElementById("blobstore-action-menu").addEventListener("focusout", () => {
+  setTimeout(() => {
+    const menu = document.getElementById("blobstore-action-menu");
+    if (!menu.contains(document.activeElement)
+        && document.activeElement !== blobActionMenuTrigger) {
+      closeBlobStoreActionMenu();
+    }
+  }, 0);
+});
+document.addEventListener("scroll", () => positionBlobStoreActionMenu(), true);
+window.addEventListener("resize", positionBlobStoreActionMenu);
 
 document.getElementById("create-repository-button").addEventListener("click", showCreateRepositoryForm);
 document.getElementById("cancel-repository-button").addEventListener("click", hideRepositoryForm);
@@ -7559,8 +8699,18 @@ document.getElementById("repository-form").addEventListener("submit", (event) =>
 });
 bindRepositoryRecipeCombobox();
 document.getElementById("repository-recipe").addEventListener("change", refreshRepositoryRecipeControls);
+document.getElementById("repository-remote-authentication-type").addEventListener("change", refreshRepositoryRecipeControls);
 document.getElementById("repository-docker-connector-enabled").addEventListener("change", refreshDockerConnectorControls);
 document.getElementById("repository-apt-flat").addEventListener("change", refreshAptControls);
+for (const field of conanManifestFields) {
+  const input = document.getElementById(field.id);
+  input.addEventListener("input", () => updateConanManifestSetting(field));
+  input.addEventListener("blur", () => {
+    // Refill the inherited display without interpreting that number as a new override.
+    if (input.value === "") updateConanManifestSetting(field, true);
+  });
+}
+window.addEventListener("kkrepo:i18n-change", updateConanManifestHelp);
 document.getElementById("repository-conan-refresh-status").addEventListener("click", () => loadConanStatus());
 document.getElementById("repository-apt-enforce-distribution").addEventListener("change", refreshAptControls);
 document.getElementById("repository-apt-metadata-mode").addEventListener("change", refreshAptControls);
@@ -7578,6 +8728,11 @@ bindRequiredFieldErrors(repositoryRequiredFields);
 bindMemberTransferEvents();
 bindSecurityTransfers();
 document.getElementById("repository-table").addEventListener("click", (event) => {
+  const copyButton = event.target.closest(".usage-location-copy");
+  if (copyButton) {
+    copyLocationValue(copyButton);
+    return;
+  }
   const editButton = event.target.closest(".edit-repository-button");
   if (editButton) {
     showEditRepositoryForm(editButton.dataset.name);
@@ -7618,7 +8773,12 @@ document.querySelectorAll("[data-cleanup-tab]").forEach((button) => {
   button.addEventListener("click", () => selectCleanupTab(button.dataset.cleanupTab));
   button.addEventListener("keydown", handleCleanupTabKeydown);
 });
+document.getElementById("cleanup-policy-mode").addEventListener("change", () => {
+  refreshCleanupCapabilityHelp();
+  refreshCleanupRepositoryOptions([]);
+});
 document.getElementById("cleanup-policy-format").addEventListener("change", () => {
+  refreshCleanupCapabilityHelp();
   refreshCleanupRepositoryOptions([]);
   refreshCleanupScheduleFields();
 });
@@ -7709,6 +8869,17 @@ document.querySelectorAll("[data-security-scan-page-action]").forEach((button) =
       button.dataset.securityScanPageList,
       button.dataset.securityScanPageAction));
 });
+document.getElementById("security-scan-current-findings").addEventListener("change", (event) => {
+  filterCurrentSecurityScanFindings(event.target.checked)
+    .catch((error) => showToast(error.message, "error"));
+});
+
+["tasks", "runs"].forEach((key) => {
+  document.querySelectorAll(`[data-${key}-sort]`).forEach((button) => {
+    button.addEventListener("click", () => sortSecurityScanPage(
+      key, securityScanPages[key].direction === "desc" ? "asc" : "desc"));
+  });
+});
 document.querySelectorAll("[data-security-scan-page-size]").forEach((select) => {
   select.addEventListener(
     "change",
@@ -7719,6 +8890,9 @@ document.getElementById("security-scan-repository-table").addEventListener("clic
   if (editButton) editSecurityScanRepository(editButton.dataset.id);
 });
 document.getElementById("security-scan-repository-form").addEventListener("submit", saveSecurityScanRepository);
+["security-scan-policy-id", "security-scan-max-age"].forEach((id) => {
+  document.getElementById(id).addEventListener("change", updateSecurityScanRepositoryPolicyHelp);
+});
 document.getElementById("security-scan-cancel-repository-button").addEventListener(
   "click", hideSecurityScanRepositoryForm);
 document.getElementById("security-scan-create-policy-button").addEventListener(
@@ -7730,7 +8904,12 @@ document.getElementById("security-scan-policy-form").addEventListener(
 bindRequiredFieldErrors(securityScanPolicyRequiredFields);
 document.getElementById("security-scan-policy-table").addEventListener("click", (event) => {
   const editButton = event.target.closest(".security-scan-policy-edit");
-  if (editButton) showEditSecurityScanPolicyForm(editButton.dataset.id);
+  if (editButton) {
+    showEditSecurityScanPolicyForm(editButton.dataset.id);
+    return;
+  }
+  const deleteButton = event.target.closest(".security-scan-policy-delete");
+  if (deleteButton) deleteSecurityScanPolicy(deleteButton.dataset.id, deleteButton);
 });
 document.getElementById("security-scan-cancel-waiver-button").addEventListener(
   "click", hideSecurityScanWaiverForm);
@@ -7741,6 +8920,12 @@ document.getElementById("security-scan-view-all-waivers-button").addEventListene
   "click", viewAllSecurityScanWaivers);
 document.getElementById("security-scan-close-finding-detail-button").addEventListener(
   "click", hideSecurityScanFindingDetail);
+document.getElementById("security-scan-finding-detail-content").addEventListener("click", (event) => {
+  const more = event.target.closest(".security-scan-finding-artifacts-more");
+  if (more && securityScanFindingArtifactDetail) {
+    loadSecurityScanFindingArtifacts(securityScanFindingArtifactDetail.findingId);
+  }
+});
 bindRequiredFieldErrors(securityScanWaiverRequiredFields);
 document.getElementById("security-scan-finding-table").addEventListener("click", (event) => {
   const viewButton = event.target.closest(".security-scan-finding-view");
@@ -7925,23 +9110,36 @@ document.getElementById("repository-data-migration-packages-button").addEventLis
 document.getElementById("repository-data-migration-retry-failed-button").addEventListener("click", retryRepositoryDataFailedPackages);
 document.getElementById("repository-data-migration-refresh-button").addEventListener("click", loadRepositoryDataMigrationJobs);
 
-hydrateSessionControls();
-loadCurrentSession({ quiet: true }).then((session) => {
-  if (!session) return;
-  if (!currentAdminPermissions.includes("nexus:*")) {
-    document.querySelectorAll(".side-item").forEach((item) => {
-      item.hidden = item.dataset.view !== "content-selectors";
-    });
-    document.querySelectorAll(".side-group").forEach((item) => {
-      item.hidden = item.dataset.sideGroup !== "repository";
-    });
-    switchView("content-selectors");
+async function bootstrap() {
+  hydrateSessionControls();
+  const session = await loadCurrentSession({ quiet: true });
+  if (!session) {
+    document.getElementById("loading-view").textContent = "Failed to load session";
     return;
   }
-  loadRepositoryRecipes().then(() => {
-    if (!applyHashRoute()) {
-      loadRepositories();
-    }
+  document.querySelectorAll(".side-item").forEach((item) => {
+    item.hidden = !canAccessAdminView(item.dataset.view);
   });
+  document.querySelectorAll(".side-group").forEach((group) => {
+    group.hidden = !Array.from(sideGroupItems(group.dataset.sideGroup)?.querySelectorAll(".side-item") || [])
+      .some((item) => !item.hidden);
+  });
+  if (!canAdmin("nexus:*")) {
+    initialDataLoaded = true;
+    if (!applyHashRoute()) {
+      const fallback = ["security-scanning", "content-selectors"].find(canAccessAdminView);
+      if (fallback) switchView(fallback, { replaceHash: true });
+      else document.getElementById("loading-view").textContent = "No administration views are available.";
+    }
+    return;
+  }
+  const recipesPromise = Promise.all([loadRepositoryRecipes(), loadConanManifestDefaults()]);
   loadBlobStores();
-});
+  await recipesPromise;
+  initialDataLoaded = true;
+  // Resolve the current URL only after authorization and recipe discovery. The initial HTML
+  // stays on Loading, and navigation during startup must not restore an older/default route.
+  if (!applyHashRoute()) switchView("repositories", { updateHash: false });
+}
+
+bootstrap();

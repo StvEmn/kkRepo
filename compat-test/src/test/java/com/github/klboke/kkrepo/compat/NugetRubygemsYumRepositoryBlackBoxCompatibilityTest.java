@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -46,7 +47,7 @@ class NugetRubygemsYumRepositoryBlackBoxCompatibilityTest {
   private static final ObjectMapper MAPPER = new ObjectMapper();
   private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {};
   private static final String DEFAULT_YUM_FIXTURE_URL =
-      "https://dl.fedoraproject.org/pub/epel/9/Everything/x86_64/Packages/6/6tunnel-0.13-1.el9.x86_64.rpm";
+      "https://kojipkgs.fedoraproject.org/packages/6tunnel/0.13/1.el9/x86_64/6tunnel-0.13-1.el9.x86_64.rpm";
   private static final HttpClient HTTP = HttpClient.newBuilder()
       .connectTimeout(Duration.ofSeconds(20))
       .followRedirects(HttpClient.Redirect.NORMAL)
@@ -67,6 +68,33 @@ class NugetRubygemsYumRepositoryBlackBoxCompatibilityTest {
         true);
     assertNugetProxyRead(config, config.nugetProxyRepository(), config.nugetProxyRepository());
     assertNugetProxyRead(config, config.nugetGroupRepository(), config.nugetGroupRepository());
+    // Discover the advertised resource and exercise the actual Visual Studio Browse request.
+    // Checking the service-index shape alone cannot detect a broken upstream search URL.
+    for (String repository : List.of(config.nugetProxyRepository(), config.nugetGroupRepository())) {
+      String query = "?q=&skip=0&take=26&prerelease=false&supportedFramework=net10.0&semVerLevel=2.0.0";
+      for (Endpoint endpoint : List.of(config.nexus, config.nexusPlus)) {
+        Map<String, Object> index = getJson(endpoint.repository(repository, "index.json"));
+        String search = nugetResourceBase(index, "SearchQueryService");
+        Exchange response = get(endpoint.absolute(search + query));
+        assertEquals(200, response.status(), repository + " search status");
+        assertEquals("application/json", normalizedContentType(response));
+        JsonNode body = MAPPER.readTree(response.body());
+        assertTrue(body.path("totalHits").asLong() > 0, repository + " search totalHits");
+        assertTrue(body.path("data").isArray());
+        assertTrue(body.path("data").size() > 0 && body.path("data").size() <= 26);
+        assertTrue(body.path("data").get(0).path("id").isTextual());
+        // Autocomplete is optional in V3; Nexus 3.94 does not advertise it.
+        if (nugetResourceTypes(index).stream().anyMatch(type -> type.startsWith("SearchAutocompleteService"))) {
+          String autocomplete = nugetResourceBase(index, "SearchAutocompleteService");
+          Exchange suggestionResponse = get(endpoint.absolute(autocomplete
+              + "?q=newtonsoft&take=10&prerelease=false&semVerLevel=2.0.0"));
+          assertEquals(200, suggestionResponse.status(), repository + " autocomplete status");
+          JsonNode suggestions = MAPPER.readTree(suggestionResponse.body());
+          assertTrue(suggestions.path("data").isArray());
+          assertTrue(suggestions.path("data").size() > 0, repository + " autocomplete results");
+        }
+      }
+    }
   }
 
   @Test
@@ -165,6 +193,130 @@ class NugetRubygemsYumRepositoryBlackBoxCompatibilityTest {
   }
 
   @Test
+  void rubygemsColdProxyGroupIndexesMatchNexusWhenConfigured() throws Exception {
+    CompatConfig config = CompatConfig.load();
+    assumeLiveEndpoints(config);
+    // Supply a Nexus base URL reachable from both servers; no public RubyGems dependency.
+    Optional<String> upstream = setting("compat.rubygems.upstreamBaseUrl", "COMPAT_RUBYGEMS_UPSTREAM_BASE_URL");
+    assumeTrue(config.setupEnabled() && config.writeEnabled() && upstream.isPresent(),
+        "Enable writes/setup and set COMPAT_RUBYGEMS_UPSTREAM_BASE_URL for cold proxy compatibility");
+    String prefix = "ruby-cold-" + System.currentTimeMillis();
+    String source = prefix + "-source", proxy = prefix + "-proxy", group = prefix + "-group";
+    String hosted = prefix + "-hosted";
+    try {
+      saveNexusRubygemsHosted(config, source);
+      GemFixture fixture = GemFixture.create(prefix + "-gem", "1.0.0");
+      assertEquals(201, post(config.nexus.repository(source, "api/v1/gems"),
+          fixture.bytes(), "application/octet-stream").status());
+      String remote = stripTrailingSlash(upstream.orElseThrow()) + "/repository/" + source + "/";
+      String body = """
+          {"name":"%s","online":true,"storage":{"blobStoreName":"default","strictContentTypeValidation":true},
+           "proxy":{"remoteUrl":"%s","contentMaxAge":1440,"metadataMaxAge":1440},
+           "negativeCache":{"enabled":true,"timeToLive":1440},
+           "httpClient":{"blocked":false,"autoBlock":false}}
+          """.formatted(proxy, remote);
+      saveNexusRepository(config, "/service/rest/v1/repositories/rubygems/proxy", proxy, body);
+      saveNexusRubygemsHosted(config, hosted);
+      saveKkRepoHosted(config, hosted, "rubygems-hosted");
+      GemFixture local = GemFixture.create(fixture.name(), "2.0.0");
+      for (Endpoint endpoint : List.of(config.nexus, config.nexusPlus)) {
+        assertEquals(201, post(endpoint.repository(hosted, "api/v1/gems"),
+            local.bytes(), "application/octet-stream").status());
+        waitForRubySpecs(endpoint, hosted, local);
+      }
+      // Nexus groups keep the latest release for each platform, including an older java
+      // release alongside a newer ruby release. Do not collapse these by gem name alone.
+      try (var javaGem = getClass().getResourceAsStream(
+          "/rubygems/platform/kkrepo-compat-platform-gem-1.0-java.gem");
+          var rubyGem = getClass().getResourceAsStream(
+              "/rubygems/platform/kkrepo-compat-platform-gem-2.0.gem")) {
+        assertEquals(201, post(config.nexus.repository(source, "api/v1/gems"),
+            javaGem.readAllBytes(), "application/octet-stream").status());
+        waitForRubyLatestPlatform(config.nexus, source, "1.0", "java");
+        byte[] localPlatform = rubyGem.readAllBytes();
+        for (Endpoint endpoint : List.of(config.nexus, config.nexusPlus)) {
+          assertEquals(201, post(endpoint.repository(hosted, "api/v1/gems"),
+              localPlatform, "application/octet-stream").status());
+          waitForRubyLatestPlatform(endpoint, hosted, "2.0", "ruby");
+        }
+      }
+      // Nexus publishes /versions asynchronously. Wait before a proxy can cache an empty snapshot.
+      waitForRubyVersions(config.nexus, source, fixture);
+      waitForRubyVersions(config.nexus, hosted, local);
+      waitForRubyVersions(config.nexusPlus, hosted, local);
+      saveNexusRubygemsGroup(config, group, List.of(hosted, proxy));
+      saveKkRepoProxy(config, proxy, "rubygems-proxy", remote);
+      saveKkRepoGroup(config, group, "rubygems-group", List.of(hosted, proxy));
+      // Discover the upstream package through every index before downloading its .gem.
+      for (String index : List.of("specs.4.8.gz", "latest_specs.4.8.gz")) {
+        assertRubySpecsContain("cold RubyGems group " + index,
+            get(config.nexus.repository(group, index)), get(config.nexusPlus.repository(group, index)),
+            index.startsWith("latest") ? local : fixture);
+      }
+      for (Endpoint endpoint : List.of(config.nexus, config.nexusPlus)) {
+        Exchange latest = get(endpoint.repository(group, "latest_specs.4.8.gz"));
+        assert2xx("RubyGems latest platforms", latest);
+        Object decoded = normalizeRubyMarshalValue(new RubyMarshalReader(gunzip(latest.body())).read());
+        assertTrue(decoded instanceof List<?>);
+        Set<Object> platformRows = new java.util.HashSet<>();
+        for (Object row : (List<?>) decoded) {
+          if (row instanceof List<?> fields && fields.getFirst().equals("kkrepo-compat-platform-gem")) {
+            platformRows.add(row);
+          }
+        }
+        assertEquals(Set.of(List.of("kkrepo-compat-platform-gem", "1.0", "java"),
+            List.of("kkrepo-compat-platform-gem", "2.0", "ruby")), platformRows,
+            endpoint.name() + " latest index must retain releases for both platforms");
+      }
+      Exchange info = get(config.nexusPlus.repository(group, fixture.infoPath()));
+      assertRubyCompactInfoContainsChecksum("cold RubyGems group compact info", info, fixture);
+      assertRubyDependenciesMatch("cold RubyGems group dependency API",
+          get(config.nexus.repository(group, fixture.dependenciesPath())),
+          get(config.nexusPlus.repository(group, fixture.dependenciesPath())), fixture);
+      // Nexus 3.94 does not expose the optional /names endpoint. Verify the candidate's
+      // supported endpoint separately; compare compact versions/info against Nexus below.
+      Exchange names = get(config.nexusPlus.repository(group, "names"));
+      assert2xx("RubyGems group names", names);
+      assertTrue(names.bodyText().lines().anyMatch(fixture.name()::equals));
+      for (Endpoint endpoint : List.of(config.nexus, config.nexusPlus)) {
+        Exchange versions = get(endpoint.repository(group, "versions"));
+        Exchange memberInfo = get(endpoint.repository(group, fixture.infoPath()));
+        assert2xx("cold RubyGems versions", versions);
+        String checksum = HexFormat.of().formatHex(MessageDigest.getInstance("MD5").digest(memberInfo.body()));
+        List<String[]> rows = versions.bodyText().lines().filter(line -> line.startsWith(fixture.name() + " "))
+            .map(line -> line.split(" ", 3)).toList();
+        Set<String> published = new java.util.HashSet<>();
+        rows.forEach(fields -> published.addAll(List.of(fields[1].split(","))));
+        assertEquals(Set.of(fixture.version(), local.version()), published, endpoint.name() + " versions");
+        assertRubyCompactInfoContainsChecksum(endpoint.name() + " group upstream info", memberInfo, fixture);
+        assertRubyCompactInfoContainsChecksum(endpoint.name() + " group hosted info", memberInfo, local);
+        // Nexus 3.94 can emit duplicate same-name rows for hosted+proxy (NEXUS-39223).
+        // The candidate emits one merged row whose MD5 covers the complete group info.
+        if (endpoint == config.nexusPlus) {
+          assertEquals(1, rows.size());
+          assertEquals(checksum, rows.getFirst()[2], "group versions must hash the merged info body");
+        }
+      }
+      // Real RubyGems clients fetch this metadata before downloading the .gem archive.
+      assertPackageHeadMatches("cold RubyGems group quick spec HEAD",
+          head(config.nexus.repository(group, fixture.quickSpecPath())),
+          head(config.nexusPlus.repository(group, fixture.quickSpecPath())));
+      assertRubyQuickSpecContains("cold RubyGems group quick spec",
+          get(config.nexus.repository(group, fixture.quickSpecPath())),
+          get(config.nexusPlus.repository(group, fixture.quickSpecPath())), fixture);
+      assertBodyMatches("RubyGems gem after quick spec",
+          get(config.nexus.repository(group, fixture.gemPath())),
+          get(config.nexusPlus.repository(group, fixture.gemPath())), fixture.bytes());
+    } finally {
+      for (String repository : List.of(group, proxy, hosted)) {
+        send(config.nexusPlus.raw("/internal/repositories/" + repository).DELETE());
+        send(config.nexus.raw("/service/rest/v1/repositories/" + repository).DELETE());
+      }
+      send(config.nexus.raw("/service/rest/v1/repositories/" + source).DELETE());
+    }
+  }
+
+  @Test
   void rubygemsRepositoryRootPagesMatchNexusWhenConfigured() throws Exception {
     CompatConfig config = CompatConfig.load();
     assumeLiveEndpoints(config);
@@ -227,6 +379,197 @@ class NugetRubygemsYumRepositoryBlackBoxCompatibilityTest {
         get(config.nexus.repository(config.yumHostedRepository(), path)),
         get(config.nexusPlus.repository(config.yumHostedRepository(), path)),
         rpm);
+  }
+
+  @Test
+  void streamingYumProxyPreservesRpmBytesAndHeadersAgainstNexus() throws Exception {
+    CompatConfig config = CompatConfig.load();
+    assumeLiveEndpoints(config);
+    String fixture = config.yumFixtureUrl();
+    String remote = fixture.substring(0, fixture.lastIndexOf('/') + 1);
+    String path = fileName(fixture);
+    String repository = "yum-stream-" + java.util.UUID.randomUUID().toString().substring(0, 8);
+    String reference = """
+        {"name":"%s","online":true,"storage":{"blobStoreName":"default","strictContentTypeValidation":true},
+         "proxy":{"remoteUrl":"%s","contentMaxAge":1440,"metadataMaxAge":1440},
+         "negativeCache":{"enabled":false,"timeToLive":1},"httpClient":{"blocked":false,"autoBlock":false}}
+        """.formatted(repository, remote);
+    saveNexusRepository(config, "/service/rest/v1/repositories/yum/proxy", repository, reference);
+    saveKkRepoProxy(config, repository, "yum-proxy", remote);
+    ProxyStreamingCompatibility.enable(config.nexusPlus.repository(repository, ""));
+    byte[] expected = download(fixture);
+    Exchange coldReference = get(config.nexus.repository(repository, path));
+    Exchange coldCandidate = get(config.nexusPlus.repository(repository, path));
+    assertBodyMatches("streaming Yum RPM", coldReference, coldCandidate, expected);
+    assertEquals(sha256(expected), sha256(coldCandidate.body()));
+    assertPackageHeadMatches("streaming Yum RPM HEAD",
+        head(config.nexus.repository(repository, path)), head(config.nexusPlus.repository(repository, path)));
+    assertBodyMatches("repeated Yum RPM", get(config.nexus.repository(repository, path)),
+        get(config.nexusPlus.repository(repository, path)), expected);
+  }
+
+  @Test
+  void yumHostedSubdirectoryRepodataMatchesNexusWhenWriteEnabled() throws Exception {
+    CompatConfig config = CompatConfig.load();
+    assumeLiveEndpoints(config);
+    assumeTrue(config.writeEnabled() && config.setupEnabled(),
+        "Enable live writes and repository setup for Yum repodata-depth compatibility");
+    String repository = "yum-depth-" + System.currentTimeMillis();
+    String groupRepository = repository + "-group";
+    byte[] rpm = download(config.yumFixtureUrl());
+    String filename = fileName(config.yumFixtureUrl());
+    try {
+      saveNexusRepository(config, "/service/rest/v1/repositories/yum/hosted", repository, """
+          {"name":"%s","online":true,"storage":{"blobStoreName":"default","strictContentTypeValidation":true,"writePolicy":"allow"},"yum":{"repodataDepth":1}}
+          """.formatted(repository));
+      saveKkRepoRepository(config, repository, """
+          {"name":"%s","recipe":"yum-hosted","online":true,"blobStoreName":"default","hosted":{"writePolicy":"ALLOW"},"yum":{"repodataDepth":1}}
+          """.formatted(repository));
+      saveNexusRepository(config, "/service/rest/v1/repositories/yum/group", groupRepository, """
+          {"name":"%s","online":true,"storage":{"blobStoreName":"default","strictContentTypeValidation":true},"group":{"memberNames":["%s"]}}
+          """.formatted(groupRepository, repository));
+      saveKkRepoGroup(config, groupRepository, "yum-group", List.of(repository));
+      for (Endpoint endpoint : List.of(config.nexus, config.nexusPlus)) {
+        assertEquals(400, put(endpoint.repository(repository, filename), rpm,
+            "application/x-rpm").status(), endpoint.name() + " rejects shallow RPM paths");
+        // Two independent release roots, with a deeper RPM path in the second one.
+        for (String prefix : List.of("fedora-44/", "fedora-45/Packages/")) {
+          assertEquals(200, put(endpoint.repository(repository, prefix + filename), rpm,
+              "application/x-rpm").status(), endpoint.name() + " upload");
+        }
+      }
+      for (Endpoint endpoint : List.of(config.nexus, config.nexusPlus)) {
+        for (String readRepository : List.of(repository, groupRepository)) {
+          for (String release : List.of("fedora-44/", "fedora-45/")) {
+            Exchange repomd = null;
+            for (int attempt = 0; attempt < 90; attempt++) {
+              repomd = get(endpoint.repository(readRepository, release + "repodata/repomd.xml"));
+              if (repomd.status() == 200) break;
+              Thread.sleep(1000);
+            }
+            assertEquals(200, repomd.status(), endpoint.name() + " " + release + "repomd");
+            var metadata = javax.xml.parsers.DocumentBuilderFactory.newInstance()
+                .newDocumentBuilder().parse(new ByteArrayInputStream(repomd.body()));
+            var entries = metadata.getElementsByTagName("data");
+            boolean foundPrimary = false;
+            for (int i = 0; i < entries.getLength(); i++) {
+              var entry = (org.w3c.dom.Element) entries.item(i);
+              if (!"primary".equals(entry.getAttribute("type"))) continue;
+              foundPrimary = true;
+              String href = ((org.w3c.dom.Element) entry.getElementsByTagName("location").item(0))
+                  .getAttribute("href");
+              Exchange primary = get(endpoint.repository(readRepository, release + href));
+              assertEquals(200, primary.status());
+              assertEquals(entry.getElementsByTagName("checksum").item(0).getTextContent(), sha256(primary.body()));
+              byte[] xml = new GZIPInputStream(new ByteArrayInputStream(primary.body())).readAllBytes();
+              assertEquals(entry.getElementsByTagName("open-checksum").item(0).getTextContent(), sha256(xml));
+              var packages = javax.xml.parsers.DocumentBuilderFactory.newInstance()
+                  .newDocumentBuilder().parse(new ByteArrayInputStream(xml));
+              var locations = packages.getElementsByTagName("location");
+              assertEquals(1, locations.getLength(), endpoint.name() + " release isolation");
+              String packageHref = ((org.w3c.dom.Element) locations.item(0)).getAttribute("href");
+              assertEquals((release.equals("fedora-45/") ? "Packages/" : "") + filename, packageHref);
+              assertArrayEquals(rpm, get(endpoint.repository(readRepository, release + packageHref)).body());
+            }
+            assertTrue(foundPrimary, endpoint.name() + " primary metadata entry");
+          }
+        }
+        // Changing one metadata root must not republish an unrelated release's snapshot.
+        Exchange untouched = get(endpoint.repository(repository, "fedora-44/repodata/repomd.xml"));
+        Thread.sleep(1100); // repomd timestamps use seconds; an unrelated rebuild must be observable.
+        int deleteStatus = send(endpoint.repository(repository, "fedora-45/Packages/" + filename)
+            .DELETE()).status();
+        // Both 200 and 204 are successful synchronous HTTP DELETE responses.
+        assertTrue(deleteStatus == 200 || deleteStatus == 204, endpoint.name() + " delete last RPM: " + deleteStatus);
+        boolean removed = false;
+        for (int attempt = 0; attempt < 90; attempt++) {
+          Exchange changed = get(endpoint.repository(repository, "fedora-45/repodata/repomd.xml"));
+          if (changed.status() == 404) {
+            // Nexus removes the empty root; kkRepo retains its existing empty-index behavior.
+            removed = true;
+            break;
+          }
+          if (changed.status() == 200) {
+            var metadata = javax.xml.parsers.DocumentBuilderFactory.newInstance()
+                .newDocumentBuilder().parse(new ByteArrayInputStream(changed.body()));
+            var entries = metadata.getElementsByTagName("data");
+            for (int i = 0; i < entries.getLength(); i++) {
+              var entry = (org.w3c.dom.Element) entries.item(i);
+              if (!"primary".equals(entry.getAttribute("type"))) continue;
+              String href = ((org.w3c.dom.Element) entry.getElementsByTagName("location").item(0))
+                  .getAttribute("href");
+              Exchange primary = get(endpoint.repository(repository, "fedora-45/" + href));
+              if (primary.status() != 200) continue;
+              try (var input = new GZIPInputStream(new ByteArrayInputStream(primary.body()))) {
+                var packages = javax.xml.parsers.DocumentBuilderFactory.newInstance()
+                    .newDocumentBuilder().parse(input);
+                removed = packages.getElementsByTagName("package").getLength() == 0;
+              }
+            }
+          }
+          if (removed) break;
+          Thread.sleep(1000);
+        }
+        assertTrue(removed, endpoint.name() + " stops advertising deleted RPM");
+        assertArrayEquals(untouched.body(),
+            get(endpoint.repository(repository, "fedora-44/repodata/repomd.xml")).body(),
+            endpoint.name() + " preserves the untouched release index");
+      }
+    } finally {
+      send(config.nexus.raw("/service/rest/v1/repositories/" + groupRepository).DELETE());
+      send(config.nexusPlus.raw("/internal/repositories/" + groupRepository).DELETE());
+      send(config.nexus.raw("/service/rest/v1/repositories/" + repository).DELETE());
+      // Like the other write fixtures, retain the non-empty candidate hosted repository until instance teardown.
+    }
+  }
+
+  @Test
+  void emptyYumHostedRepositoryCanBeDeletedWithoutDeletingRepodata() throws Exception {
+    CompatConfig config = CompatConfig.load();
+    assumeLiveEndpoints(config);
+    assumeTrue(config.writeEnabled() && config.setupEnabled(),
+        "Enable live writes and repository setup for Yum deletion compatibility");
+    byte[] rpm = download(config.yumFixtureUrl());
+    for (int depth : List.of(0, 1)) {
+      String repository = "yum-delete-" + depth + "-" + System.currentTimeMillis();
+      String root = depth == 0 ? "" : "release/";
+      String path = root + "Packages/" + fileName(config.yumFixtureUrl());
+      try {
+        saveNexusRepository(config, "/service/rest/v1/repositories/yum/hosted", repository, """
+            {"name":"%s","online":true,"storage":{"blobStoreName":"default","strictContentTypeValidation":true,"writePolicy":"allow"},"yum":{"repodataDepth":%d}}
+            """.formatted(repository, depth));
+        saveKkRepoRepository(config, repository, """
+            {"name":"%s","recipe":"yum-hosted","online":true,"blobStoreName":"default","hosted":{"writePolicy":"ALLOW"},"yum":{"repodataDepth":%d}}
+            """.formatted(repository, depth));
+        for (Endpoint endpoint : List.of(config.nexus, config.nexusPlus)) {
+          assertEquals(200, put(endpoint.repository(repository, path), rpm, "application/x-rpm").status());
+          Exchange repomd = null;
+          for (int attempt = 0; attempt < 90; attempt++) {
+            repomd = get(endpoint.repository(repository, root + "repodata/repomd.xml"));
+            if (repomd.status() == 200) break;
+            Thread.sleep(1000);
+          }
+          assertEquals(200, repomd.status(), endpoint.name() + " must have generated metadata");
+          int status = send(endpoint.repository(repository, path).DELETE()).status();
+          assertTrue(status == 200 || status == 204, endpoint.name() + " RPM deletion");
+          assertEquals(404, head(endpoint.repository(repository, path)).status());
+        }
+        Exchange reference = send(config.nexus.raw("/service/rest/v1/repositories/" + repository).DELETE());
+        Exchange candidate = null;
+        // A live worker may hold the repository lock; deletion must succeed once it finishes.
+        for (int attempt = 0; attempt < 30; attempt++) {
+          candidate = send(config.nexusPlus.raw("/internal/repositories/" + repository).DELETE());
+          if (candidate.status() != 400) break;
+          Thread.sleep(1000);
+        }
+        assertEquals(204, reference.status());
+        assertSameStatus("delete empty Yum hosted repository with managed metadata", reference, candidate);
+        assertEquals(404, get(config.nexusPlus.raw("/internal/repositories/" + repository)).status());
+      } finally {
+        send(config.nexus.raw("/service/rest/v1/repositories/" + repository).DELETE());
+        send(config.nexusPlus.raw("/internal/repositories/" + repository).DELETE());
+      }
+    }
   }
 
   private static void assumeLiveEndpoints(CompatConfig config) {
@@ -363,6 +706,30 @@ class NugetRubygemsYumRepositoryBlackBoxCompatibilityTest {
       assertEquals(reference.contentLength().get(), candidate.contentLength().get(),
           label + " content length");
     }
+  }
+
+  private static void waitForRubyVersions(Endpoint endpoint, String repository, GemFixture fixture)
+      throws Exception {
+    for (int attempt = 0; attempt < 90; attempt++) {
+      Exchange response = get(endpoint.repository(repository, "versions"));
+      if (response.status() == 200 && response.bodyText().contains(fixture.name() + " " + fixture.version() + " ")) return;
+      Thread.sleep(1000L);
+    }
+    throw new AssertionError(endpoint.name() + " versions did not publish " + fixture.name());
+  }
+
+  private static void waitForRubyLatestPlatform(Endpoint endpoint, String repository,
+      String version, String platform) throws Exception {
+    List<String> expected = List.of("kkrepo-compat-platform-gem", version, platform);
+    for (int attempt = 0; attempt < 90; attempt++) {
+      Exchange response = get(endpoint.repository(repository, "latest_specs.4.8.gz"));
+      if (response.status() == 200) {
+        Object decoded = normalizeRubyMarshalValue(new RubyMarshalReader(gunzip(response.body())).read());
+        if (decoded instanceof List<?> rows && rows.contains(expected)) return;
+      }
+      Thread.sleep(1000L);
+    }
+    throw new AssertionError(endpoint.name() + " latest index did not publish " + expected);
   }
 
   private static Exchange waitForRubySpecs(Endpoint endpoint, String repository, GemFixture fixture)
@@ -580,7 +947,7 @@ class NugetRubygemsYumRepositoryBlackBoxCompatibilityTest {
   private static void saveKkRepoProxy(
       CompatConfig config, String repository, String recipe, String remoteUrl) throws Exception {
     String body = """
-        {"name":"%s","recipe":"%s","online":true,"blobStoreName":"default","strictContentTypeValidation":true,"proxy":{"remoteUrl":"%s","contentMaxAgeMinutes":1440,"metadataMaxAgeMinutes":1440,"autoBlock":false}}
+        {"name":"%s","recipe":"%s","online":true,"blobStoreName":"default","strictContentTypeValidation":true,"proxy":{"streamingEnabled":true,"remoteUrl":"%s","contentMaxAgeMinutes":1440,"metadataMaxAgeMinutes":1440,"autoBlock":false}}
         """.formatted(repository, recipe, remoteUrl);
     saveKkRepoRepository(config, repository, body);
   }
@@ -1107,11 +1474,15 @@ class NugetRubygemsYumRepositoryBlackBoxCompatibilityTest {
       List<List<String>> dependencies) {
   }
 
-  private record NugetFixture(String id, String version, String fileName, byte[] bytes) {
+  record NugetFixture(String id, String version, String fileName, byte[] bytes) {
     static NugetFixture create() throws Exception {
       String stamp = Long.toString(System.currentTimeMillis());
       String id = "KkRepo.Compat.NuGet." + stamp;
       String version = "1.0." + stamp;
+      return create(id, version);
+    }
+
+    static NugetFixture create(String id, String version) throws Exception {
       String fileName = id + "." + version + ".nupkg";
       ByteArrayOutputStream out = new ByteArrayOutputStream();
       try (ZipOutputStream zip = new ZipOutputStream(out)) {
@@ -1126,7 +1497,7 @@ class NugetRubygemsYumRepositoryBlackBoxCompatibilityTest {
               </metadata>
             </package>
             """.formatted(id, version).getBytes(StandardCharsets.UTF_8));
-        putZip(zip, "content/readme.txt", ("nuget fixture " + stamp + "\n").getBytes(StandardCharsets.UTF_8));
+        putZip(zip, "content/readme.txt", ("nuget fixture " + id + "\n").getBytes(StandardCharsets.UTF_8));
       }
       return new NugetFixture(id, version, fileName, out.toByteArray());
     }
@@ -1147,7 +1518,7 @@ class NugetRubygemsYumRepositoryBlackBoxCompatibilityTest {
     }
   }
 
-  private record GemFixture(
+  record GemFixture(
       String name,
       String version,
       String dependencyName,
@@ -1157,6 +1528,10 @@ class NugetRubygemsYumRepositoryBlackBoxCompatibilityTest {
       String stamp = Long.toString(System.currentTimeMillis());
       String name = "kkrepo-compat-gem-" + stamp;
       String version = "0.0." + stamp;
+      return create(name, version);
+    }
+
+    static GemFixture create(String name, String version) throws Exception {
       String dependencyName = "rack";
       List<String> dependencyRequirements = List.of(">= 2.0.0", "< 3.0.0");
       String metadata = """
@@ -1172,6 +1547,16 @@ class NugetRubygemsYumRepositoryBlackBoxCompatibilityTest {
           - lib/%s.rb
           require_paths:
           - lib
+          required_ruby_version: !ruby/object:Gem::Requirement
+            requirements:
+            - - ">="
+              - !ruby/object:Gem::Version
+                version: '0'
+          required_rubygems_version: !ruby/object:Gem::Requirement
+            requirements:
+            - - ">="
+              - !ruby/object:Gem::Version
+                version: '0'
           dependencies:
           - !ruby/object:Gem::Dependency
             name: %s
@@ -1183,7 +1568,10 @@ class NugetRubygemsYumRepositoryBlackBoxCompatibilityTest {
               - - "<"
                 - !ruby/object:Gem::Version
                   version: 3.0.0
+            type: :runtime
           """.formatted(name, version, name.replace('-', '_'), dependencyName);
+      // Real gem archives include additional root fields after the dependency sequence.
+      metadata += "requirements: []\n";
       ByteArrayOutputStream dataTarGz = new ByteArrayOutputStream();
       try (GZIPOutputStream gzip = new GZIPOutputStream(dataTarGz);
            TarArchiveOutputStream tar = new TarArchiveOutputStream(gzip)) {

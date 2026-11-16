@@ -21,6 +21,7 @@ import com.github.klboke.kkrepo.core.RepositoryType;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.AssetRecord;
 import com.github.klboke.kkrepo.protocol.r.RPathParser;
+import com.github.klboke.kkrepo.server.coordination.FencedLeaseManager;
 import com.github.klboke.kkrepo.server.maven.MavenExceptions;
 import com.github.klboke.kkrepo.server.maven.MavenResponse;
 import com.github.klboke.kkrepo.server.maven.RepositoryRuntime;
@@ -35,6 +36,12 @@ import java.util.Map;
 import java.util.Optional;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.AfterEach;
+import com.github.klboke.kkrepo.persistence.jdbc.api.RoutingRuleDao;
+import com.github.klboke.kkrepo.server.routingrules.RepositoryRoutingPolicy;
+import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 import org.mockito.ArgumentCaptor;
 
 class RServiceTest {
@@ -45,11 +52,56 @@ class RServiceTest {
   private final RAssetSupport assets = mock(RAssetSupport.class);
   private final RIndexBuilder indexBuilder = mock(RIndexBuilder.class);
   private final RLeaseManager leases = mock(RLeaseManager.class);
-  private final RLeaseManager.Lease lease = mock(RLeaseManager.Lease.class);
+  private final FencedLeaseManager.Lease lease = mock(FencedLeaseManager.Lease.class);
   private final RProxyProjectionService proxy = mock(RProxyProjectionService.class);
   private final RepositoryRuntimeRegistry runtimes = mock(RepositoryRuntimeRegistry.class);
   private final RepositoryRuntime hosted = runtime(1L, RepositoryType.HOSTED, "ALLOW", List.of());
   private RService service;
+
+  @AfterEach
+  void clearRoutingRequest() { RequestContextHolder.resetRequestAttributes(); }
+
+  @Test
+  void allowedPinnedHostedPackageDoesNotRefreshUnrelatedProxyUnderRoutingPolicy() {
+    RepositoryRuntime unhealthy = runtime(2L, RepositoryType.PROXY, "ALLOW", List.of());
+    RepositoryRuntime group = runtime(3L, RepositoryType.GROUP, "ALLOW", List.of(unhealthy, hosted));
+    var rules = mock(RoutingRuleDao.class);
+    when(rules.bindings()).thenReturn(List.of(new RoutingRuleDao.Binding(unhealthy.id(),
+        new RoutingRuleDao.Rule(1, "rule", "", "BLOCK", List.of("/never")))));
+    var request = new MockHttpServletRequest("GET", "/repository/group/" + PATH);
+    RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
+    RepositoryRuntime projected = initializedPolicy(rules).prepare(group, PATH, request);
+    when(published.find(group.id(), "src/contrib")).thenReturn(Optional.of(snapshot(group.id(), 9L, Map.of())));
+    var binding = new RRegistryDao.GroupBinding(1L, group.id(), "src/contrib", 9L, PATH,
+        hosted.id(), 4L, PATH, "a".repeat(32), "b".repeat(64), 12L, Instant.EPOCH);
+    when(registry.findGroupBinding(group.id(), "src/contrib", 9L, PATH)).thenReturn(Optional.of(binding));
+    when(runtimes.resolveById(hosted.id())).thenReturn(Optional.of(hosted));
+    when(proxy.prepareGroupMember(eq(unhealthy), eq("src/contrib"), any(Instant.class)))
+        .thenThrow(new MavenExceptions.BadUpstreamException("Malformed PACKAGES.gz"));
+    assertEquals(200, service.get(projected, PATH, false).status());
+    verify(assets).serve(hosted, PATH, false);
+    verify(proxy, never()).prepareGroupMember(any(), anyString(), any());
+  }
+
+  @Test
+  void deniedPinnedProxyBindingIsNeverServedFromPublishedGroupSnapshot() {
+    RepositoryRuntime denied = runtime(2L, RepositoryType.PROXY, "ALLOW", List.of());
+    RepositoryRuntime group = runtime(3L, RepositoryType.GROUP, "ALLOW", List.of(denied));
+    var rules = mock(RoutingRuleDao.class);
+    when(rules.bindings()).thenReturn(List.of(new RoutingRuleDao.Binding(denied.id(),
+        new RoutingRuleDao.Rule(1, "rule", "", "BLOCK", List.of("/src/.*")))));
+    var request = new MockHttpServletRequest("GET", "/repository/group/" + PATH);
+    RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
+    RepositoryRuntime projected = initializedPolicy(rules).prepare(group, PATH, request);
+    when(published.find(group.id(), "src/contrib")).thenReturn(Optional.of(snapshot(group.id(), 9L,
+        Map.of("@members", RService.fingerprint(Map.of())))));
+    var binding = new RRegistryDao.GroupBinding(1L, group.id(), "src/contrib", 9L, PATH,
+        denied.id(), 4L, PATH, "a".repeat(32), "b".repeat(64), 12L, Instant.EPOCH);
+    when(registry.findGroupBinding(group.id(), "src/contrib", 9L, PATH)).thenReturn(Optional.of(binding));
+    assertThrows(MavenExceptions.MavenNotFoundException.class, () -> service.get(projected, PATH, false));
+    verify(proxy, never()).getBoundGroupPackage(any(), any(), anyBoolean());
+    verify(runtimes, never()).resolveById(denied.id());
+  }
 
   @BeforeEach
   void setUp() {
@@ -75,6 +127,17 @@ class RServiceTest {
         snapshot(1L, 1L, Map.of("src/contrib/PACKAGES.gz", ".r/index"))));
     when(registry.savePackage(any())).thenAnswer(invocation -> withId(
         invocation.getArgument(0), 50L, 1L));
+  }
+
+  @Test
+  void refusesSnapshotPublishedForAnotherMemberProjection() {
+    RepositoryRuntime group = runtime(3L, RepositoryType.GROUP, "ALLOW", List.of());
+    when(published.find(group.id(), "src/contrib")).thenReturn(Optional.of(snapshot(group.id(), 1L,
+        Map.of("src/contrib/PACKAGES.gz", ".r/denied", "@members", "another-projection"))));
+    var failure = assertThrows(org.springframework.web.server.ResponseStatusException.class,
+        () -> service.get(group, "src/contrib/PACKAGES.gz", false));
+    assertEquals(503, failure.getStatusCode().value());
+    verify(assets, never()).serve(eq(group), anyString(), anyBoolean());
   }
 
   @Test
@@ -148,6 +211,72 @@ class RServiceTest {
     RepositoryRuntime deny = runtime(9L, RepositoryType.HOSTED, "DENY", List.of());
     assertThrows(MavenExceptions.WritePolicyDenied.class, () -> service.publish(
         deny, "demo_1.0.0.tar.gz", new ByteArrayInputStream(fixture), "alice", null));
+  }
+
+  @Test
+  void binaryCoordinatesAndComponentsAreIsolatedByPlatformAndRVersion() throws Exception {
+    for (String namespace : List.of("src/contrib", "bin/windows/contrib/4.5",
+        "bin/windows/contrib/4.6", "bin/macosx/big-sur-arm64/contrib/4.5",
+        "bin/linux/noble-x86_64/4.5/src/contrib")) {
+      String extension = RPathParser.packageExtension(namespace);
+      String filename = "demo_1.0.0" + extension;
+      byte[] fixture = RTestPackage.binary("demo", "1.0.0", extension);
+      assertEquals(namespace + "/" + filename, service.publish(hosted, namespace, filename,
+          new ByteArrayInputStream(fixture), "alice", null).path());
+      String type = RPathParser.packageType(namespace);
+      verify(registry).findPackage(hosted.id(), namespace, type, "demo", "1.0.0", type);
+    }
+    ArgumentCaptor<RRegistryDao.PackageRecord> saved = ArgumentCaptor.forClass(RRegistryDao.PackageRecord.class);
+    verify(registry, times(5)).savePackage(saved.capture());
+    assertEquals(5L, saved.getAllValues().stream().map(RRegistryDao.PackageRecord::distribution).distinct().count());
+    ArgumentCaptor<com.github.klboke.kkrepo.persistence.jdbc.api.model.ComponentRecord> components =
+        ArgumentCaptor.forClass(com.github.klboke.kkrepo.persistence.jdbc.api.model.ComponentRecord.class);
+    verify(assets, times(5)).storePackage(any(), anyString(), anyString(), any(), any(), any(), any(), components.capture());
+    assertEquals(5L, components.getAllValues().stream().map(component ->
+        java.util.HexFormat.of().formatHex(component.coordinateHash())).distinct().count());
+    assertThrows(MavenExceptions.MethodNotAllowed.class, () -> service.put(hosted,
+        "bin/windows/contrib/4.5/demo_1.0.0.tgz", new ByteArrayInputStream(new byte[0]), null, null, null));
+  }
+
+  @Test
+  void binaryIndexAndPinnedGroupDownloadUseTheirOwnNamespace() {
+    String namespace = "bin/windows/contrib/4.5";
+    String path = namespace + "/demo_1.0.0.zip";
+    RepositoryRuntime group = runtime(3L, RepositoryType.GROUP, "ALLOW", List.of(hosted));
+    var snapshot = new RRegistryDao.Snapshot(hosted.id(), namespace, 1L, 1,
+        Map.of(namespace + "/PACKAGES.gz", ".r/windows/index"), "a".repeat(64), Instant.EPOCH);
+    when(published.find(hosted.id(), namespace)).thenReturn(Optional.of(snapshot));
+    assertEquals(200, service.get(hosted, namespace + "/PACKAGES.gz", false).status());
+    verify(assets).serve(hosted, ".r/windows/index", false);
+    when(published.find(group.id(), namespace)).thenReturn(Optional.of(new RRegistryDao.Snapshot(
+        group.id(), namespace, 2L, 1, Map.of("@members", RService.fingerprint(Map.of(hosted.id(), 1L))),
+        "a".repeat(64), Instant.EPOCH)));
+    when(registry.findGroupBinding(group.id(), namespace, 2L, path)).thenReturn(Optional.of(
+        new RRegistryDao.GroupBinding(1L, group.id(), namespace, 2L, path, hosted.id(), 1L,
+            path, "a".repeat(32), "b".repeat(64), 12L, Instant.EPOCH)));
+    when(runtimes.resolveById(hosted.id())).thenReturn(Optional.of(hosted));
+    assertEquals(200, service.get(group, path, true).status());
+    verify(assets).serve(hosted, path, true);
+  }
+
+  @Test
+  void deletesBinaryCoordinateWithoutTouchingSourceNamespace() throws Exception {
+    String namespace = "bin/windows/contrib/4.5";
+    String path = namespace + "/demo_1.0.0.zip";
+    service.put(hosted, path, new ByteArrayInputStream(RTestPackage.binary("demo", "1.0.0", ".zip")),
+        null, "alice", null);
+    ArgumentCaptor<RRegistryDao.PackageRecord> captured = ArgumentCaptor.forClass(RRegistryDao.PackageRecord.class);
+    verify(registry).savePackage(captured.capture());
+    var row = withId(captured.getValue(), 50L, 1L);
+    when(registry.findPackageByPath(hosted.id(), path)).thenReturn(Optional.of(row));
+    when(registry.deletePackage(eq(hosted.id()), eq(namespace), eq("binary"), eq("demo"),
+        eq("1.0.0"), eq("binary"), eq("manual"), any())).thenReturn(Optional.of(row));
+    assertEquals(204, service.delete(hosted, path, "manual", true).status());
+    verify(registry).deletePackage(eq(hosted.id()), eq(namespace), eq("binary"), eq("demo"),
+        eq("1.0.0"), eq("binary"), eq("manual"), any());
+    verify(assets).retirePackageProjection(row.assetId());
+    verify(registry, never()).deletePackage(anyLong(), eq("src/contrib"), anyString(), anyString(),
+        anyString(), anyString(), anyString(), any());
   }
 
   @Test
@@ -264,7 +393,7 @@ class RServiceTest {
     RepositoryRuntime group = runtime(3L, RepositoryType.GROUP, "ALLOW", List.of(proxyRuntime));
     String memberFingerprint = RService.fingerprint(new LinkedHashMap<>(Map.of(2L, 4L)));
     RRegistryDao.SuiteState dirtyProxy = suite(proxyRuntime.id(), 4L, 3L);
-    when(proxy.prepareGroupMember(eq(proxyRuntime), any(Instant.class))).thenReturn(4L);
+    when(proxy.prepareGroupMember(eq(proxyRuntime), eq("src/contrib"), any(Instant.class))).thenReturn(4L);
     when(registry.findSuite(proxyRuntime.id(), "src/contrib"))
         .thenReturn(Optional.of(dirtyProxy));
     when(published.find(proxyRuntime.id(), "src/contrib")).thenReturn(
@@ -285,11 +414,29 @@ class RServiceTest {
     MavenResponse response = service.get(group, "src/contrib/PACKAGES.gz", false);
 
     assertEquals(200, response.status());
-    verify(proxy).prepareGroupMember(eq(proxyRuntime), any(Instant.class));
+    verify(proxy).prepareGroupMember(eq(proxyRuntime), eq("src/contrib"), any(Instant.class));
     verify(registry).publishSnapshot(any(), eq("owner"), eq(7L));
     verify(assets).serve(group, ".r/group/index", false);
     verify(registry, never()).markSuiteDirty(
         eq(group.id()), eq("src/contrib"), any(Instant.class));
+  }
+
+  @Test
+  void skipsProxyMembersWithoutTheRequestedBinaryNamespace() {
+    String namespace = "bin/windows/contrib/4.5";
+    RepositoryRuntime member = runtime(2L, RepositoryType.PROXY, "ALLOW", List.of());
+    RepositoryRuntime group = runtime(3L, RepositoryType.GROUP, "ALLOW", List.of(member));
+    String fingerprint = RService.fingerprint(new LinkedHashMap<>(Map.of(member.id(), 0L)));
+    when(proxy.prepareGroupMember(eq(member), eq(namespace), any(Instant.class)))
+        .thenThrow(new MavenExceptions.MavenNotFoundException(namespace + "/PACKAGES.gz"));
+    when(published.find(group.id(), namespace)).thenReturn(Optional.of(new RRegistryDao.Snapshot(
+        group.id(), namespace, 1L, 1,
+        Map.of(namespace + "/PACKAGES.gz", ".r/empty", "@members", fingerprint),
+        "a".repeat(64), Instant.EPOCH)));
+
+    assertEquals(200, service.get(group, namespace + "/PACKAGES.gz", false).status());
+    verify(assets).serve(group, ".r/empty", false);
+    verify(registry, never()).findSuite(member.id(), namespace);
   }
 
   @Test
@@ -441,7 +588,7 @@ class RServiceTest {
         50L, member.id(), "broken", "1.0.0", RRegistryDao.SOURCE_PROXY, "missing");
     when(registry.findSuite(group.id(), "src/contrib")).thenReturn(Optional.of(dirty));
     when(published.find(group.id(), "src/contrib")).thenReturn(Optional.empty());
-    when(proxy.prepareGroupMember(eq(member), any(Instant.class))).thenReturn(4L);
+    when(proxy.prepareGroupMember(eq(member), eq("src/contrib"), any(Instant.class))).thenReturn(4L);
     when(published.find(member.id(), "src/contrib"))
         .thenReturn(Optional.of(snapshot(member.id(), 4L, Map.of())));
     when(registry.listPackagePage(
@@ -583,5 +730,10 @@ class RServiceTest {
         1L, writePolicy, null, null, true,
         type == RepositoryType.PROXY ? "https://example.invalid/" : null,
         60, 60, true, null, members);
+  }
+  private static RepositoryRoutingPolicy initializedPolicy(RoutingRuleDao rules) {
+    var policy = new RepositoryRoutingPolicy(rules);
+    policy.initialize();
+    return policy;
   }
 }

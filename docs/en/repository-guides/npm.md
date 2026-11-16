@@ -62,6 +62,22 @@ registry. Run `npm pack --dry-run` before publication to inspect the tarball con
 - npm audit compatibility is exposed for supported client workflows; policy enforcement remains a
   separate kkRepo security-scanning concern.
 
+## Hosted Write Policy
+
+With `ALLOW_ONCE` (the default), a hosted tarball cannot be overwritten, including when publishers
+race on different replicas. The database's unique asset path decides the winner; the losing
+publication receives the existing write-policy error and rolls back all its attachment and
+package-metadata changes. Refresh metadata to inspect the winner before retrying with a new version.
+Adding other versions still updates the package root normally. Multipart publication has the same
+transaction boundary. Unreferenced uploaded objects are cleaned up after a rollback. Transient database contention retries
+the complete publication in a fresh transaction, using the same staged attachments and revalidating
+metadata and write policy. Retries are bounded; unexpected failures retain their original cause.
+
+`ALLOW` retains tarball overwrite behavior. The npm publication endpoint does not provide an
+opt-in atomic create-if-absent contract for `ALLOW` repositories: a prior GET returning `404` is
+not a reservation. Use `ALLOW_ONCE` for immutable hosted publication. Proxy-cache refreshes and
+separately authorized administrative package-root cleanup retain their existing semantics.
+
 ## Operations And Troubleshooting
 
 Grant publication rights only on hosted. A `401` normally indicates invalid or missing credentials;
@@ -75,3 +91,20 @@ resolve the problem.
 - [Compatibility matrix](../compatibility-matrix.md#repository-format-matrix)
 - [npm registry configuration](https://docs.npmjs.com/misc/registry/)
 - [`npm publish` reference](https://docs.npmjs.com/cli/publish/)
+
+## Proxy Tarball URLs
+
+Proxy downloads follow the `dist.tarball` URL in the upstream package metadata. This includes
+Huawei CodeArts paths such as `@scope/package/-/@scope/package-1.0.0.tgz`; existing lockfiles
+using that scoped path are also accepted. The original metadata is persisted in shared blob
+storage, so another replica can resolve the same URL. A different download host must be listed
+in the proxy redirect-host allowlist; upstream credentials remain scoped to the trusted origin.
+
+A direct lockfile download also fetches missing or expired package metadata before selecting the
+upstream tarball URL. Scoped filename paths remain distinct from plain filenames, including in
+minimum-release-age checks. Older release-age indexes are rebuilt lazily from the stored raw
+metadata after upgrade; normal downloads do not require an operator backfill.
+
+Tarball suffix subdirectories are preserved. If metadata is unavailable, a direct download can
+still try the conventional registry path. Cached HTTP validators are reused only for the exact
+upstream URL they came from, including its query string.

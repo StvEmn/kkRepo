@@ -56,6 +56,9 @@ import org.springframework.web.server.ResponseStatusException;
 public class NexusMigrationController {
   static final String REQUIRED_TARGET_BLOB_STORE = "default";
 
+  @Autowired
+  private com.github.klboke.kkrepo.persistence.jdbc.api.RoutingRuleDao routingRules;
+
   private final ObjectMapper objectMapper;
   private final BlobStoreDao blobStoreDao;
   private final RepositoryDao repositoryDao;
@@ -297,12 +300,16 @@ public class NexusMigrationController {
 
   @ExceptionHandler(IOException.class)
   public ResponseEntity<Map<String, Object>> handleSourceRequestFailure(IOException e) {
+    String message = e.getMessage();
+    if (message == null || message.isBlank()) {
+      message = e.getClass().getSimpleName();
+    }
     return ResponseEntity
         .status(HttpStatus.BAD_GATEWAY)
         .body(Map.of(
             "status", HttpStatus.BAD_GATEWAY.value(),
             "error", "Bad Gateway",
-            "message", e.getMessage()));
+            "message", message));
   }
 
   NexusApiMigrationService service() {
@@ -314,7 +321,7 @@ public class NexusMigrationController {
         migrationJobDao,
         new SecurityDaoMigrationWriter(securityDao),
         terraformRegistry,
-        transactionManager);
+        transactionManager, routingRules);
   }
 
   private NexusMigrationRequest toRequest(NexusMigrationCommand command, boolean dryRun) {

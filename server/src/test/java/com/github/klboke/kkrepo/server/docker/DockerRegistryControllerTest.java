@@ -1,5 +1,7 @@
 package com.github.klboke.kkrepo.server.docker;
 
+import org.springframework.mock.web.MockHttpServletResponse;
+import com.github.klboke.kkrepo.server.security.ClientAddressFilter;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -34,6 +36,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.NullSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -43,6 +48,70 @@ import org.springframework.test.web.servlet.RequestBuilder;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
 class DockerRegistryControllerTest {
+  @Test
+  void routingRulesUseParsedDockerPathsBeforeBlobReads() {
+    RepositoryRuntime runtime = repository("docker-proxy", RepositoryType.PROXY, "docker-proxy");
+    DockerProxyService proxy = mock(DockerProxyService.class);
+    var controller = controller(runtime, null, proxy, mock(DockerGroupService.class), null);
+    var rules = mock(com.github.klboke.kkrepo.persistence.jdbc.api.RoutingRuleDao.class);
+    String digest = "sha256:" + "a".repeat(64);
+    when(rules.bindings()).thenReturn(List.of(new com.github.klboke.kkrepo.persistence.jdbc.api.RoutingRuleDao.Binding(1,
+        new com.github.klboke.kkrepo.persistence.jdbc.api.RoutingRuleDao.Rule(1, "blocked", "", "BLOCK",
+            List.of("/v2/private/pkg/blobs/" + digest, "/v2/private/pkg/tags/list")))));
+    var policy = new com.github.klboke.kkrepo.server.routingrules.RepositoryRoutingPolicy(rules);
+    policy.initialize();
+    controller.setRoutingPolicy(policy);
+    for (String method : List.of("GET", "HEAD")) {
+      for (String path : List.of("private/pkg/blobs/" + digest + "/",
+          "private/pkg/blobs/" + digest.toUpperCase(java.util.Locale.ROOT), "private/pkg/tags/list/")) {
+        var request = new MockHttpServletRequest(method, "/v2/docker-proxy/" + path);
+        assertThrows(com.github.klboke.kkrepo.server.routingrules.RepositoryRoutingPolicy.Blocked.class,
+            () -> { if (method.equals("GET")) controller.get(request, 100, null, null); else controller.head(request); });
+      }
+    }
+    org.mockito.Mockito.verifyNoInteractions(proxy);
+  }
+
+  @Test
+  void completedBlobUploadPersistsVerifiedClientProvenance() throws Exception {
+    RepositoryRuntime runtime = hosted("docker-hosted", null);
+    DockerHostedService hosted = mock(DockerHostedService.class);
+    DockerDigest digest = DockerDigest.parse("sha256:" + "a".repeat(64));
+    when(hosted.completeUpload(eq(runtime), eq("upload-1"), any(), eq(3L), eq(null),
+        eq(digest), anyString(), eq("203.0.113.45")))
+        .thenReturn(new DockerUploadService.CompleteResult(digest, 3L));
+    DockerRegistryController controller = controller(runtime, hosted);
+    var request = new MockHttpServletRequest(
+        "PUT", "/v2/docker-hosted/library/alpine/blobs/uploads/upload-1");
+    request.setContent(new byte[] {1, 2, 3});
+    request.setRemoteAddr("127.0.0.1");
+    request.addHeader("X-Forwarded-For", "198.51.100.1, 203.0.113.45");
+    new ClientAddressFilter(new ForwardedHeaderPolicy("127.0.0.1"))
+        .doFilter(request, new MockHttpServletResponse(), (req, res) -> {
+          var response = controller.put(request, digest.value(), null, "application/octet-stream", null);
+          assertEquals(HttpStatus.CREATED, response.getStatusCode());
+          assertEquals(digest.value(), response.getHeaders().getFirst(DockerConstants.CONTENT_DIGEST_HEADER));
+        });
+    verify(hosted).completeUpload(eq(runtime), eq("upload-1"), any(), eq(3L), eq(null),
+        eq(digest), anyString(), eq("203.0.113.45"));
+  }
+
+
+  @Test
+  void malformedRepositoryNameReturnsDockerProtocolError() {
+    DockerRegistryController controller = controller(null, null);
+    for (String name : List.of("repo%", "repo%FF", "repo%2Fchild")) {
+      MockHttpServletRequest request = new MockHttpServletRequest(
+          "GET", "/v2/" + name + "/library/alpine/manifests/latest");
+
+      DockerProtocolException error = assertThrows(DockerProtocolException.class,
+          () -> controller.get(request, 100, null, null));
+
+      assertEquals(DockerErrorCode.NAME_INVALID, error.code());
+      assertEquals("Invalid repository URI path", error.getMessage());
+    }
+  }
+
   @Test
   void baseEndpointReturnsRegistryApiHeader() {
     DockerRegistryController controller = controller(null, null);
@@ -75,8 +144,10 @@ class DockerRegistryControllerTest {
         response.getHeaders().getFirst(HttpHeaders.LOCATION));
   }
 
-  @Test
-  void trustedForwardedHeadersDefinePublicUploadLocation() {
+  @ParameterizedTest
+  @NullSource
+  @ValueSource(strings = {"443"})
+  void trustedForwardedHeadersDefinePublicUploadLocation(String forwardedPort) {
     RepositoryRuntime runtime = hosted("docker-hosted", null);
     DockerHostedService hosted = mock(DockerHostedService.class);
     when(hosted.startUpload(eq(runtime), eq("library/alpine"), eq(null), eq(null), eq(null), anyString(), anyString()))
@@ -91,7 +162,7 @@ class DockerRegistryControllerTest {
     request.setRemoteAddr("10.0.0.1");
     request.addHeader("X-Forwarded-Proto", "https");
     request.addHeader("X-Forwarded-Host", "registry.example.com");
-    request.addHeader("X-Forwarded-Port", "443");
+    if (forwardedPort != null) request.addHeader("X-Forwarded-Port", forwardedPort);
 
     ResponseEntity<?> response = controller.post(request, null, null);
 

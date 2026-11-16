@@ -1,5 +1,7 @@
 package com.github.klboke.kkrepo.server.proxy;
 
+import com.github.klboke.kkrepo.server.security.ClientAddress;
+
 import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.context.request.ServletRequestAttributes;
 
@@ -16,9 +18,9 @@ public final class ProxyRequestAudit {
    */
   public static String currentClientIp() {
     if (!(RequestContextHolder.getRequestAttributes() instanceof ServletRequestAttributes attrs)) {
-      return null;
+      return ProxyCachePublication.clientIp();
     }
-    String remoteAddress = attrs.getRequest().getRemoteAddr();
+    String remoteAddress = ClientAddress.from(attrs.getRequest());
     return remoteAddress == null || remoteAddress.isBlank() ? null : remoteAddress.trim();
   }
 }

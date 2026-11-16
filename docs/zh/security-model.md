@@ -1,5 +1,9 @@
 # 安全模型
 
+代理仓库的路径限制参见[路由规则](routing-rules.md)。
+
+代理仓库对新发布版本的隔离参见[最小发布时长](minimum-release-age.md)。
+
 本文说明 kkrepo 当前安全模型：认证、授权、密钥、审计日志和运维边界。
 
 内容表达式、管理页面、预览限制和权限叠加语义见[内容选择器](content-selectors.md)。
@@ -122,6 +126,12 @@ X-Nexus-Plus-Token
 ```
 
 协议客户端应继续使用各自原生认证机制和匹配的 token domain。当前协议 token domain 包含 `NpmToken`、`CargoToken`、`PubToken`、`NuGetApiKey` 和 `RubyGemsApiKey`；对应客户端协议使用 token 或 API key 时按各自协议处理，其中 Cargo、Pub 和 RubyGems 客户端通过 `Authorization` header 发送 registry/API key token。Composer 私有仓库优先使用 `COMPOSER_AUTH`/`auth.json` 的 HTTP Basic；能够显式发送 bearer 或自定义 API-key header 的 Composer/CI 场景可以使用 `GenericToken`。Terraform CLI 可把 `GenericToken` 仅放在已配置的 `modules.v1`/`providers.v1` service URL 中；生成的 archive/checksum/signature URL 会保留 credential segment，但日志、指标和上传的 CI 诊断产物必须脱敏。Ansible Galaxy 客户端可通过当前 ansible-core 的 Bearer scheme 或 Ansible 2.9 的 Token scheme 发送 `GenericToken`；仅在 Ansible route 内，kkrepo 还接受 Nexus 兼容的 Base64 `username:password`。后者只是密码传输而不是加密，不应写日志，也不应优先于 scoped token。显式错误 Ansible credential 必须返回 `401`，不能降级为 anonymous。Conda 私有 channel 通常通过 `.netrc` 提供 HTTP Basic 凭据；能够显式发送 bearer 或自定义 API-key header 的调用方可以使用 `GenericToken`。不要在 `.condarc` 中嵌入可复用密钥。`GenericToken` 不作为所有包管理客户端 token 格式的通用替代。
+
+### OHPM Token 与公钥
+
+在 **Security → Keys & Tokens → API Tokens** 创建 GenericToken，即可用于普通 OHPM 发布与安装。OHPM 将其作为原始 `Authorization` 值发送，不加 Bearer 前缀。实际访问权限来自所属用户的角色和仓库权限；已存储的 API Key `scopes` 值目前不作为令牌级权限限制执行。
+
+**OHPM Public Keys** 为已有用户登记公钥，提供服务端默认关闭的可选签名登录。登记公钥不会授予仓库权限，也不对仓库元数据或包进行签名。UI 新登记公钥立即启用，轮换保留当前启停状态，私钥由发布者保管。CI 应使用仓库权限受限的专用账号。详见[OHPM 使用指南](repository-guides/ohpm.md)和[签名登录配置](dev/ohpm-login.md)。
 
 ## 加密密钥
 
@@ -248,3 +258,56 @@ KKREPO_OUTBOUND_ALLOWED_HOSTS=
 - 迁移数据泄露。
 
 详见 [SECURITY.md](../../SECURITY.md)。
+
+## NuGet 上游 NTLM 认证
+
+NuGet proxy 仓库支持使用 NTLM 访问要求 Windows 凭据的上游。在管理控制台的仓库配置中，将「上游认证方式」设为 **NTLM**，填写远端用户名、密码，以及可选的 NTLM 域和工作站名称。用户名也可以填写 `DOMAIN\username`；显式配置的域优先。切换前须清除已保存的 Bearer token。
+
+对应 `/internal/repositories` 的 proxy 配置如下：
+
+```json
+{
+  "remoteAuthenticationType": "ntlm",
+  "remoteUsername": "service-user",
+  "remotePassword": "<password>",
+  "remoteNtlmDomain": "DOMAIN",
+  "remoteNtlmHost": "KKREPO"
+}
+```
+
+默认的 `auto` 模式保留现有 Basic/Bearer 行为。NTLM 模式收到上游挑战后才开始握手，不预先发送 Basic 密码，也不回退到 Basic。本功能用于 NuGet proxy 上游认证，不包含 Kerberos/SPNEGO 或使用 Windows 账号登录 kkRepo。私有地址仍需要出站白名单；支持 NTLM 不代表已验证所有 Azure DevOps 专有 NuGet API 行为。
+
+密码继续使用加密存储的 `remotePassword`，API 不返回明文。Nexus NuGet 迁移会保留导出的 NTLM 类型、域和工作站；缺失或被掩码遮蔽的密码仍需由管理员重新填写。认证连接按仓库、源站、出站代理和凭据指纹隔离。各副本依据数据库配置独立建立可重建的本地连接池；凭据更新会选择新连接池，本节点更新/删除会清理旧池，空闲池按 `kkrepo.outbound-proxy.idle-ttl-ms` 到期。相同源站的重定向保留认证，跨源站重定向必须通过原有白名单检查且不携带 NTLM 凭据。
+
+NuGet service index 发现不会向其他源站委托仓库凭据。发现的资源遵循现有出站请求的同源校验；私有地址白名单和 `allowedRedirectHosts` 均不授权跨源共享 Basic/Bearer/NTLM 凭据。如果需要认证的资源使用规范主机名，且该源站也提供 service index，可将其配置为上游地址。需要跨多个源站共享凭据的 feed 需要单独配置凭据委托功能，目前尚不支持。
+
+NuGet group 的包链接和 registration 链接（包括不带查询参数的链接）携带绑定入口 group、来源成员、包路径、原始查询串和已发现资源的认证路由证明。各副本使用已有的部署 credential secret 校验，仍执行仓库权限检查，并依据当前 group 配置检查成员关系。客户端不能覆盖资源自身的查询参数。如果隐藏资源凭据会改变链接查询串的原始顺序或编码，则使用经过认证的加密数据保留完整查询串，并绑定 proxy 仓库、配置的 feed、已发现资源和客户端路径／查询串；任意副本都可还原，无需本地 session 状态。签名下载请求失败不会写入普通包请求的负缓存。
+
+当前 Apache HttpClient 依赖保留了已弃用、需显式注册的 NTLM 实现。仅 NTLM 请求启用该实现，升级依赖时必须保留 NTLMv2 握手回归测试。参考对照脚本为 `compat-test/scripts/ntlm-upstream.py`，可分别或同时连接临时 Nexus/kkRepo 实例，校验 NTLMv2 密码证明、包内容和 GET/HEAD 响应，并清理测试仓库及临时 Nexus SSRF 白名单项。指定双方可达的 `--upstream-host`；添加 `--dotnet` 可使用独立包缓存执行真实 .NET 8 restore。
+
+## 扫描活动排序
+
+管理控制台 → Security Scanning → Tasks / Overview（扫描运行记录）默认按实际完成时间降序显示（最新优先）。点击任务的 **Finished** 或运行记录的 **Completed** 列表头可切换升降序，箭头显示当前排序方向，与仓库列表一致。任务列表同时显示完成时间。未完成任务在两个方向都排在最后；完成时间相同时按所选方向的 ID 排序。搜索和仓库可见性过滤均在分页前执行。
+
+管理 API 支持相同排序：
+
+- `GET /internal/security/scanning/tasks?sort=finished_at&direction=desc&limit=25`，可附加 `status=FAILED`、`repositoryId` 或 `q`。
+- `GET /internal/security/scanning/runs?sort=completed_at&direction=asc&limit=25`，可附加 `repositoryId` 或 `q`。
+
+选择完成时间排序但省略方向时，默认 `direction=desc`。将响应中的不透明 `nextCursor` 作为下一页的 `cursor`，并保持排序、方向和过滤条件一致；游标为空表示没有下一页。修改排序或过滤条件后应从第一页重新查询。完成时间排序不使用 `after`/`nextAfter`。省略 `sort`（或使用 `sort=id&direction=asc`）时，保留原有 ID 升序和 `after`/`nextAfter` 分页，兼容旧客户端。不支持的字段、方向、格式错误或与排序不匹配的游标，以及超出 JDBC 连接支持范围的时间戳均返回 HTTP 400。
+
+游标保存完成时间和 ID，任何服务副本都能继续分页，无需重新查询上一页的边界记录。列表反映实时数据，并非固定快照：任务重试、新完成任务或历史清理可能在浏览期间改变列表。查看最新活动时请从第一页刷新。
+
+完成时间分页使用 V55 迁移新增的时间戳／ID 索引，并为按状态筛选的任务列表提供状态前导索引（包括指定仓库的列表）。任务分别查询已完成和未完成区间，每次最多读取该页剩余条数，服务端在同一个只读事务内完成两次读取。这样既保持未完成任务排在最后，也避免对全部历史记录进行空值排序。MySQL 使用在线索引构建，PostgreSQL 使用并发索引构建；迁移支持中断后重试。
+
+### 代理重定向域名规则
+
+`proxy.allowedRedirectHosts` 支持完整域名和以 `*.` 开头的规则，例如
+`["*.quay.io", "quay.io"]`。`*.quay.io` 匹配 `cdn01.quay.io` 和多级子域名，
+不匹配 `quay.io`、`evilquay.io` 或 `quay.io.example.com`。原有精确域名规则行为不变。
+规则不区分大小写，规范化末尾的点，国际化域名转为 ASCII 存储。拒绝单独的 `*`、
+部分通配符、单标签通配后缀、IP 通配规则、协议头、端口和路径；每个仓库最多 64 条。
+
+规则保存在共享数据库中，每个副本在普通代理和 Docker 的每次重定向中应用。
+这些规则不授权访问私网，也不会跨源转发 Basic/Bearer/NTLM 凭据；每次跳转仍执行
+出站地址校验和 DNS 固定。

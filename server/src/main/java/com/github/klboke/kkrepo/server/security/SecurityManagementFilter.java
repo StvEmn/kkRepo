@@ -70,11 +70,16 @@ public class SecurityManagementFilter extends OncePerRequestFilter {
 
   private Optional<String> permissionFor(HttpServletRequest request) {
     String method = request.getMethod().toUpperCase();
-    String uri = stripContextPath(request);
+    String uri = SecurityRequestPath.matchingPath(request);
     if (uri.equals("/service/rest/internal/ui/content-selectors/preview")
         || uri.equals("/internal/security/content-selectors/options")) {
       // The controller enforces the selector create OR update permission for preview.
       return Optional.of(AUTHENTICATED_ONLY);
+    }
+    if (uri.equals("/service/rest/v1/routing-rules")
+        || uri.startsWith("/service/rest/v1/routing-rules/")
+        || uri.startsWith("/internal/routing-rules/")) {
+      return Optional.of("nexus:*");
     }
     if (uri.startsWith("/service/rest/v1/security/")) {
       return serviceRestPermission(method, uri);
@@ -258,17 +263,8 @@ public class SecurityManagementFilter extends OncePerRequestFilter {
     };
   }
 
-  private String stripContextPath(HttpServletRequest request) {
-    String uri = request.getRequestURI();
-    String contextPath = request.getContextPath();
-    if (contextPath != null && !contextPath.isBlank() && uri.startsWith(contextPath)) {
-      uri = uri.substring(contextPath.length());
-    }
-    return uri.replace("%2f", "/").replace("%2F", "/");
-  }
-
   private void challenge(HttpServletRequest request, HttpServletResponse response) throws IOException {
-    String uri = stripContextPath(request);
+    String uri = SecurityRequestPath.matchingPath(request);
     if (shouldRedirectToWelcome(request, uri)) {
       response.sendRedirect(AUTH_REQUIRED_WELCOME);
       return;

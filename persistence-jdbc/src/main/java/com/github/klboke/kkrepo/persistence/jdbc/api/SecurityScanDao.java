@@ -152,6 +152,17 @@ public interface SecurityScanDao {
       long afterId,
       int maxItems);
 
+  /** Completion-time keyset order; null timestamps sort last in either direction. */
+  record CompletionOrder(boolean ascending, long afterId, Instant afterTime) {}
+
+  List<ScanTask> listTasks(
+      Long repositoryId, TaskStatus status, String query, long afterId, int maxItems,
+      CompletionOrder completion);
+
+  List<ScanTask> listTasksByRepositories(
+      List<Long> repositoryIds, TaskStatus status, String query, long afterId, int maxItems,
+      CompletionOrder completion);
+
   /** Claims tasks with row locks and assigns a distinct lease token to every task. */
   List<ScanTask> claimTasks(
       String workerId, Instant now, Instant leaseUntil, int maxItems);
@@ -242,6 +253,13 @@ public interface SecurityScanDao {
   List<ScanRun> listRunsByRepositories(
       List<Long> repositoryIds, String query, long afterId, int maxItems);
 
+  List<ScanRun> listRuns(
+      Long repositoryId, String query, long afterId, int maxItems, CompletionOrder completion);
+
+  List<ScanRun> listRunsByRepositories(
+      List<Long> repositoryIds, String query, long afterId, int maxItems,
+      CompletionOrder completion);
+
   void associateRun(
       long scanRunId,
       long repositoryId,
@@ -260,6 +278,50 @@ public interface SecurityScanDao {
    */
   List<ScanRunSubject> listRunSubjects(
       long scanRunId, long afterRepositoryId, long afterAssetId, int maxItems);
+
+  /** When currentOnly is true, also requires the overview current-run predicate. */
+  List<ScanRunSubject> listRunSubjects(
+      long scanRunId, long afterRepositoryId, long afterAssetId, int maxItems, boolean currentOnly);
+
+  /** Same subject pagination, with only the live asset's source repository for capability checks. */
+  List<ScanRunSubjectAsset> listRunSubjectAssets(
+      long scanRunId, long afterRepositoryId, long afterAssetId, int maxItems, boolean currentOnly);
+
+  /**
+   * Lists run subjects whose recorded content generation still matches the current asset
+   * candidate. This prevents historical findings from being presented as remediation targets
+   * after an asset path has been overwritten with different content.
+   */
+  List<ScanRunSubject> listCurrentRunSubjects(
+      long scanRunId, long afterRepositoryId, long afterAssetId, int maxItems);
+
+  /**
+   * Lists current run subjects within the supplied visible repository contexts.
+   *
+   * <p>The database also validates that a group context still resolves to the asset's source
+   * repository, avoiding an application-side scan across hidden or detached subjects.
+   */
+  List<ScanRunSubject> listCurrentRunSubjects(
+      long scanRunId,
+      List<Long> repositoryIds,
+      long afterRepositoryId,
+      long afterAssetId,
+      int maxItems);
+
+  /** When currentOnly is true, also requires the overview current-run predicate. */
+  List<ScanRunSubject> listCurrentRunSubjects(
+      long scanRunId,
+      List<Long> repositoryIds,
+      long afterRepositoryId,
+      long afterAssetId,
+      int maxItems,
+      boolean currentOnly);
+
+  /** Counts current run subjects within visible, currently valid repository contexts. */
+  long countCurrentRunSubjects(long scanRunId, List<Long> repositoryIds);
+
+  /** When currentOnly is true, also requires the overview current-run predicate. */
+  long countCurrentRunSubjects(long scanRunId, List<Long> repositoryIds, boolean currentOnly);
 
   boolean runSubjectExists(long scanRunId, long repositoryId, long assetId);
 
@@ -288,6 +350,16 @@ public interface SecurityScanDao {
       long afterId,
       int maxItems);
 
+  /** When currentOnly is true, also requires the overview current-run predicate. */
+  List<ScanFinding> listFindings(
+      Long repositoryId,
+      Long scanRunId,
+      Severity severity,
+      String query,
+      long afterId,
+      int maxItems,
+      boolean currentOnly);
+
   List<ScanFinding> listFindingsByRepositories(
       List<Long> repositoryIds,
       Long scanRunId,
@@ -295,6 +367,16 @@ public interface SecurityScanDao {
       String query,
       long afterId,
       int maxItems);
+
+  /** When currentOnly is true, also requires the overview current-run predicate. */
+  List<ScanFinding> listFindingsByRepositories(
+      List<Long> repositoryIds,
+      Long scanRunId,
+      Severity severity,
+      String query,
+      long afterId,
+      int maxItems,
+      boolean currentOnly);
 
   Optional<AssetSecurityState> findAssetState(long assetId, long profileId);
 
@@ -363,6 +445,12 @@ public interface SecurityScanDao {
 
   List<ScanPolicy> listPolicies(String query, long afterId, int maxItems);
 
+  /** Latest revision of each policy plus an optional existing assignment, paginated by ID. */
+  List<ScanPolicy> listPolicyOptions(Long assignedPolicyId, long afterId, int maxItems);
+
+  /** Returns the latest revisions among these IDs, considering all stored revisions across pages. */
+  List<Long> findLatestPolicyIds(List<Long> policyIds);
+
   Optional<ScanPolicy> findPolicy(long policyId);
 
   ScanPolicy createPolicy(ScanPolicy policy);
@@ -380,6 +468,15 @@ public interface SecurityScanDao {
    */
   Optional<ScanPolicy> createNextPolicyRevision(
       long expectedHeadPolicyId, ScanPolicy policy);
+
+  /**
+   * Deletes every revision of an unused policy, fenced by its expected latest revision ID.
+   * The database serializes this with revision creation and locks all revision rows before
+   * checking references, including disabled configurations and expired waivers.
+   */
+  PolicyDeletion deletePolicyIfUnused(long expectedHeadPolicyId);
+
+  enum PolicyDeletion { DELETED, NOT_FOUND, STALE_REVISION, IN_USE }
 
   /**
    * Moves repository configurations pinned to one immutable policy revision to its replacement.
@@ -776,6 +873,9 @@ public interface SecurityScanDao {
       long profileId,
       long contentGeneration,
       Instant associatedAt) {}
+
+  /** A null sourceRepositoryId means the asset no longer exists. */
+  record ScanRunSubjectAsset(ScanRunSubject subject, Long sourceRepositoryId) {}
 
   record ScanFinding(
       Long id,

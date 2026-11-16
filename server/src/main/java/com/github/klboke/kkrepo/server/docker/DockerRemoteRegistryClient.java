@@ -11,6 +11,7 @@ import com.github.klboke.kkrepo.server.proxy.ProxiedHttpClientFactory;
 import com.github.klboke.kkrepo.server.security.OutboundRequestPolicy;
 import com.github.klboke.kkrepo.server.security.SecurityValidationException;
 import io.micrometer.core.instrument.Timer;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.net.URLEncoder;
@@ -32,6 +33,7 @@ import org.springframework.stereotype.Component;
 public class DockerRemoteRegistryClient {
   private static final String TOKEN_CACHE_NAMESPACE = "docker-remote-token";
   private static final int MAX_REDIRECTS = 5;
+  private static final int MAX_CHALLENGE_BODY_BYTES = 64 * 1024;
 
   private final HttpRemoteFetcher fetcher;
   private final OutboundRequestPolicy outboundPolicy;
@@ -60,23 +62,33 @@ public class DockerRemoteRegistryClient {
   }
 
   public HttpRemoteFetcher.Result get(RepositoryRuntime runtime, String remotePath, String accept) throws IOException {
-    String url = remoteUrl(runtime, remotePath);
-    RemoteFetch fetched = fetch(url, runtime, null, accept);
+    return get(runtime, remotePath, null, accept);
+  }
+
+  public HttpRemoteFetcher.Result get(
+      RepositoryRuntime runtime, String remotePath, String query, String accept) throws IOException {
+    return get(runtime, remotePath, query, accept, null);
+  }
+
+  public HttpRemoteFetcher.Result get(RepositoryRuntime runtime, String remotePath,
+      String query, String accept, HttpRemoteFetcher.ByteRange range) throws IOException {
+    String url = remoteUrl(runtime, remotePath, query);
+    RemoteFetch fetched = fetch(url, runtime, null, accept, range);
     HttpRemoteFetcher.Result result = fetched.result();
     if (result.status() == 401 && fetched.credentialsAllowed()) {
+      result = releaseChallenge(result);
       String challenge = result.header("WWW-Authenticate");
       RemoteToken token = token(runtime, challenge).orElse(null);
       if (token != null) {
-        result.close();
-        fetched = fetch(fetched.effectiveUri().toString(), runtime, token.value(), accept);
+        fetched = fetch(fetched.effectiveUri().toString(), runtime, token.value(), accept, range);
         result = fetched.result();
         if (result.status() == 401 && token.cached() && fetched.credentialsAllowed()) {
+          result = releaseChallenge(result);
           evictToken(token.cacheKey());
           challenge = result.header("WWW-Authenticate");
           token = fetchToken(runtime, BearerChallenge.parse(challenge).orElse(null), true).orElse(null);
           if (token != null) {
-            result.close();
-            result = fetch(fetched.effectiveUri().toString(), runtime, token.value(), accept).result();
+            result = fetch(fetched.effectiveUri().toString(), runtime, token.value(), accept, range).result();
           }
         }
       }
@@ -84,9 +96,23 @@ public class DockerRemoteRegistryClient {
     return result;
   }
 
+  private static HttpRemoteFetcher.Result releaseChallenge(HttpRemoteFetcher.Result result) throws IOException {
+    // The token realm may share the registry's route. Release that lease before any token/cache
+    // operation, including refresh failures. Keep the error body readable if no token is available;
+    // successful manifests and blobs continue to stream without buffering here.
+    try (result) {
+      byte[] body = result.body().readNBytes(MAX_CHALLENGE_BODY_BYTES + 1);
+      if (body.length > MAX_CHALLENGE_BODY_BYTES) {
+        throw new IOException("Docker authentication challenge body exceeds 64 KiB");
+      }
+      return new HttpRemoteFetcher.Result(result.status(), result.headers(),
+          new ByteArrayInputStream(body));
+    }
+  }
+
   private RemoteFetch fetch(
-      String url, RepositoryRuntime runtime, String bearerToken, String accept) throws IOException {
-    return pinnedFetchWithHeaders(url, runtime, bearerToken, accept, 0, true);
+      String url, RepositoryRuntime runtime, String bearerToken, String accept, HttpRemoteFetcher.ByteRange range) throws IOException {
+    return pinnedFetchWithHeaders(url, runtime, bearerToken, accept, 0, true, range);
   }
 
   private Optional<RemoteToken> token(RepositoryRuntime runtime, String challenge) throws IOException {
@@ -131,20 +157,27 @@ public class DockerRemoteRegistryClient {
       String bearerToken,
       String accept,
       int redirects,
-      boolean sendCredentials) throws IOException {
+      boolean sendCredentials, HttpRemoteFetcher.ByteRange range) throws IOException {
     Timer.Sample sample = metrics == null ? null : metrics.startTimer();
     int status = 0;
     Throwable failure = null;
     boolean recorded = false;
     ProxiedHttpClientFactory.ProxiedResponse response = null;
     try {
-      OutboundRequestPolicy.ResolvedHttpTarget target =
-          outboundPolicy.resolveHttpTarget(
-              url, "docker remote fetch", proxyResolvesDns(runtime));
+      boolean publicHttps = runtime != null && runtime.contentRedirectPolicy()
+          == com.github.klboke.kkrepo.server.security.ProxyRedirectPolicy.PUBLIC_HTTPS;
+      OutboundRequestPolicy.ResolvedHttpTarget target = publicHttps
+          ? outboundPolicy.resolvePublicHttpsTarget(url, "docker remote fetch")
+          : outboundPolicy.resolveHttpTarget(url, "docker remote fetch", proxyResolvesDns(runtime));
       URI uri = target.uri();
       Map<String, String> headers = new LinkedHashMap<>();
       headers.put("User-Agent", "kkrepo/0.1");
       headers.put("Accept", accept == null || accept.isBlank() ? "*/*" : accept);
+      if (range != null) {
+        headers.put("Range", range.range());
+        if (range.ifRange() != null) headers.put("If-Range", range.ifRange());
+        headers.put("Accept-Encoding", "identity");
+      }
       if (sendCredentials && bearerToken != null && !bearerToken.isBlank()) {
         headers.put("Authorization", "Bearer " + bearerToken);
       } else if (sendCredentials) {
@@ -165,7 +198,7 @@ public class DockerRemoteRegistryClient {
         response.close();
         response = null;
         if (redirects >= MAX_REDIRECTS) {
-          throw new IOException("Too many redirects fetching Docker remote " + url);
+          throw new IOException("Too many redirects fetching Docker remote from " + uri.getHost());
         }
         URI redirected = uri.resolve(location);
         requireAllowedRedirect(runtime, uri, redirected);
@@ -178,7 +211,7 @@ public class DockerRemoteRegistryClient {
             forwardCredentials ? bearerToken : null,
             accept,
             redirects + 1,
-            forwardCredentials);
+            forwardCredentials, range);
       }
       return new RemoteFetch(
           new HttpRemoteFetcher.Result(response.status(), response.headers(), releaseOnClose(response)),
@@ -263,7 +296,7 @@ public class DockerRemoteRegistryClient {
     };
   }
 
-  private static String remoteUrl(RepositoryRuntime runtime, String remotePath) {
+  private static String remoteUrl(RepositoryRuntime runtime, String remotePath, String query) {
     String base = runtime.proxyRemoteUrl();
     if (base == null || base.isBlank()) {
       throw new DockerProtocolException(DockerErrorCode.NAME_UNKNOWN, "Docker proxy remote URL is not configured");
@@ -272,12 +305,12 @@ public class DockerRemoteRegistryClient {
     String path = remotePath == null ? "" : remotePath;
     while (path.startsWith("/")) path = path.substring(1);
     if (base.endsWith("/v2")) {
-      return RemoteUrlBuilder.repositoryPathString(base, path);
+      return RemoteUrlBuilder.repositoryPathWithQueryString(base, path, query);
     }
     if (base.contains("/v2/")) {
-      return RemoteUrlBuilder.repositoryPathString(base, path);
+      return RemoteUrlBuilder.repositoryPathWithQueryString(base, path, query);
     }
-    return RemoteUrlBuilder.repositoryPathString(base + "/v2", path);
+    return RemoteUrlBuilder.repositoryPathWithQueryString(base + "/v2", path, query);
   }
 
   private static String encode(String value) {
@@ -317,6 +350,14 @@ public class DockerRemoteRegistryClient {
 
   private static void requireAllowedRedirect(
       RepositoryRuntime runtime, URI current, URI redirected) {
+    if (runtime != null && runtime.contentRedirectPolicy()
+        == com.github.klboke.kkrepo.server.security.ProxyRedirectPolicy.PUBLIC_HTTPS) {
+      if (!"https".equalsIgnoreCase(current.getScheme())
+          || !"https".equalsIgnoreCase(redirected.getScheme())) {
+        throw new SecurityValidationException("PUBLIC_HTTPS redirect must remain https");
+      }
+      return; // Every destination is independently validated and pinned before connection.
+    }
     if (sameOrigin(current, redirected)) {
       return;
     }

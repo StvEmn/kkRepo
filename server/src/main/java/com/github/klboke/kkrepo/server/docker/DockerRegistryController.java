@@ -1,9 +1,13 @@
 package com.github.klboke.kkrepo.server.docker;
 
+import com.github.klboke.kkrepo.server.routingrules.RepositoryRoutingPolicy;
+import com.github.klboke.kkrepo.server.security.ClientAddress;
+
 import com.github.klboke.kkrepo.auth.AccessDecisionService;
 import com.github.klboke.kkrepo.auth.PermissionAction;
 import com.github.klboke.kkrepo.auth.RepositoryPermission;
 import com.github.klboke.kkrepo.core.RepositoryFormat;
+import com.github.klboke.kkrepo.core.http.UriPathDecoder;
 import com.github.klboke.kkrepo.protocol.docker.DockerConstants;
 import com.github.klboke.kkrepo.protocol.docker.DockerDigest;
 import com.github.klboke.kkrepo.protocol.docker.DockerErrorCode;
@@ -16,7 +20,6 @@ import com.github.klboke.kkrepo.server.security.AuthenticatedSubject;
 import com.github.klboke.kkrepo.server.security.ForwardedHeaderPolicy;
 import jakarta.servlet.http.HttpServletRequest;
 import java.io.IOException;
-import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -40,6 +43,13 @@ import org.springframework.web.bind.annotation.RestController;
 @RestController
 @RequestMapping("/v2")
 public class DockerRegistryController {
+  private RepositoryRoutingPolicy routingPolicy;
+
+  @org.springframework.beans.factory.annotation.Autowired
+  void setRoutingPolicy(RepositoryRoutingPolicy policy) {
+    this.routingPolicy = policy;
+  }
+
   private final RepositoryRuntimeRegistry registry;
   private final DockerHostedService hosted;
   private final DockerProxyService proxy;
@@ -85,7 +95,7 @@ public class DockerRegistryController {
     if (target.path().kind() == DockerPath.Kind.BASE) {
       return registryBase();
     }
-    RepositoryRuntime runtime = runtime(target);
+    RepositoryRuntime runtime = runtime(target, request);
     return switch (target.path().kind()) {
       case MANIFEST -> stream(dispatchManifest(runtime, target.path(), false, accept), request, false);
       case BLOB -> stream(dispatchBlob(runtime, target.path(), false), request, true);
@@ -110,7 +120,7 @@ public class DockerRegistryController {
     if (target.path().kind() == DockerPath.Kind.BASE) {
       return registryBase();
     }
-    RepositoryRuntime runtime = runtime(target);
+    RepositoryRuntime runtime = runtime(target, request);
     return switch (target.path().kind()) {
       case MANIFEST -> stream(dispatchManifest(runtime, target.path(), true, accept), request, false);
       case BLOB -> stream(dispatchBlob(runtime, target.path(), true), request, false);
@@ -126,7 +136,7 @@ public class DockerRegistryController {
       @RequestParam(name = "mount", required = false) String mount,
       @RequestParam(name = "from", required = false) String from) {
     DockerTarget target = target(request);
-    RepositoryRuntime runtime = runtime(target);
+    RepositoryRuntime runtime = runtime(target, request);
     DockerPath path = target.path();
     if (path.kind() != DockerPath.Kind.UPLOAD_START) {
       throw new DockerProtocolException(DockerErrorCode.UNSUPPORTED, "unsupported Docker POST path", 405);
@@ -137,7 +147,7 @@ public class DockerRegistryController {
     }
     var status = hosted.startUpload(
         runtime, path.imageName(), mount, source == null ? from : source.imageName(), source == null ? null : source.runtime(),
-        userId(request), request.getRemoteAddr());
+        userId(request), ClientAddress.from(request));
     if (status.mounted()) {
       return ResponseEntity.status(HttpStatus.CREATED)
           .header(DockerConstants.API_VERSION_HEADER, DockerConstants.API_VERSION)
@@ -153,7 +163,7 @@ public class DockerRegistryController {
       HttpServletRequest request,
       @RequestHeader(name = "Content-Range", required = false) String contentRange) throws IOException {
     DockerTarget target = target(request);
-    RepositoryRuntime runtime = runtime(target);
+    RepositoryRuntime runtime = runtime(target, request);
     DockerPath path = target.path();
     if (path.kind() != DockerPath.Kind.UPLOAD_SESSION) {
       throw new DockerProtocolException(DockerErrorCode.UNSUPPORTED, "unsupported Docker PATCH path", 405);
@@ -171,12 +181,12 @@ public class DockerRegistryController {
       @RequestHeader(name = HttpHeaders.CONTENT_TYPE, required = false) String contentType,
       @RequestHeader(name = "Content-Range", required = false) String contentRange) throws IOException {
     DockerTarget target = target(request);
-    RepositoryRuntime runtime = runtime(target);
+    RepositoryRuntime runtime = runtime(target, request);
     DockerPath path = target.path();
     if (path.kind() == DockerPath.Kind.MANIFEST) {
       DockerResponse response = hosted.putManifest(
           runtime, path.imageName(), path.reference(), request.getInputStream(), contentType, tags,
-          userId(request), request.getRemoteAddr())
+          userId(request), ClientAddress.from(request))
           .withHeader(HttpHeaders.LOCATION, manifestLocation(request, runtime, target, path.imageName(), path.reference()));
       return stream(response, request, false);
     }
@@ -189,7 +199,7 @@ public class DockerRegistryController {
           contentRange,
           parseUploadDigest(digest),
           userId(request),
-          request.getRemoteAddr());
+          ClientAddress.from(request));
       return ResponseEntity.status(HttpStatus.CREATED)
           .header(DockerConstants.API_VERSION_HEADER, DockerConstants.API_VERSION)
           .header(DockerConstants.CONTENT_DIGEST_HEADER, result.digest().value())
@@ -202,7 +212,7 @@ public class DockerRegistryController {
   @DeleteMapping("/**")
   public ResponseEntity<?> delete(HttpServletRequest request) {
     DockerTarget target = target(request);
-    RepositoryRuntime runtime = runtime(target);
+    RepositoryRuntime runtime = runtime(target, request);
     DockerPath path = target.path();
     if (path.kind() == DockerPath.Kind.MANIFEST) {
       return stream(hosted.deleteManifest(runtime, path.imageName(), path.reference()), request, false);
@@ -386,7 +396,7 @@ public class DockerRegistryController {
     return new DockerTarget(repository, parser.parse(raw.substring(slash + 1)), false);
   }
 
-  private RepositoryRuntime runtime(DockerTarget target) {
+  private RepositoryRuntime runtime(DockerTarget target, HttpServletRequest request) {
     if (target.repository() == null || target.repository().isBlank()) {
       throw new DockerProtocolException(DockerErrorCode.NAME_UNKNOWN, "Docker repository route is missing");
     }
@@ -394,6 +404,22 @@ public class DockerRegistryController {
         .orElseThrow(() -> new DockerProtocolException(DockerErrorCode.NAME_UNKNOWN, target.repository()));
     if (runtime.format() != RepositoryFormat.DOCKER) {
       throw new DockerProtocolException(DockerErrorCode.NAME_UNKNOWN, target.repository());
+    }
+    if (routingPolicy != null && ("GET".equals(request.getMethod()) || "HEAD".equals(request.getMethod()))) {
+      // The target parser has already decoded segments and normalized digest identities.
+      // Match that same resource, including connector routes without a repository prefix.
+      DockerPath parsed = target.path();
+      String path = "/v2/" + switch (parsed.kind()) {
+        case BASE -> "";
+        case CATALOG -> "_catalog";
+        case MANIFEST -> parsed.imageName() + "/manifests/" + parsed.reference();
+        case BLOB -> parsed.imageName() + "/blobs/" + parsed.digest().value();
+        case REFERRERS -> parsed.imageName() + "/referrers/" + parsed.digest().value();
+        case TAGS -> parsed.imageName() + "/tags/list";
+        case UPLOAD_START -> parsed.imageName() + "/blobs/uploads";
+        case UPLOAD_SESSION -> parsed.imageName() + "/blobs/uploads/" + parsed.uploadUuid();
+      };
+      runtime = routingPolicy.prepareCanonical(runtime, path, request);
     }
     return runtime;
   }
@@ -519,7 +545,11 @@ public class DockerRegistryController {
   }
 
   private static String decode(String value) {
-    return URLDecoder.decode(value, StandardCharsets.UTF_8);
+    try {
+      return UriPathDecoder.decodeSegment(value);
+    } catch (IllegalArgumentException e) {
+      throw new DockerProtocolException(DockerErrorCode.NAME_INVALID, "Invalid repository URI path");
+    }
   }
 
   private String linkHeader(HttpServletRequest request, int limit, String nextLast) {

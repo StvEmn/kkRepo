@@ -1,5 +1,6 @@
 package com.github.klboke.kkrepo.server.swift;
 
+import com.github.klboke.kkrepo.server.config.RepositoryUrlPrefix;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -451,7 +452,7 @@ public class SwiftService {
             ip,
             lease);
         String base = repositoryBaseUrl == null || repositoryBaseUrl.isBlank()
-            ? "/repository/" + runtime.name() + "/"
+            ? RepositoryUrlPrefix.currentPath() + runtime.name() + "/"
             : repositoryBaseUrl;
         String location = releaseUrl(base, release);
         return json(
@@ -1154,8 +1155,15 @@ public class SwiftService {
     return registry.findReleaseById(binding.memberReleaseId())
         .filter(row -> row.revision() == binding.memberRevision())
         .filter(row -> SwiftRegistryDao.RELEASE_READY.equals(row.status()))
-        .flatMap(release -> runtimes.resolveById(release.repositoryId())
-            .map(memberRuntime -> new ResolvedRelease(memberRuntime, release)));
+        .flatMap(release -> {
+          try {
+            return runtimes.resolveById(release.repositoryId())
+                .map(memberRuntime -> new ResolvedRelease(memberRuntime, release));
+          } catch (com.github.klboke.kkrepo.server.routingrules.RepositoryRoutingPolicy.Blocked ignored) {
+            // A binding published by an earlier policy cannot prevent allowed-member fallback.
+            return Optional.empty();
+          }
+        });
   }
 
   private SwiftRegistryDao.Release materializeProxy(
@@ -1366,7 +1374,7 @@ public class SwiftService {
           null,
           null,
           "PROXY",
-          "/repository/" + runtime.name() + "/"
+          RepositoryUrlPrefix.currentPath() + runtime.name() + "/"
               + coordinates.owner() + "/" + coordinates.repository() + "/" + observed.version(),
           null,
           409,

@@ -1,5 +1,6 @@
 package com.github.klboke.kkrepo.server.management;
 
+import com.github.klboke.kkrepo.server.config.RepositoryUrlPrefix;
 import com.fasterxml.jackson.annotation.JsonAnyGetter;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonInclude;
@@ -49,6 +50,13 @@ public class NexusAssetManagementService {
   private final NexusAssetAuthorizer authorizer;
   private final NexusAssetIdCodec idCodec;
   private final ForwardedHeaderPolicy forwardedHeaderPolicy;
+  private com.github.klboke.kkrepo.server.gitlfs.GitLfsHostedService gitLfs;
+
+  @org.springframework.beans.factory.annotation.Autowired
+  void setGitLfsHostedService(com.github.klboke.kkrepo.server.gitlfs.GitLfsHostedService gitLfs) {
+    this.gitLfs = gitLfs;
+  }
+
   private final MavenPathParser mavenPathParser = new MavenPathParser();
 
   public NexusAssetManagementService(
@@ -208,9 +216,12 @@ public class NexusAssetManagementService {
         .filter(candidate -> belongsTo(candidate, repository))
         .orElseThrow(AssetNotFoundException::new);
     authorizer.requireRepositoryAction(request, repository, asset.path(), PermissionAction.DELETE);
+    if (repository.format() == RepositoryFormat.GITLFS && repository.type() == RepositoryType.HOSTED) {
+      return gitLfs.deleteById(repository.id(), asset.id());
+    }
     if (repository.format() != RepositoryFormat.RAW || repository.type() != RepositoryType.HOSTED) {
       throw new UnsupportedAssetDeleteException(
-          "Asset deletion by ID is currently supported only for Raw hosted repositories");
+          "Asset deletion by ID is currently supported only for Raw and Git LFS hosted repositories");
     }
     RepositoryRuntime runtime = runtimeRegistry.resolve(repository.name())
         .orElseThrow(AssetNotFoundException::new);
@@ -299,7 +310,7 @@ public class NexusAssetManagementService {
     String contextPath = request.getContextPath() == null ? "" : request.getContextPath();
     return forwardedHeaderPolicy.serverBaseUrl(request)
         + contextPath
-        + "/repository/"
+        + RepositoryUrlPrefix.path(request)
         + UriUtils.encodePathSegment(repositoryName, StandardCharsets.UTF_8)
         + "/"
         + encodePath(path);

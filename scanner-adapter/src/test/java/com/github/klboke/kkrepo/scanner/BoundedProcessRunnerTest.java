@@ -14,6 +14,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -98,6 +99,19 @@ class BoundedProcessRunnerTest {
         Duration.ofSeconds(2),
         Map.of("GRYPE_DB_CACHE_DIR", explicitDatabase.toString()));
     assertEquals(explicitDatabase.toString(), Files.readString(environmentOutput));
+
+    Path mirrorOutput = directory.resolve("mirror-environment.out");
+    runner.run(
+        List.of("/bin/sh", "-c", "printf '%s|%s' \"$GRYPE_DB_UPDATE_URL\" \"$GRYPE_DB_CA_CERT\""),
+        directory,
+        mirrorOutput,
+        Duration.ofSeconds(2),
+        Map.of(
+            "GRYPE_DB_UPDATE_URL", "https://mirror.example/grype-db",
+            "GRYPE_DB_CA_CERT", "/etc/ssl/mirror.crt"));
+    assertEquals(
+        "https://mirror.example/grype-db|/etc/ssl/mirror.crt",
+        Files.readString(mirrorOutput));
 
     ScannerRequestException failure = assertThrows(
         ScannerRequestException.class,
@@ -214,6 +228,18 @@ class BoundedProcessRunnerTest {
     for (Long processId : processIds) {
       assertFalse(canExecute(processId));
     }
+  }
+
+  @Test
+  void anEmptyProcSnapshotDoesNotHideAForkedChild() throws Exception {
+    AtomicInteger inspections = new AtomicInteger();
+
+    // /proc enumeration can omit a newly forked child while its listed parent exits.
+    // The child is visible to later snapshots and remains able to execute work.
+    boolean exited = BoundedProcessRunner.ProcessGroupSupport.waitForGroupExit(
+        Duration.ofMillis(100), () -> inspections.incrementAndGet() > 1);
+
+    assertFalse(exited, "Cleanup must keep waiting for the child instead of returning early");
   }
 
   @Test

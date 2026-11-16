@@ -4,6 +4,252 @@ All notable public changes to kkrepo are documented in this file.
 
 This project follows a pragmatic release process. Stable releases call out migration impact, compatibility changes, operational notes, and any known behavior changes in their release section.
 
+## 1.4.0 - 2026-11-05
+
+### Added
+
+- Nexus-compatible ALLOW/BLOCK routing rules with path previews, usage inspection, proxy bindings, and atomic configuration migration. Proxy GET/HEAD enforcement precedes cache and upstream access; groups retain ordered fallback to permitted members. Every replica loads policy at startup and refreshes immutable snapshots in the background. (#454)
+- Minimum release age for Go, Maven, and PyPI proxies extends the existing npm setting. Enabled policies filter indexes and gate direct downloads, including previously cached content, while hosted repositories remain unaffected. (#467)
+- Scoped artifact-scanning readers can enter Admin without global administration. Repository visibility and server-authorized capabilities control navigation and actions; independent waiver grants and built-in scanning privileges support minimal roles. (#466)
+- The scanning UI defaults to current findings and can include historical results. Filtering applies to related artifact and waiver views; existing API defaults remain unchanged. (#440)
+
+### Fixed
+
+- Preserve multiline Galaxy descriptions and Raw first-segment colon paths; apply configured repository URL prefixes to actual routes and generated URLs; derive client provenance consistently from explicitly trusted proxy hops. (#435)
+- Permit deletion of emptied migrated Docker and empty hosted Yum repositories. Docker catalog access honors repository read permission, and generated Docker origins retain externally visible HTTPS proxy information. (#437, #444, #446, #464)
+- Release database connections during Docker upload streaming, storage reads, digest verification, and final blob I/O. Short fenced publication transactions coordinate concurrent append, cancel, completion, and blob-reuse races across replicas. (#462)
+- Serve APT packages stored beneath `dists`, preserve APT settings in Browse directory details, and renew expiring hosted APT metadata without requiring package uploads or configuration edits. (#443, #469, #488)
+- Proxy Raw directory pages with Nexus-compatible behavior, retain missing-file responses across repeated Hugging Face probes, and paginate GitHub tags before Swift SemVer filtering. (#463, #486, #483)
+- Adding optional proxy backups no longer narrows an omitted hosted selection during Nexus migration; explicit hosted selections and explicit-only proxy backups remain supported. (#484)
+
+### Changed
+
+- Refresh Spring Boot, AWS SDK, OSS SDK, zstd-jni, GraalVM build tools, Surefire, and JaCoCo dependencies. (#447, #448, #449, #450, #451, #474, #475, #476, #477, #478)
+- Quickstart defaults, Dockerfile packaging, deployment documentation, Helm application version, runtime checks, and the optional scanner profile now use `1.4.0`.
+
+### Upgrade Notes
+
+- Upgrades from `1.3.4` apply Flyway V60 on MySQL and PostgreSQL. It seeds scanning privileges while preserving existing ID/name collisions and ordinary role assignments; it does not automatically grant scanning access to ordinary users. Back up the relational database and blob store together, allow migrations to complete, and upgrade all replicas before relying on the new scoped Admin entry point.
+- Routing-rule edits and bindings converge through background refresh (30 seconds by default). Startup fails if the initial policy cannot be loaded; subsequent refresh failures retain the last successful snapshot. Complete the rollout before relying on routing enforcement across every replica. No routing-rule schema migration is required.
+- Minimum release age is disabled by default (`0` minutes). Go uses commit time, not publication time; Maven relies on upstream POM `Last-Modified` and exempts SNAPSHOTs; PyPI requires JSON index upload timestamps and returns 502 for unsupported upstreams when enabled. Quarantined direct downloads return 403 for these three formats, while npm retains 404. Consult the minimum-release-age guide before enabling policies.
+- A configured custom repository URL prefix now moves actual routes, rather than only changing displayed URLs. Check reverse-proxy forwarding and client URLs when using a non-default prefix; reserved or ambiguous prefixes prevent startup. Configure trusted proxy hops explicitly for accurate client provenance. Historical uploader addresses are not rewritten.
+- Hosted APT expiration refresh uses the existing durable publication queue and signing configuration; allow background publication to finish before retrying an expired index. Existing migration jobs are not rewritten by the hosted-selection fix; create a new job with the intended selection when needed.
+
+## 1.3.4 - 2026-10-23
+
+### Security
+
+- Harden post-login, logout, and OIDC return-target validation across the server and UI. Alternate URL separators, control characters, protocol-relative targets, and absolute URLs can no longer redirect users outside the kkRepo origin. Upgrade every JVM and Native replica to `1.3.4` to address GHSA-vvvm-fx67-445x.
+- Escape Browse asset download URLs and restrict inline scripts through Content Security Policy. Crafted raw repository paths can no longer inject executable markup when an asset detail is viewed. Upgrade every JVM and Native replica to `1.3.4` to address GHSA-fxj4-cwgv-rcqp.
+
+### Upgrade Notes
+
+- Upgrading from `1.3.3` adds no database migrations; MySQL and PostgreSQL remain at Flyway V59. Back up the relational database and blob store together before upgrading all replicas.
+- Quickstart defaults, Dockerfile packaging, deployment documentation, Helm application version, runtime checks, and the optional scanner profile now use `1.3.4`.
+
+## 1.3.3 - 2026-10-22
+
+### Fixed
+
+- RubyGems ingestion preserves dependency requirements instead of allowing trailing root-level gemspec fields to erase them. The dependency API returns Bundler-compatible string tuples. (#410, #412)
+- RubyGems groups merge member compact and legacy indexes so uncached upstream gems are discoverable before download. Aggregation preserves member precedence, platform-specific releases, dependency constraints, yanks, and checksums, with bounded parsing and memory use. Unsupported optional indexes fall back to complete legacy discovery. (#411, #413)
+- Durable cache invalidations and generations commit with database writes. Invalidation failures now roll back and reach transaction retries instead of leaving sibling replicas unaware of committed changes; local eviction happens only after commit. The same boundary covers asset/group metadata, authorization, and repository/security catalogs. PostgreSQL lock-not-available errors are retried without treating cancellation or syntax errors as transient. (#414, #415)
+- New Nexus migration jobs refresh npm packuments while retaining existing-tarball shortcuts. Publication fencing prevents concurrent jobs or replicas from overwriting newer metadata with stale responses, and hosted/group caches are invalidated transactionally. (#416, #418)
+
+### Changed
+
+- Composer proxy metadata requests skip persistence for unchanged dist routes using bounded comparisons against shared asset/blob records. Warm GET, HEAD, and conditional requests avoid redundant route writes, search updates, and cache-generation bumps while preserving response bytes and validators. Missing or changed routes are still repaired through the existing writer. (#425, #426)
+- Update AWS SDK to `2.56.0`, zstd-jni to `1.5.7-23`, and the Windows Swift setup action to `0.5.1`. (#422, #423, #424)
+- Quickstart defaults, Dockerfile packaging, deployment documentation, Helm application version, runtime checks, and the optional scanner profile now use `1.3.3`.
+
+### Upgrade Notes
+
+- Upgrading from `1.3.2` adds no database migrations; MySQL and PostgreSQL remain at Flyway V59. Back up the relational database and blob store together before upgrading all replicas.
+- Previously ingested RubyGems dependency metadata is not automatically reparsed. For an affected gem, temporarily allow redeployment, re-publish the identical original archive, and restore the write policy. An index-only rebuild cannot recover lost constraints. (#412)
+- To repair an affected npm migration, create a new metadata scan with **Metadata since** unset, then sync packages. Resuming the old job does not refresh completed items. Preserve target-only metadata before resyncing independently published repositories: Nexus remains authoritative for imported packuments. Existing tarballs need not be downloaded again. (#418)
+- Composer's improvement applies to unchanged warm routes; cold fills still create route records. Existing lock-file routes remain available, and no configuration change is required. (#426)
+
+## 1.3.2 - 2026-10-13
+
+### Security
+
+- Fix a critical authentication and authorization bypass in management APIs caused by inconsistent request-path interpretation. Management authentication, permissions, CSRF checks, rate limiting, and audit selection now use Spring MVC-compatible segment matching. Both JVM and Native deployments are affected by GHSA-5gj5-2jx6-8vcq in versions through `1.3.1`; upgrade every replica to `1.3.2`.
+
+### Added
+
+- Conan manifest limits can be configured globally and per repository. Admin shows effective limits and their source. (#401, #402)
+- Browse supports directory deletion with permission checks, explicit confirmation, and shared confirmation dialogs. (#409)
+
+### Changed
+
+- Upgrade zstd-jni to `1.5.7-22` with complete Native FFM metadata, update AWS SDK to `2.55.13`, and refresh the Go setup action. (#404, #405, #406)
+- Add Alipay and WeChat Pay sponsorship links. (#403)
+- Quickstart defaults, Dockerfile packaging, deployment documentation, Helm application version, runtime checks, and the optional scanner profile now use `1.3.2`.
+
+### Upgrade Notes
+
+- Upgrading from `1.3.1` adds no database migrations; MySQL and PostgreSQL remain at Flyway V59. Back up the relational database and blob store together before upgrading.
+- Upgrade all replicas promptly. Until the upgrade is complete, restrict access to trusted clients at the network or reverse-proxy boundary. Check existing users, roles, API keys, and authentication settings for unexpected changes; affected requests may be missing from management audit logs.
+
+## 1.3.1 - 2026-10-10
+
+### Fixed
+
+- Hosted Yum repositories honor Repodata Depth, generate directory-scoped metadata with relative RPM locations, and preserve the setting during Nexus migration. Routine uploads and deletions rebuild only the affected metadata root through the shared database queue; hosted-only groups support the matching subdirectory endpoints. (#396, #397)
+- Native security scanning retains Jackson bindings for scanner requests, capabilities, readiness, and structured errors, fixing `SCANNER_INVALID_JSON` with a healthy scanner adapter. Packaged JVM and Native runtime checks now cover disabled scanning, error propagation, and recovery. (#392)
+- Scan validity tooltips explain the effective limit and its source. Policy deletion distinguishes historical revisions and reports actionable conflicts while preserving server-side reference and revision checks. (#393)
+- Browse and Admin deep links no longer flash an unrelated default page during initialization. Startup navigation and overlapping login/discovery requests retain the requested destination and current session data. (#394)
+- Git LFS format icons render correctly throughout Browse and Admin. Scanner process-group cleanup waits for consecutive quiescent inspections so newly forked children are not missed when their parents exit. (#395)
+- Browse Welcome correctly lists Hosted and Group modes for Go and Helm. (#398)
+
+### Changed
+
+- Quickstart defaults, Dockerfile packaging, deployment documentation, Helm application version, runtime checks, and the optional scanner profile now use `1.3.1`.
+
+### Upgrade Notes
+
+- Upgrading from `1.3.0` adds no database migrations; MySQL and PostgreSQL remain at Flyway V59. Back up the relational database and blob store together before upgrading.
+- Upgrade all replicas before changing Yum Repodata Depth; older workers do not implement scoped rebuild coordination. For an affected Nexus import, confirm the depth in repository settings and save once to initialize the active settings and enqueue a metadata rebuild; no package re-import is required. A `/fedora-$releasever/` base URL requires depth `1`. If the source export omitted the setting, enter it explicitly, then run `dnf clean metadata` before retrying. (#397)
+- Native deployments affected by `SCANNER_INVALID_JSON` should upgrade the server image. No scanner API or database migration is required. (#392)
+
+## 1.3.0 - 2026-10-08
+
+### Added
+
+- Proxy repositories can opt into public HTTPS content GET/HEAD redirects with a standalone `*` in `proxy.allowedRedirectHosts`. The existing editor, exact/domain rules and strict default remain. Public-address validation, DNS pinning, TLS, downgrade rejection and credential/cookie isolation are enforced independently; POST and authentication exchanges retain strict rules, including Hugging Face and Conan integration paths. (#384, #385)
+- Administrators can delete unused, empty blob-store configurations. Database locking coordinates deletion with repository assignments and registered uploads; referenced stores, registered blobs, and persisted upload sessions prevent deletion. Backing files, objects, and buckets are retained. (#390)
+- Browse supports a resizable tree/detail split pane with keyboard controls, reset, minimum widths, and browser-local width persistence. (#379)
+
+### Fixed
+
+- Hosted npm `ALLOW_ONCE` rejects concurrent tarball replacement at the persistence boundary. Package publication and multipart upload roll back all attachment and metadata changes when a write fails, while new versions and proxy-cache refreshes remain supported. Transient contention retries the complete staged publication in a fresh transaction. (#387, #388)
+- Nexus PyPI migration preserves package, signature, index, and metadata-sidecar asset kinds so migrated packages appear in generated Simple indexes, including on PostgreSQL. (#383, #386)
+- Malformed upstream redirect locations become remote I/O failures instead of unhandled errors. Maven groups continue to later members; direct proxies return 502 when the upstream redirect is invalid. (#378, #380)
+- Browse explains an empty Upload page instead of silently redirecting users, with guidance appropriate to their repository permissions. (#382)
+
+### Changed
+
+- Shared repository upload, fenced-lease, versioned-snapshot, migration-checksum, and UI primitives reduce duplication while retaining protocol-specific behavior and distributed coordination. (#381)
+- AWS SDK, Guava, Commons Lang, Maven Artifact, ArchUnit, and the CI cache action were refreshed. (#371, #372, #373, #374, #375, #376)
+- Quickstart defaults, Dockerfile packaging, deployment documentation, Helm application version, runtime checks, and the optional scanner profile now use `1.3.0`.
+
+### Upgrade Notes
+
+- Upgrading from `1.2.1` adds no database migrations; MySQL and PostgreSQL remain at Flyway V59. Back up the relational database and blob store together before upgrading.
+- The PyPI migration fix applies to new imports and does not rewrite previously imported assets. For an affected repository, preserve target-only content, prepare an empty same-name target repository, create a new Sync metadata job with Metadata since unset, then Sync packages and verify the generated index with pip. Rerunning an old job against existing paths is insufficient; see the Nexus migration guide. (#386)
+- The standalone redirect `*` is opt-in for public HTTPS content GET/HEAD with an HTTPS upstream and direct transport. Existing exact/domain allowlists and the strict default remain unchanged; authentication and token exchanges are not widened. (#385)
+- Delete blob-store configurations only after uploads and connection checks have finished across all replicas. Deletion does not drain unregistered in-flight I/O, erase backing storage, or clean up untracked objects; a concurrent operation may fail and require external cleanup. (#390)
+
+## 1.2.1 - 2026-10-04
+
+### Added
+
+- Git LFS hosted repositories support Batch upload/download, basic transfers, verify, HEAD, byte ranges, conditional reads, Basic authentication, and GenericToken authentication at `/repository/<repo>/info/lfs`. Objects are verified for SHA-256 and exact length before publication; database-backed upload contexts, leases, fencing, and recovery coordinate replicas. Admin, Browse, Search, content selectors, manual deletion, and shape-verified Nexus 3.94.x hosted migration are included. Git commits and refs remain on the existing Git server. (#367, #368)
+- JVM and Native deployments can trust private certificate authorities through a multi-certificate PEM bundle using `KKREPO_TLS_CA_CERTIFICATES` / `kkrepo.tls.ca-certificates`. The bundle augments the active Java truststore for S3, OSS Native, and upstream HTTPS clients, including HTTP CONNECT and SOCKS routes, while retaining certificate-chain and hostname verification. (#366)
+
+### Fixed
+
+- Docker proxy and group requests release upstream 401 challenge connections before acquiring or refreshing bearer tokens. Concurrent cold pulls and token failures no longer exhaust the registry connection pool; successful manifest and blob responses remain streamed. (#365)
+
+### Changed
+
+- Outbound HTTP connection-pool acquisition has an independent, configurable 10-second default timeout through `KKREPO_OUTBOUND_PROXY_CONNECTION_REQUEST_TIMEOUT_MS`. TCP connection and response timeouts remain separate. (#365)
+- Full E2E splits real-client tests into core, system, and Swift shards, reuses prepared SDK/Swift environments, and verifies complete protocol/runtime/database and cleanup coverage. Nexus, migration, OCI, and platform-specific checks remain enabled. (#364)
+- Quickstart defaults, Dockerfile packaging, deployment documentation, Helm application version, runtime checks, and the optional scanner profile now use `1.2.1`.
+
+### Upgrade Notes
+
+- Existing `1.1.1` MySQL and PostgreSQL deployments upgrade through Flyway V59, which adds Git LFS object coordination and upload-recovery tables. Back up the relational database and blob store together before upgrading.
+- Git LFS is hosted-only: proxy/group repositories, Git hosting, file locks, tus, direct-to-S3 transfers, generic component uploads, and automatic Cleanup are not supported. Opaque LFS objects have `NOT_APPLICABLE` scan coverage, not a clean vulnerability verdict; manual deletion may break historical Git checkouts.
+- PEM CA bundles are optional and loaded at startup. Mount the same readable bundle on every replica and restart after certificate updates. A missing, empty, or malformed configured bundle prevents startup.
+
+## 1.1.1 - 2026-10-01
+
+### Fixed
+
+- npm proxy downloads resolve the original upstream `dist.tarball` URL, including scoped filenames, separate metadata/download prefixes, nested paths, encoded paths, and query strings. Existing lockfiles, minimum-release-age checks, offline cache reads, group URL projection, and Browse navigation retain the full tarball identity. (#359)
+- NuGet proxies discover search, autocomplete, package, and registration resources from the upstream V3 service index. Group registration links retain their source member and query identity, paginated metadata is expanded within bounded limits, and resource credentials remain protected by existing origin rules and shared-secret routing proofs. (#344, #345)
+- Docker proxy and group tag/catalog pagination preserve query parameters through upstream requests and authentication retries. Browse generates valid Docker pull/tag/push references, and global search finds existing Docker tags by image, tag, or digest with permission-aware pagination. (#348, #360)
+- Native images register the zstd FFM downcalls required by JDK 25 and GraalVM, fixing Conda `repodata.json.zst` decoding with the updated zstd binding. (#354)
+- Repository scan settings allow explicit policy assignment or unassignment and show effective validity, including built-in rules, disabled policies, and combined age limits. (#349)
+
+### Added
+
+- Administrators can delete unused security scan policies and all their revisions. Referenced policies return a conflict; database locking coordinates deletion with assignments, waivers, and scan-state writes across replicas. (#350)
+- Proxy redirect allowlists support leading subdomain patterns such as `*.quay.io`, including deeper subdomains while excluding the apex. Existing outbound address validation and cross-origin credential isolation apply to every redirect. (#358)
+
+### Changed
+
+- Quickstart defaults, Dockerfile packaging, deployment documentation, Helm application version, runtime checks, and the optional scanner profile now use `1.1.1`.
+- Development and acceptance-test S3 fixtures use pinned RustFS and AWS CLI images. The AWS SDK, GraalVM Native Build Tools, and zstd-jni dependencies were refreshed. (#345, #351, #352, #354)
+
+### Upgrade Notes
+
+- Existing `1.1.0` MySQL and PostgreSQL deployments upgrade through Flyway V56-V58. Back up the relational database and blob store together and allow migrations to complete before serving traffic. V56 adds PostgreSQL policy-reference indexes; V57 adds Docker tag ordering indexes; V58 adds separate rebuildable npm full-path release-index tables.
+- PostgreSQL V56/V57 indexes are built concurrently outside a transaction; MySQL V57 uses online index creation. Allow time and disk capacity for large tables. The npm index rebuilds lazily from shared raw metadata, and existing Docker tags become searchable without a backfill or repush.
+- Keep the same deployment credential secret on every replica so NuGet group routing proofs and encrypted queries can be verified consistently. Upstream credentials remain limited to the configured origin.
+- Scan policy deletion applies to an unused policy's complete revision history; repository, scan-state, and waiver references must be removed before deletion is allowed.
+
+## 1.1.0 - 2026-09-24
+
+### Added
+
+- AWS RDS / Aurora IAM database authentication for MySQL and PostgreSQL, with fresh signed tokens for new physical connections, verified TLS, workload credential refresh, Native runtime selection, and Helm configuration. Password authentication remains the default. (#340)
+- IPv4 and IPv6 CIDR ranges in trusted-proxy configuration, matched against the immediate peer address with startup validation and consistent forwarded-header handling. (#341)
+- Opt-in NTLM upstream authentication for NuGet proxy repositories, including encrypted credentials, domain/workstation settings, repository-isolated connections, and Nexus migration support. (#322)
+- Operational storage usage in Admin: blob and asset counts, registered and logical sizes, pending-cleanup totals, numeric sorting, filtered summaries, and blob-store-to-repository drill-down. Large counts and byte totals retain exact integer precision. (#307)
+- Security findings show affected artifacts; scan tasks expose asset paths and Browse links; repository views expose effective scan settings and policy sources; tasks and runs support completion-time sorting with cursor pagination. (#334, #335, #336, #337)
+
+### Fixed
+
+- Enabling group scanning reuses eligible member scan results and backfills group policy state instead of unnecessarily rescanning existing artifacts. (#333)
+- Native images honor the security-scanning runtime toggle instead of omitting required beans during AOT compilation. Missing scan-result ages no longer break management views. (#315, #325)
+- Anonymous repository authentication challenges preserve client login behavior, including NuGet clients using LDAP credentials. (#314)
+- Nexus migration accepts null-valued security documents and preserves useful diagnostics for exceptions with empty messages. (#332, #313)
+- Cleanup scheduling safely handles missing Quartz fire times. (#312)
+
+### Changed
+
+- Quickstart defaults, Dockerfile packaging, deployment documentation, Helm application version, runtime checks, and the optional scanner profile now use `1.1.0`.
+- S3 credential guidance is available in a field tooltip; Bouncy Castle, AWS SDK, GraalVM Native Build Tools, zstd-jni, Maven Exec Plugin, and Swift setup dependencies were refreshed. (#304, #316, #317, #318, #319, #320, #321)
+
+### Upgrade Notes
+
+- Existing `1.0.2` MySQL and PostgreSQL deployments upgrade through Flyway V54-V55. Back up the relational database and blob store together, and allow index migrations to complete before serving traffic. V54 adds a repository-usage covering index; V55 adds scan-completion indexes. MySQL uses online index creation and PostgreSQL uses non-transactional concurrent index creation; allow additional time and disk capacity for large installations.
+- IAM database authentication and NuGet NTLM are opt-in. Existing database passwords and Basic/Bearer upstream authentication remain unchanged. IAM requires deployment-specific AWS permissions, database-user grants, and CA trust; automated signing/TLS fixtures do not verify a live AWS account.
+- Trust only dedicated proxy addresses or subnets and apply the same settings to every replica. Invalid CIDR entries prevent startup. NTLM support does not add Kerberos/SPNEGO or Windows login to kkRepo.
+- Storage usage is a cached operational snapshot, not a quota or physical bucket-size measurement; group repository logical usage is not applicable.
+
+## 1.0.2 - 2026-09-18
+
+### Added
+
+- AWS S3 blob stores can use the AWS SDK default credentials chain, including environment session credentials, EC2 instance profiles, EKS Pod Identity, and IRSA. Admin and API credential-source selection can explicitly clear saved static keys; credential refresh remains owned by each SDK client. OSS Native stores continue to require static credentials. (#302)
+- Scanner database updaters support a custom Grype database mirror URL and CA certificate, with Compose and Helm configuration for internal HTTPS mirrors while preserving serving-scanner egress isolation. (#277)
+
+### Fixed
+
+- UI redirects honor trusted forwarded headers and preserve the configured servlet context path, preventing HTTPS reverse-proxy deployments from redirecting users to the wrong origin. Untrusted forwarded origins remain ignored. (#291)
+- The npm web-login probe returns HTTP 405 so pnpm 11 can fall back to legacy token authentication; the exact probe is accessible before repository authentication, while the legacy endpoint still validates credentials. (#295)
+- Maven groups continue to later members when a proxy member rejects an outbound address or redirect. Direct proxy diagnostics and unrelated security failures retain their existing behavior. (#298)
+- Go hosted, proxy, and group requests decode percent-encoded uppercase module escapes before authorization. A shared URI path decoder preserves literal plus signs, validates UTF-8, rejects unsafe path segments, and removes repeated decoding across protocol handlers. (#300)
+
+### Changed
+
+- Quickstart defaults, Dockerfile packaging, deployment documentation, Helm application version, runtime checks, and the optional scanner profile now use `1.0.2`.
+- The AWS SDK and GraalVM Native Build Tools were refreshed. (#292, #293)
+
+### Compatibility And Validation
+
+- Regression coverage includes trusted-proxy redirects, real pnpm login, Nexus Maven group failure fallback, uppercase Go module downloads, and protocol-specific URI decoding. (#291, #295, #298, #300)
+- S3 credential tests cover environment, IMDSv2, container, and IRSA/STS fixtures, temporary credential refresh, static precedence, multi-replica catalog refresh, and MySQL/PostgreSQL persistence. Real EC2/EKS IAM and deployment configuration remain operator-specific. (#302)
+
+### Upgrade Notes
+
+- Existing `1.0.1` MySQL and PostgreSQL deployments can upgrade in place; no new Flyway migrations are introduced and the schema remains at V53. Back up the relational database and blob store together before upgrading.
+- Existing static S3 credentials remain in use until the credential source is explicitly changed. Default credentials require a working AWS SDK credential source on every application replica.
+- Custom scanner database mirrors are optional; existing deployments keep the default Grype database source when no mirror is configured.
+
 ## 1.0.1 - 2026-09-10
 
 ### Added

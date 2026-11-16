@@ -44,6 +44,32 @@ import org.springframework.web.server.ResponseStatusException;
 class BrowseControllerSecurityTest {
 
   @Test
+  void npmTarballSubdirectoriesRemainNavigableWhenTheInternalDashIsHidden() {
+    RepositoryRecord repository = repo(1L, "npm-proxy", RepositoryFormat.NPM, RepositoryType.PROXY);
+    StubRepositoryDao repositories = new StubRepositoryDao(Map.of(repository.name(), repository));
+    StubBrowseNodeDao nodes = new StubBrowseNodeDao();
+    String pkg = "@scope/demo";
+    nodes.children.put(key(1L, pkg), List.of(child(pkg + "/-", "-", false)));
+    nodes.children.put(key(1L, pkg + "/-"), List.of(
+        child(pkg + "/-/demo-1.tgz", "demo-1.tgz", true),
+        child(pkg + "/-/@scope", "@scope", false)));
+    nodes.children.put(key(1L, pkg + "/-/@scope"), List.of(
+        child(pkg + "/-/@scope/demo-2.tgz", "demo-2.tgz", true)));
+    RecordingSecurityService security = new RecordingSecurityService(permission -> AccessDecision.allow());
+    BrowseController controller = controller(repositories, nodes, subject("alice"), null, security);
+    var request = request("GET", "/internal/browse/npm-proxy");
+
+    var listing = controller.list("npm-proxy", pkg, request);
+    assertEquals(List.of("@scope", "demo-1.tgz"), listing.entries().stream()
+        .map(BrowseController.BrowseEntry::name).toList());
+    var folder = listing.entries().getFirst();
+    assertEquals(pkg + "/-/@scope", folder.path());
+    var nested = controller.list("npm-proxy", folder.path(), request).entries().getFirst();
+    assertEquals(pkg + "/-/@scope/demo-2.tgz", nested.path());
+    assertEquals("/repository/npm-proxy/" + nested.path(), nested.downloadUrl());
+  }
+
+  @Test
   void listRequiresRepositoryBrowsePermissionForRequestedPath() {
     RepositoryRecord repository = repo(1L, "maven-public", RepositoryFormat.MAVEN2, RepositoryType.GROUP);
     RepositoryRecord member = repo(2L, "maven-central", RepositoryFormat.MAVEN2, RepositoryType.PROXY);
@@ -70,6 +96,91 @@ class BrowseControllerSecurityTest {
     assertEquals(List.of(key(member.id(), "junit/junit")), browseNodes.calls);
     assertEquals("junit/junit", security.repositoryPermissions.get(0).pathPattern());
     assertEquals(List.of("nexus:repository-view:maven2:maven-public:browse"), security.permissions);
+  }
+
+  @Test
+  void listCanRestrictAGroupDeepLinkToItsExactSourceRepository() {
+    RepositoryRecord group = repo(
+        1L, "maven-public", RepositoryFormat.MAVEN2, RepositoryType.GROUP);
+    RepositoryRecord first = repo(
+        2L, "maven-first", RepositoryFormat.MAVEN2, RepositoryType.HOSTED);
+    RepositoryRecord second = repo(
+        3L, "maven-second", RepositoryFormat.MAVEN2, RepositoryType.HOSTED);
+    StubRepositoryDao repositories = new StubRepositoryDao(Map.of(group.name(), group));
+    repositories.members.put(group.id(), List.of(first, second));
+    StubBrowseNodeDao browseNodes = new StubBrowseNodeDao();
+    browseNodes.children.put(key(first.id(), "com/acme"), List.of(child(
+        "com/acme/first", "first", false)));
+    browseNodes.children.put(key(second.id(), "com/acme"), List.of(child(
+        "com/acme/second", "second", false)));
+    RecordingSecurityService security = new RecordingSecurityService(
+        permission -> AccessDecision.allow());
+    BrowseController controller = controller(
+        repositories, browseNodes, subject("alice"), null, security);
+
+    BrowseController.BrowseListing listing = controller.list(
+        group.name(),
+        "com/acme",
+        second.name(),
+        request("GET", "/internal/browse/" + group.name()));
+
+    assertEquals(List.of("second"), listing.entries().stream()
+        .map(BrowseController.BrowseEntry::name).toList());
+    assertEquals(List.of(key(second.id(), "com/acme")), browseNodes.calls);
+  }
+
+  @Test
+  void listCanRestrictANestedGroupDeepLinkToItsTransitiveSourceRepository() {
+    RepositoryRecord outer = repo(
+        1L, "helm-public", RepositoryFormat.HELM, RepositoryType.GROUP);
+    RepositoryRecord nested = repo(
+        2L, "helm-team", RepositoryFormat.HELM, RepositoryType.GROUP);
+    RepositoryRecord hosted = repo(
+        3L, "helm-hosted", RepositoryFormat.HELM, RepositoryType.HOSTED);
+    StubRepositoryDao repositories = new StubRepositoryDao(Map.of(outer.name(), outer));
+    repositories.members.put(outer.id(), List.of(nested));
+    repositories.members.put(nested.id(), List.of(hosted));
+    StubBrowseNodeDao browseNodes = new StubBrowseNodeDao();
+    browseNodes.children.put(key(hosted.id(), "charts/demo"), List.of(child(
+        "charts/demo/demo-1.0.0.tgz", "demo-1.0.0.tgz", true)));
+    RecordingSecurityService security = new RecordingSecurityService(
+        permission -> AccessDecision.allow());
+    BrowseController controller = controller(
+        repositories, browseNodes, subject("alice"), null, security);
+
+    BrowseController.BrowseListing listing = controller.list(
+        outer.name(),
+        "charts/demo",
+        hosted.name(),
+        request("GET", "/internal/browse/" + outer.name()));
+
+    assertEquals(List.of("demo-1.0.0.tgz"), listing.entries().stream()
+        .map(BrowseController.BrowseEntry::name).toList());
+    assertEquals(List.of(key(hosted.id(), "charts/demo")), browseNodes.calls);
+  }
+
+  @Test
+  void listRejectsADeepLinkSourceOutsideTheGroup() {
+    RepositoryRecord group = repo(
+        1L, "maven-public", RepositoryFormat.MAVEN2, RepositoryType.GROUP);
+    RepositoryRecord member = repo(
+        2L, "maven-member", RepositoryFormat.MAVEN2, RepositoryType.HOSTED);
+    StubRepositoryDao repositories = new StubRepositoryDao(Map.of(group.name(), group));
+    repositories.members.put(group.id(), List.of(member));
+    RecordingSecurityService security = new RecordingSecurityService(
+        permission -> AccessDecision.allow());
+    BrowseController controller = controller(
+        repositories, new StubBrowseNodeDao(), subject("alice"), null, security);
+
+    ResponseStatusException failure = assertThrows(
+        ResponseStatusException.class,
+        () -> controller.list(
+            group.name(),
+            "com/acme",
+            "maven-unrelated",
+            request("GET", "/internal/browse/" + group.name())));
+
+    assertEquals(HttpStatus.BAD_REQUEST, failure.getStatusCode());
   }
 
   @Test

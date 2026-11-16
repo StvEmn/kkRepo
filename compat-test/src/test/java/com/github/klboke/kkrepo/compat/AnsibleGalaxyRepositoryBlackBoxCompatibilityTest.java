@@ -152,6 +152,8 @@ class AnsibleGalaxyRepositoryBlackBoxCompatibilityTest {
       throws Exception {
     Config config = configured();
     ensureRepositories(config);
+    ProxyStreamingCompatibility.enable(HttpRequest.newBuilder(URI.create(config.candidateRepository(config.proxy()) + "/"))
+        .header("Authorization", config.candidateAuth()));
     String path = "api/v3/collections/" + config.proxyNamespace() + "/"
         + config.proxyCollection() + "/versions/" + config.proxyVersion() + "/";
 
@@ -172,6 +174,10 @@ class AnsibleGalaxyRepositoryBlackBoxCompatibilityTest {
         nexusDetail.path("artifact").path("sha256").asText(),
         candidateDetail.path("artifact").path("sha256").asText(),
         "proxy artifact SHA-256");
+
+    assertEquals(nexusDetail.path("metadata").path("description"),
+        candidateDetail.path("metadata").path("description"),
+        "proxy description whitespace must be preserved");
 
     Exchange nexusArtifact = get(resolve(
         config.nexusRepository(config.proxy()), nexusDetail.path("download_url").asText()),
@@ -369,11 +375,11 @@ class AnsibleGalaxyRepositoryBlackBoxCompatibilityTest {
     String body = """
         {"name":"%s","online":true,
          "storage":{"blobStoreName":"default","strictContentTypeValidation":true},
-         "proxy":{"remoteUrl":"https://galaxy.ansible.com/",
+         "proxy":{"remoteUrl":%s,
                   "contentMaxAge":1440,"metadataMaxAge":60},
          "negativeCache":{"enabled":true,"timeToLive":5},
          "httpClient":{"blocked":false,"autoBlock":true}}
-        """.formatted(config.proxy());
+        """.formatted(config.proxy(), JSON.writeValueAsString(config.upstreamUrl()));
     assert2xx("create Nexus Ansible proxy", send(config.nexusAdmin(
         "/service/rest/v1/repositories/ansiblegalaxy/proxy")
         .header("Content-Type", "application/json")
@@ -412,11 +418,11 @@ class AnsibleGalaxyRepositoryBlackBoxCompatibilityTest {
     String body = """
         {"name":"%s","recipe":"ansiblegalaxy-proxy","online":true,
          "blobStoreName":"default","strictContentTypeValidation":true,
-         "proxy":{"remoteUrl":"https://galaxy.ansible.com/",
+         "proxy":{"remoteUrl":%s,
                   "contentMaxAgeMinutes":1440,"metadataMaxAgeMinutes":60,
                   "negativeCacheEnabled":true,"negativeCacheTtlMinutes":5,
                   "autoBlock":true}}
-        """.formatted(config.proxy());
+        """.formatted(config.proxy(), JSON.writeValueAsString(config.upstreamUrl()));
     assert2xx("create kkrepo Ansible proxy", send(config.candidateAdmin("/internal/repositories")
         .header("Content-Type", "application/json")
         .POST(HttpRequest.BodyPublishers.ofString(body))));
@@ -544,6 +550,7 @@ class AnsibleGalaxyRepositoryBlackBoxCompatibilityTest {
       String secondaryHosted,
       String proxy,
       String group,
+      String upstreamUrl,
       String proxyNamespace,
       String proxyCollection,
       String proxyVersion) {
@@ -584,6 +591,9 @@ class AnsibleGalaxyRepositoryBlackBoxCompatibilityTest {
           CompatDefaults.setting(
               "compat.ansible.groupRepository", "ANSIBLE_COMPAT_GROUP_REPOSITORY")
               .orElse("ansible-compat-group"),
+          CompatDefaults.setting(
+              "compat.ansible.upstreamUrl", "ANSIBLE_COMPAT_UPSTREAM_URL")
+              .orElse("https://galaxy.ansible.com/"),
           CompatDefaults.setting(
               "compat.ansible.proxyNamespace", "ANSIBLE_COMPAT_PROXY_NAMESPACE")
               .orElse("community"),

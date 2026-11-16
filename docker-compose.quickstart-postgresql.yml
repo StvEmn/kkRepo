@@ -41,7 +41,7 @@ services:
     network_mode: none
 
   kkrepo:
-    image: ghcr.io/klboke/kkrepo:${KKREPO_IMAGE_TAG:-1.0.1}
+    image: ghcr.io/klboke/kkrepo:${KKREPO_IMAGE_TAG:-1.4.0}
     depends_on:
       postgresql:
         condition: service_healthy
@@ -93,7 +93,7 @@ services:
     restart: unless-stopped
 
   scanner:
-    image: ghcr.io/klboke/kkrepo-scanner:${KKREPO_SCANNER_IMAGE_TAG:-1.0.1}
+    image: ghcr.io/klboke/kkrepo-scanner:${KKREPO_SCANNER_IMAGE_TAG:-1.4.0}
     profiles: ["security-scanning"]
     environment:
       KKREPO_SCANNER_SERVICE_CREDENTIAL: ${KKREPO_SECURITY_SCANNING_SERVICE_CREDENTIAL:-}
@@ -123,7 +123,7 @@ services:
     restart: unless-stopped
 
   scanner-database-updater:
-    image: ghcr.io/klboke/kkrepo-scanner:${KKREPO_SCANNER_IMAGE_TAG:-1.0.1}
+    image: ghcr.io/klboke/kkrepo-scanner:${KKREPO_SCANNER_IMAGE_TAG:-1.4.0}
     profiles: ["security-scanning"]
     entrypoint: ["/bin/sh", "-ec"]
     command:
@@ -141,11 +141,19 @@ services:
       KKREPO_SCANNER_DATABASE_UPDATE_LOCK_TIMEOUT: ${KKREPO_SCANNER_DATABASE_UPDATE_LOCK_TIMEOUT:-10m}
       KKREPO_SCANNER_DB_UPDATE_CHECK_SECONDS: ${KKREPO_SCANNER_DB_UPDATE_CHECK_SECONDS:-300}
       KKREPO_SCANNER_DB_DIRECTORY: /var/lib/kkrepo-scanner/grype
+      KKREPO_SCANNER_DB_UPDATE_URL: ${KKREPO_SCANNER_DB_UPDATE_URL:-https://grype.anchore.io/databases}
+      # Optional for an HTTPS mirror with a private CA; uncomment together with the CA volume below.
+      # KKREPO_SCANNER_DB_CA_CERT: /etc/kkrepo-ca/ca.crt
     read_only: true
     tmpfs:
       - /tmp:size=${KKREPO_SCANNER_UPDATER_TMPFS_SIZE:-1g},uid=10001,gid=10001,mode=1770
     volumes:
       - scanner-db:/var/lib/kkrepo-scanner/grype
+      # Optional mirror CA certificate:
+      # - type: bind
+      #   source: ${KKREPO_SCANNER_DB_CA_CERT_FILE}
+      #   target: /etc/kkrepo-ca/ca.crt
+      #   read_only: true
     security_opt:
       - no-new-privileges:true
     cap_drop:

@@ -1,5 +1,6 @@
 package com.github.klboke.kkrepo.server.terraform;
 
+import com.github.klboke.kkrepo.server.config.RepositoryUrlPrefix;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.klboke.kkrepo.persistence.jdbc.api.TerraformRegistryDao;
@@ -766,7 +767,7 @@ public class TerraformService {
     }
     String bindingKey = sourceBindingKey(path.rawPath());
     Optional<TerraformRegistryDao.SourceBinding> existing = registry.findSourceBinding(group.id(), bindingKey);
-    if (existing.isPresent()) {
+    if (existing.isPresent() && group.containsMember(existing.get().memberRepositoryId())) {
       RepositoryRuntime member = runtimes.resolveById(existing.get().memberRepositoryId()).orElse(null);
       if (member != null) {
         try { return get(member, path, urls, headOnly); }
@@ -1216,7 +1217,7 @@ public class TerraformService {
 
   private static String repositoryPath(String url, String repository) {
     if (url == null) return null;
-    String marker = "/repository/" + repository + "/";
+    String marker = RepositoryUrlPrefix.currentPath() + repository + "/";
     int index = url.indexOf(marker);
     return index < 0 ? null : url.substring(index + marker.length());
   }

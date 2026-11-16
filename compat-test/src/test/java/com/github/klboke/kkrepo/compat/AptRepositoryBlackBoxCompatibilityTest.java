@@ -21,6 +21,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.LinkedHashMap;
@@ -151,6 +154,151 @@ class AptRepositoryBlackBoxCompatibilityTest {
   }
 
   @Test
+  void proxySha256OnlyIndexAndEncodedPackagePathsMatchNexusWhenConfigured() throws Exception {
+    Config config = configured();
+    String repository = "apt-proxy-path-" + UUID.randomUUID().toString().substring(0, 8);
+    String host = CompatDefaults.setting("compat.apt.upstreamHost", "APT_COMPAT_UPSTREAM_HOST")
+        .orElse("host.docker.internal");
+    var upstream = com.sun.net.httpserver.HttpServer.create(
+        new java.net.InetSocketAddress("0.0.0.0", 0), 0);
+    String remote = "http://" + host + ":" + upstream.getAddress().getPort() + "/linux/debian/";
+    Map<String, byte[]> packages = new LinkedHashMap<>();
+    StringBuilder packageIndex = new StringBuilder();
+    for (int index = 0; index < 3; index++) {
+      var fixture = AptCompatibilityFixtures.deb(
+          "kkrepo-proxy-fixture", "1.0-" + index + "~debian.12~bookworm", "amd64", null, "proxy");
+      String path = "dists/bookworm/pool/stable/amd64/" + fixture.filename();
+      packages.put(path, fixture.bytes());
+      // Debian permits omitting MD5sum and SHA1 when a SHA2 digest is present.
+      packageIndex.append("Package: kkrepo-proxy-fixture\nVersion: 1.0-").append(index)
+          .append("~debian.12~bookworm\nArchitecture: amd64\n")
+          .append("Maintainer: Test <test@example.invalid>\nDescription: proxy fixture\n")
+          .append("Filename: ").append(path).append("\nSize: ").append(fixture.bytes().length)
+          .append("\nSHA256: ").append(fixture.sha256()).append("\n\n");
+    }
+    byte[] indexBytes = packageIndex.toString().getBytes(StandardCharsets.UTF_8);
+    String indexDigest = java.util.HexFormat.of().formatHex(
+        java.security.MessageDigest.getInstance("SHA-256").digest(indexBytes));
+    byte[] releaseBytes = ("Suite: bookworm\nCodename: bookworm\nComponents: main\n"
+        + "Architectures: amd64\nDate: " + DateTimeFormatter.RFC_1123_DATE_TIME.format(
+            ZonedDateTime.now(java.time.ZoneOffset.UTC)) + "\nSHA256:\n "
+        + indexDigest + " " + indexBytes.length + " main/binary-amd64/Packages\n")
+        .getBytes(StandardCharsets.UTF_8);
+    Map<String, byte[]> resources = new LinkedHashMap<>(packages);
+    resources.put("dists/bookworm/Release", releaseBytes);
+    resources.put("dists/bookworm/main/binary-amd64/Packages", indexBytes);
+    upstream.createContext("/linux/debian/", exchange -> {
+      try (exchange) {
+        byte[] body = resources.get(exchange.getRequestURI().getPath()
+            .substring("/linux/debian/".length()));
+        if (body == null) {
+          exchange.sendResponseHeaders(404, -1);
+        } else {
+          exchange.getResponseHeaders().set("Content-Type", exchange.getRequestURI().getPath().endsWith(".deb")
+              ? "application/vnd.debian.binary-package" : "text/plain");
+          exchange.getResponseHeaders().set("Content-Length", Integer.toString(body.length));
+          if (exchange.getRequestMethod().equals("HEAD")) {
+            exchange.sendResponseHeaders(200, -1);
+          } else {
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+          }
+        }
+      }
+    });
+    upstream.start();
+    try (var access = allowAptFixtureHost(config.nexusAdmin(), host)) {
+      createProxy(config.nexusAdmin(), repository, remote, config.nexusBlobStore(), true);
+      if (!config.referenceOnly()) {
+        createProxy(config.candidateAdmin(), repository, remote, config.candidateBlobStore(), false);
+      }
+      for (String path : List.of("dists/bookworm/Release", "dists/bookworm/main/binary-amd64/Packages")) {
+        Exchange reference = send(config.nexus(repository).request(path).GET());
+        assertEquals(200, reference.status(), () -> "Nexus metadata: " + reference.text());
+        assertArrayEquals(resources.get(path), reference.body());
+        if (!config.referenceOnly()) {
+          Exchange candidate = send(config.candidate(repository).request(path).GET());
+          assertEquals(reference.status(), candidate.status());
+          assertArrayEquals(reference.body(), candidate.body());
+        }
+      }
+      int index = 0;
+      for (var entry : packages.entrySet()) {
+        // Each spelling starts cold, with a distinct package, before checking cached aliases.
+        String spelling = List.of("~", "%7e", "%7E").get(index++);
+        String path = entry.getKey().replace("~", spelling);
+        assertPackageHttp(config.nexus(repository), path, entry.getValue());
+        if (!config.referenceOnly()) {
+          assertPackageHttp(config.candidate(repository), path, entry.getValue());
+        }
+        for (String alias : List.of("~", "%7e", "%7E")) {
+          assertPackageHttp(config.nexus(repository), entry.getKey().replace("~", alias), entry.getValue());
+          if (!config.referenceOnly()) {
+            assertPackageHttp(config.candidate(repository), entry.getKey().replace("~", alias), entry.getValue());
+          }
+        }
+      }
+    } finally {
+      upstream.stop(0);
+      if (!config.keepRepositories()) {
+        deleteRepository(config.nexusAdmin(), repository);
+        if (!config.referenceOnly()) deleteRepository(config.candidateAdmin(), repository);
+      }
+    }
+  }
+
+  private static void createProxy(
+      AdminEndpoint admin, String repository, String remote, String blobStore, boolean nexus)
+      throws Exception {
+    Map<String, Object> body = new LinkedHashMap<>();
+    body.put("name", repository);
+    body.put("online", true);
+    body.put("apt", Map.of("distribution", "bookworm", "flat", false));
+    if (nexus) {
+      body.put("storage", Map.of("blobStoreName", blobStore, "strictContentTypeValidation", true));
+      body.put("proxy", Map.of("remoteUrl", remote, "contentMaxAge", 1440, "metadataMaxAge", 60));
+      body.put("negativeCache", Map.of("enabled", false, "timeToLive", 1));
+      body.put("httpClient", Map.of("blocked", false, "autoBlock", false));
+    } else {
+      body.put("recipe", "apt-proxy");
+      body.put("blobStoreName", blobStore);
+      body.put("proxy", Map.of("remoteUrl", remote, "autoBlock", false, "streamingEnabled", true));
+      body.put("apt", Map.of("distribution", "bookworm", "flat", false,
+          "metadataMode", "PASSTHROUGH"));
+    }
+    Exchange created = send(admin.request(nexus
+            ? "/service/rest/v1/repositories/apt/proxy" : "/internal/repositories")
+        .header("Content-Type", "application/json")
+        .POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(body))));
+    assertEquals(201, created.status(), () -> "APT proxy create: " + created.text());
+  }
+
+  private static AutoCloseable allowAptFixtureHost(AdminEndpoint admin, String host) throws Exception {
+    String path = "/service/rest/v1/security/ssrf-protection";
+    Exchange response = send(admin.request(path).GET());
+    if (response.status() == 404) return () -> {};
+    assertEquals(200, response.status());
+    var config = (com.fasterxml.jackson.databind.node.ObjectNode) JSON.readTree(response.body());
+    String field = host.matches("[0-9.]+") ? "allowedIPs" : "allowedDomains";
+    var allowed = config.withArray(field);
+    for (var entry : allowed) if (host.equals(entry.asText())) return () -> {};
+    allowed.add(host);
+    assertEquals(200, send(admin.request(path).header("Content-Type", "application/json")
+        .PUT(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(config)))).status());
+    return () -> {
+      Exchange latest = send(admin.request(path).GET());
+      assertEquals(200, latest.status());
+      var restored = (com.fasterxml.jackson.databind.node.ObjectNode) JSON.readTree(latest.body());
+      var entries = restored.withArray(field);
+      for (int index = entries.size() - 1; index >= 0; index--) {
+        if (host.equals(entries.get(index).asText())) entries.remove(index);
+      }
+      assertEquals(200, send(admin.request(path).header("Content-Type", "application/json")
+          .PUT(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(restored)))).status());
+    };
+  }
+
+  @Test
   void preparesNexusHostedMigrationFixtureWhenConfigured() throws Exception {
     assumeTrue(Boolean.parseBoolean(System.getenv().getOrDefault(
         "APT_MIGRATION_PREP_ENABLED", "false")),
@@ -230,6 +378,21 @@ class AptRepositoryBlackBoxCompatibilityTest {
         () -> "unexpected Nexus-compatible package path: " + snapshot.packagePath());
 
     AptRelease release = AptRelease.parse(snapshot.releaseText());
+    Instant releaseDate = ZonedDateTime.parse(
+        release.fields().get("Date"), DateTimeFormatter.RFC_1123_DATE_TIME).toInstant();
+    String validUntil = release.fields().get("Valid-Until");
+    // Debian permits archives (including Nexus versions) to omit expiration entirely.
+    // When present, it must describe a usable, signed validity window.
+    if (validUntil != null) {
+      Instant expires = ZonedDateTime.parse(
+          validUntil, DateTimeFormatter.RFC_1123_DATE_TIME).toInstant();
+      assertTrue(expires.isAfter(releaseDate), "Valid-Until must follow Date");
+      assertTrue(expires.isAfter(Instant.now()), "newly published Release must not be expired");
+      AptRelease inlineRelease = AptRelease.parse(new String(
+          clearSignedMessage(snapshot.inRelease()).cleartext(), StandardCharsets.UTF_8));
+      assertEquals(validUntil, inlineRelease.fields().get("Valid-Until"));
+      assertEquals(release.fields().get("Date"), inlineRelease.fields().get("Date"));
+    }
     String acquireByHash = release.fields().get("Acquire-By-Hash");
     assertTrue(acquireByHash == null || "yes".equals(acquireByHash),
         "Acquire-By-Hash must either be omitted like Nexus or safely enabled");

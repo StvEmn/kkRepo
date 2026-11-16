@@ -1,26 +1,28 @@
 package com.github.klboke.kkrepo.server.security;
 
+import com.github.klboke.kkrepo.server.config.RepositoryUrlPrefix;
 import com.github.klboke.kkrepo.auth.AccessDecision;
 import com.github.klboke.kkrepo.auth.AccessDecisionService;
 import com.github.klboke.kkrepo.auth.PermissionAction;
 import com.github.klboke.kkrepo.auth.RepositoryPermission;
 import com.github.klboke.kkrepo.core.RepositoryFormat;
 import com.github.klboke.kkrepo.core.RepositoryType;
+import com.github.klboke.kkrepo.core.http.UriPathDecoder;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AssetDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.TerraformRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.RepositoryRecord;
 import com.github.klboke.kkrepo.protocol.ansible.AnsibleGalaxyPath;
 import com.github.klboke.kkrepo.protocol.ansible.AnsibleGalaxyPathParser;
+import com.github.klboke.kkrepo.protocol.composer.ComposerPathParser;
 import com.github.klboke.kkrepo.protocol.conda.CondaPath;
 import com.github.klboke.kkrepo.protocol.conda.CondaPathParser;
-import com.github.klboke.kkrepo.protocol.composer.ComposerPathParser;
 import com.github.klboke.kkrepo.protocol.pub.PubPath;
 import com.github.klboke.kkrepo.protocol.pub.PubPathParser;
 import com.github.klboke.kkrepo.protocol.terraform.TerraformPath;
 import com.github.klboke.kkrepo.protocol.terraform.TerraformPathParser;
-import com.github.klboke.kkrepo.server.maven.RepositoryRuntimeRegistry;
 import com.github.klboke.kkrepo.server.conan.ConanAuthService;
+import com.github.klboke.kkrepo.server.maven.RepositoryRuntimeRegistry;
 import com.github.klboke.kkrepo.server.npm.NpmTokenService;
 import com.github.klboke.kkrepo.server.pypi.PypiExceptions;
 import com.github.klboke.kkrepo.server.pypi.PypiRequestPath;
@@ -29,7 +31,6 @@ import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
-import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -74,6 +75,18 @@ public class RepositorySecurityFilter extends OncePerRequestFilter {
   private final ForwardedHeaderPolicy forwardedHeaderPolicy;
   private final NexusLegacyUiCompatibility legacyUi;
   private ConanAuthService conanAuth;
+  private com.github.klboke.kkrepo.server.gitlfs.GitLfsAccess gitLfsAccess;
+  private com.github.klboke.kkrepo.server.ohpm.OhpmAccess ohpmAccess;
+
+  @Autowired
+  void setOhpmAccess(com.github.klboke.kkrepo.server.ohpm.OhpmAccess access) {
+    this.ohpmAccess = access;
+  }
+
+  @Autowired
+  void setGitLfsAccess(com.github.klboke.kkrepo.server.gitlfs.GitLfsAccess access) {
+    this.gitLfsAccess = access;
+  }
 
   @Autowired(required = false)
   void setConanAuthService(ConanAuthService conanAuth) {
@@ -117,7 +130,13 @@ public class RepositorySecurityFilter extends OncePerRequestFilter {
       HttpServletRequest request,
       HttpServletResponse response,
       FilterChain filterChain) throws ServletException, IOException {
-    Optional<RepositoryRequest> securedRequest = resolve(request);
+    Optional<RepositoryRequest> securedRequest;
+    try {
+      securedRequest = resolve(request);
+    } catch (IllegalArgumentException e) {
+      response.sendError(HttpServletResponse.SC_BAD_REQUEST, "Invalid repository URI path");
+      return;
+    }
     if (securedRequest.isEmpty()) {
       filterChain.doFilter(request, response);
       return;
@@ -137,8 +156,34 @@ public class RepositorySecurityFilter extends OncePerRequestFilter {
         target = target.withPath(canonicalPath);
         request.setAttribute(NORMALIZED_REPOSITORY_PATH_ATTRIBUTE, canonicalPath);
       }
-    } catch (PypiExceptions.BadRequestException e) {
+    } catch (PypiExceptions.BadRequestException | IllegalArgumentException e) {
       response.sendError(HttpServletResponse.SC_BAD_REQUEST, e.getMessage());
+      return;
+    }
+    if (repository.get().format() == RepositoryFormat.OHPM && target.componentUploadRoute()) {
+      if (ohpmAccess == null) {
+        response.sendError(503, "OHPM authentication unavailable");
+      } else if (ohpmAccess.authorizeManagementUpload(request, response)) {
+        filterChain.doFilter(request, response);
+      }
+      return;
+    }
+    if (repository.get().format() == RepositoryFormat.OHPM
+        && !target.repositoryBrowseRoute() && !target.componentUploadRoute()) {
+      if (ohpmAccess == null) {
+        response.sendError(503, "OHPM authentication unavailable");
+      } else if (ohpmAccess.authorize(request, response, repository.get(), target.path())) {
+        filterChain.doFilter(request, response);
+      }
+      return;
+    }
+    if (repository.get().format() == RepositoryFormat.GITLFS
+        && !target.repositoryBrowseRoute() && !target.componentUploadRoute()) {
+      if (gitLfsAccess == null) {
+        response.sendError(503, "Git LFS authentication unavailable");
+      } else if (gitLfsAccess.authorize(request, response, repository.get(), target.path())) {
+        filterChain.doFilter(request, response);
+      }
       return;
     }
     String terraformUrlToken = null;
@@ -214,6 +259,10 @@ public class RepositorySecurityFilter extends OncePerRequestFilter {
 
     AccessDecision decision = decide(authenticated.get(), repository.get(), target);
     if (!decision.allowed()) {
+      if (authenticatedAnonymously) {
+        challenge(request, response, repository.get(), target);
+        return;
+      }
       if (repository.get().format() == RepositoryFormat.SWIFT) {
         swiftProblem(response, HttpServletResponse.SC_FORBIDDEN, "Forbidden", decision.reason());
         return;
@@ -245,6 +294,7 @@ public class RepositorySecurityFilter extends OncePerRequestFilter {
   private static String canonicalRepositoryPath(RepositoryFormat format, String path) {
     return switch (format) {
       case PYPI -> PypiRequestPath.decode(path);
+      case GO -> UriPathDecoder.decodePath(path);
       case COMPOSER -> COMPOSER_PATH_PARSER.canonicalize(path);
       default -> null;
     };
@@ -343,8 +393,8 @@ public class RepositorySecurityFilter extends OncePerRequestFilter {
   private Optional<RepositoryRequest> resolve(HttpServletRequest request) {
     String method = request.getMethod();
     String uri = stripContextPath(request);
-    if (uri.startsWith("/repository/")) {
-      return repositoryRoute(method, uri);
+    if (uri.startsWith(RepositoryUrlPrefix.path(request))) {
+      return repositoryRoute(method, uri, RepositoryUrlPrefix.path(request));
     }
     if (uri.startsWith("/service/rest/repository/browse/")) {
       return browseRoute(method, uri);
@@ -370,8 +420,8 @@ public class RepositorySecurityFilter extends OncePerRequestFilter {
     return Optional.empty();
   }
 
-  private Optional<RepositoryRequest> repositoryRoute(String method, String uri) {
-    String remaining = uri.substring("/repository/".length());
+  private Optional<RepositoryRequest> repositoryRoute(String method, String uri, String prefix) {
+    String remaining = uri.substring(prefix.length());
     if (remaining.isBlank()) {
       return Optional.empty();
     }
@@ -649,7 +699,7 @@ public class RepositorySecurityFilter extends OncePerRequestFilter {
 
   private String cargoLoginUrl(HttpServletRequest request, String repository) {
     String contextPath = request.getContextPath();
-    String path = (contextPath == null ? "" : contextPath) + "/repository/" + repository + "/me";
+    String path = (contextPath == null ? "" : contextPath) + RepositoryUrlPrefix.path(request) + repository + "/me";
     String baseUrl = forwardedHeaderPolicy.serverBaseUrl(request);
     return baseUrl.isBlank() ? path : baseUrl + path;
   }
@@ -659,7 +709,7 @@ public class RepositorySecurityFilter extends OncePerRequestFilter {
   }
 
   private static String decode(String value) {
-    return URLDecoder.decode(value, StandardCharsets.UTF_8);
+    return UriPathDecoder.decodeSegment(value);
   }
 
   private record RepositoryRequest(

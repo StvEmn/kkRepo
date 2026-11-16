@@ -1,5 +1,7 @@
 package com.github.klboke.kkrepo.server.securityscan;
 
+import com.github.klboke.kkrepo.persistence.jdbc.api.InvalidScanCompletionCursorException;
+import com.github.klboke.kkrepo.persistence.jdbc.api.ScanPolicyReferenceConflictException;
 import com.github.klboke.kkrepo.persistence.jdbc.api.SecurityScanDao.RepositoryScanConfig;
 import com.github.klboke.kkrepo.persistence.jdbc.api.SecurityScanDao.ScanPolicy;
 import com.github.klboke.kkrepo.persistence.jdbc.api.SecurityScanDao.ScanWaiver;
@@ -9,11 +11,13 @@ import com.github.klboke.kkrepo.server.security.AuthenticatedSubject;
 import com.github.klboke.kkrepo.server.securityscan.SecurityScanManagementService.AssetDetail;
 import com.github.klboke.kkrepo.server.securityscan.SecurityScanManagementService.ConfigCommand;
 import com.github.klboke.kkrepo.server.securityscan.SecurityScanManagementService.CursorPage;
+import com.github.klboke.kkrepo.server.securityscan.SecurityScanManagementService.FindingArtifactPage;
 import com.github.klboke.kkrepo.server.securityscan.SecurityScanManagementService.FindingView;
 import com.github.klboke.kkrepo.server.securityscan.SecurityScanManagementService.FindingWaiverContext;
 import com.github.klboke.kkrepo.server.securityscan.SecurityScanManagementService.FindingWaiverDetail;
 import com.github.klboke.kkrepo.server.securityscan.SecurityScanManagementService.Overview;
 import com.github.klboke.kkrepo.server.securityscan.SecurityScanManagementService.PolicyCommand;
+import com.github.klboke.kkrepo.server.securityscan.SecurityScanManagementService.PolicyView;
 import com.github.klboke.kkrepo.server.securityscan.SecurityScanManagementService.RepositoryView;
 import com.github.klboke.kkrepo.server.securityscan.SecurityScanManagementService.RunView;
 import com.github.klboke.kkrepo.server.securityscan.SecurityScanManagementService.TaskView;
@@ -28,6 +32,7 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
@@ -52,6 +57,24 @@ public class SecurityScanManagementController {
     this.mutations = mutations;
   }
 
+  @ExceptionHandler(InvalidScanCompletionCursorException.class)
+  public ResponseEntity<Map<String, String>> invalidCompletionCursor() {
+    return ResponseEntity.badRequest().body(Map.of("message", "Invalid completion cursor timestamp"));
+  }
+
+  @ExceptionHandler(ScanPolicyReferenceConflictException.class)
+  public ResponseEntity<Map<String, String>> deletedPolicyReference(
+      ScanPolicyReferenceConflictException conflict) {
+    return ResponseEntity.status(409).body(Map.of("message", conflict.getMessage()));
+  }
+
+  @ExceptionHandler(ScanPolicyDeletionConflictException.class)
+  public ResponseEntity<Map<String, String>> policyDeletionConflict(
+      ScanPolicyDeletionConflictException conflict) {
+    return ResponseEntity.status(409).body(Map.of(
+        "code", conflict.code(), "message", conflict.getReason()));
+  }
+
   @GetMapping("/summary")
   public Overview summary(HttpServletRequest request) {
     return service.overview(actor(request));
@@ -73,8 +96,11 @@ public class SecurityScanManagementController {
       @RequestParam(name = "q", required = false) String query,
       @RequestParam(name = "after", defaultValue = "0") long after,
       @RequestParam(name = "limit", defaultValue = "25") int limit,
+      @RequestParam(name = "sort", required = false) String sort,
+      @RequestParam(name = "direction", required = false) String direction,
+      @RequestParam(name = "cursor", required = false) String cursor,
       HttpServletRequest request) {
-    return service.taskPage(actor(request), repositoryId, status, query, after, limit);
+    return service.taskPage(actor(request), repositoryId, status, query, after, limit, sort, direction, cursor);
   }
 
   @GetMapping("/runs")
@@ -83,8 +109,11 @@ public class SecurityScanManagementController {
       @RequestParam(name = "q", required = false) String query,
       @RequestParam(name = "after", defaultValue = "0") long after,
       @RequestParam(name = "limit", defaultValue = "25") int limit,
+      @RequestParam(name = "sort", required = false) String sort,
+      @RequestParam(name = "direction", required = false) String direction,
+      @RequestParam(name = "cursor", required = false) String cursor,
       HttpServletRequest request) {
-    return service.runPage(actor(request), repositoryId, query, after, limit);
+    return service.runPage(actor(request), repositoryId, query, after, limit, sort, direction, cursor);
   }
 
   @GetMapping("/findings")
@@ -95,21 +124,38 @@ public class SecurityScanManagementController {
       @RequestParam(name = "q", required = false) String query,
       @RequestParam(name = "after", defaultValue = "0") long after,
       @RequestParam(name = "limit", defaultValue = "25") int limit,
+      @RequestParam(name = "currentOnly", defaultValue = "false") boolean currentOnly,
       HttpServletRequest request) {
     return service.findingPage(
-        actor(request), repositoryId, runId, severity, query, after, limit);
+        actor(request), repositoryId, runId, severity, query, after, limit, currentOnly);
+  }
+
+  @GetMapping("/findings/{findingId}/artifacts")
+  public FindingArtifactPage findingArtifacts(
+      @PathVariable("findingId") long findingId,
+      @RequestParam(name = "afterRepositoryId", defaultValue = "0") long afterRepositoryId,
+      @RequestParam(name = "afterAssetId", defaultValue = "0") long afterAssetId,
+      @RequestParam(name = "limit", defaultValue = "25") int limit,
+      @RequestParam(name = "currentOnly", defaultValue = "false") boolean currentOnly,
+      HttpServletRequest request) {
+    return service.findingArtifacts(
+        actor(request), findingId, afterRepositoryId, afterAssetId, limit, currentOnly);
   }
 
   @GetMapping("/findings/{findingId}/waiver-context")
   public FindingWaiverContext findingWaiverContext(
-      @PathVariable("findingId") long findingId, HttpServletRequest request) {
-    return service.findingWaiverContext(actor(request), findingId);
+      @PathVariable("findingId") long findingId,
+      @RequestParam(name = "currentOnly", defaultValue = "false") boolean currentOnly,
+      HttpServletRequest request) {
+    return service.findingWaiverContext(actor(request), findingId, currentOnly);
   }
 
   @GetMapping("/findings/{findingId}/waivers")
   public FindingWaiverDetail findingWaivers(
-      @PathVariable("findingId") long findingId, HttpServletRequest request) {
-    return service.findingWaivers(actor(request), findingId);
+      @PathVariable("findingId") long findingId,
+      @RequestParam(name = "currentOnly", defaultValue = "false") boolean currentOnly,
+      HttpServletRequest request) {
+    return service.findingWaivers(actor(request), findingId, currentOnly);
   }
 
   @GetMapping("/assets/{assetId}")
@@ -159,12 +205,21 @@ public class SecurityScanManagementController {
   }
 
   @GetMapping("/policies")
-  public CursorPage<ScanPolicy> policies(
+  public CursorPage<PolicyView> policies(
       @RequestParam(name = "q", required = false) String query,
       @RequestParam(name = "after", defaultValue = "0") long after,
       @RequestParam(name = "limit", defaultValue = "25") int limit,
       HttpServletRequest request) {
     return service.policyPage(actor(request), query, after, limit);
+  }
+
+  @GetMapping("/policies/options")
+  public CursorPage<ScanPolicy> policyOptions(
+      @RequestParam(name = "assignedPolicyId", required = false) Long assignedPolicyId,
+      @RequestParam(name = "after", defaultValue = "0") long after,
+      @RequestParam(name = "limit", defaultValue = "25") int limit,
+      HttpServletRequest request) {
+    return service.policyOptionPage(actor(request), assignedPolicyId, after, limit);
   }
 
   @PostMapping("/policies")
@@ -181,6 +236,13 @@ public class SecurityScanManagementController {
       HttpServletRequest request) {
     AuthenticatedSubject actor = actor(request);
     return mutations.revisePolicy(request, actor, policyId, command);
+  }
+
+  @DeleteMapping("/policies/{policyId}")
+  public ResponseEntity<Void> deletePolicy(
+      @PathVariable("policyId") long policyId, HttpServletRequest request) {
+    mutations.deletePolicy(request, actor(request), policyId);
+    return ResponseEntity.noContent().build();
   }
 
   @GetMapping("/waivers")

@@ -1,6 +1,8 @@
 package com.github.klboke.kkrepo.server.metrics;
 
+import com.github.klboke.kkrepo.server.config.RepositoryUrlPrefix;
 import com.github.klboke.kkrepo.core.RepositoryFormat;
+import com.github.klboke.kkrepo.core.http.UriPathDecoder;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.RepositoryRecord;
 import com.github.klboke.kkrepo.protocol.composer.ComposerPath;
 import com.github.klboke.kkrepo.protocol.composer.ComposerPathParser;
@@ -17,8 +19,6 @@ import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
-import java.net.URLDecoder;
-import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Locale;
@@ -63,7 +63,13 @@ public class RepositoryRequestMetricsFilter extends OncePerRequestFilter {
       HttpServletRequest request,
       HttpServletResponse response,
       FilterChain filterChain) throws ServletException, IOException {
-    Target target = target(request);
+    Target target;
+    try {
+      target = target(request);
+    } catch (IllegalArgumentException e) {
+      filterChain.doFilter(request, response);
+      return;
+    }
     if (target == null) {
       filterChain.doFilter(request, response);
       return;
@@ -215,7 +221,7 @@ public class RepositoryRequestMetricsFilter extends OncePerRequestFilter {
             && !REDACTED_TERRAFORM_PATH.equals(target.path()))) {
       return stripContextPath(request);
     }
-    return "/repository/" + target.repository() + "/" + target.path();
+    return RepositoryUrlPrefix.path(request) + target.repository() + "/" + target.path();
   }
 
   private static boolean terraformShaped(String path) {
@@ -230,8 +236,8 @@ public class RepositoryRequestMetricsFilter extends OncePerRequestFilter {
   private static Target target(HttpServletRequest request) {
     String method = request.getMethod() == null ? "" : request.getMethod().toUpperCase(Locale.ROOT);
     String uri = stripContextPath(request);
-    if (uri.startsWith("/repository/")) {
-      String remaining = uri.substring("/repository/".length());
+    if (uri.startsWith(RepositoryUrlPrefix.path(request))) {
+      String remaining = uri.substring(RepositoryUrlPrefix.path(request).length());
       if (remaining.isBlank()) return null;
       int slash = remaining.indexOf('/');
       String repository = slash < 0 ? remaining : remaining.substring(0, slash);
@@ -288,6 +294,8 @@ public class RepositoryRequestMetricsFilter extends OncePerRequestFilter {
     return switch (format) {
       case MAVEN2 -> mavenOperation(path, normalizedMethod);
       case NPM -> npmOperation(path, normalizedMethod);
+      case OHPM -> "ohpm_" + new com.github.klboke.kkrepo.protocol.ohpm.OhpmPathParser()
+          .parse(normalizedMethod, path).kind().name().toLowerCase(Locale.ROOT);
       case PYPI -> pypiOperation(path, normalizedMethod);
       case CARGO -> cargoOperation(path, normalizedMethod);
       case PUB -> pubOperation(path, normalizedMethod);
@@ -307,6 +315,9 @@ public class RepositoryRequestMetricsFilter extends OncePerRequestFilter {
       case ALPINE -> alpineOperation(path, normalizedMethod);
       case R -> rOperation(path, normalizedMethod);
       case HUGGINGFACE -> huggingFaceOperation(path, normalizedMethod);
+      case GITLFS -> path.equals("info/lfs/objects/batch") ? "gitlfs_batch"
+          : path.endsWith("/verify") ? "gitlfs_verify"
+          : "PUT".equals(normalizedMethod) ? "gitlfs_upload" : "gitlfs_download";
       case RAW -> rawOperation(normalizedMethod);
     };
   }
@@ -683,7 +694,7 @@ public class RepositoryRequestMetricsFilter extends OncePerRequestFilter {
   }
 
   private static String decode(String value) {
-    return URLDecoder.decode(value, StandardCharsets.UTF_8);
+    return UriPathDecoder.decodeSegment(value);
   }
 
   private record Target(String repository, String path, String route) {

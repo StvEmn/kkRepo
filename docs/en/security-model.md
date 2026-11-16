@@ -1,5 +1,9 @@
 # Security Model
 
+See [Routing Rules](routing-rules.md) for proxy path restrictions.
+
+See [Minimum Release Age](minimum-release-age.md) for quarantining recently published versions on proxy repositories.
+
 This document explains the current kkrepo security model: authentication, authorization, secrets, audit logs, and operational boundaries.
 
 See [Content Selectors](content-selectors.md) for path expressions, the management UI, preview limits, and additive grant behavior.
@@ -131,6 +135,12 @@ X-Nexus-Plus-Token
 
 Protocol-specific clients should keep using their native auth mechanisms and matching token domains. Current protocol-token domains include `NpmToken`, `CargoToken`, `PubToken`, `NuGetApiKey`, and `RubyGemsApiKey` where the corresponding client protocol uses tokens or API keys; Cargo, Pub, and RubyGems clients send their registry/API key token through the `Authorization` header. Private Composer repositories should normally use HTTP Basic through `COMPOSER_AUTH`/`auth.json`; Composer or CI callers that explicitly send bearer or custom API-key headers can use `GenericToken`. Terraform CLI can use a `GenericToken` embedded only in the configured `modules.v1`/`providers.v1` service URL; generated archive/checksum/signature URLs preserve that credential segment, while logs, metrics, and uploaded CI diagnostics must redact it. Ansible Galaxy clients may send a `GenericToken` through the current ansible-core Bearer scheme or the Ansible 2.9 Token scheme. On Ansible routes only, kkrepo also accepts Nexus-compatible Base64 `username:password`; it is password transport rather than encryption and should not be logged or preferred over a scoped token. An explicit invalid Ansible credential must return `401` instead of falling back to anonymous access. Private Conda channels normally use HTTP Basic credentials from `.netrc`; callers that explicitly send bearer or the custom API-key header can use `GenericToken`. Do not embed reusable secrets in `.condarc`. `GenericToken` is not a universal replacement for every package client token format.
 
+### OHPM tokens and public keys
+
+Use **Security → Keys & Tokens → API Tokens** to issue a GenericToken for ordinary OHPM publication and installation. OHPM sends it as raw `Authorization`, without the Bearer prefix. Effective access comes from the owner's roles and repository permissions; stored API key `scopes` values are not currently enforced as token-level restrictions.
+
+**OHPM Public Keys** registers a public key against an existing user for optional signed login. It is disabled by default at the server level; registration does not grant repository permissions or sign repository metadata/packages. New UI registrations are enabled immediately, while rotation preserves the existing enabled state. Private keys remain with the publisher. Use a dedicated account with limited repository grants for CI. See the [OHPM usage guide](repository-guides/ohpm.md) and [signed-login configuration](dev/ohpm-login.md).
+
 ## Encryption Secrets
 
 Two stable deployment secrets are required outside dev/test-style usage:
@@ -259,3 +269,67 @@ Report privately if the issue could cause:
 - Migration data leakage.
 
 See [SECURITY.md](../../SECURITY.md).
+
+## NuGet upstream NTLM authentication
+
+Reference: [Microsoft NTLM connection-oriented flow](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-nlmp/1fbf5c3b-04c1-4591-a4be-9dc232c4744b).
+
+NuGet proxy repositories can authenticate to NTLM upstreams, including on-premises feeds that require Windows credentials. In Admin → Repositories, choose **NTLM** under **Upstream authentication**, enter the remote username/password, and optionally provide the **NTLM domain** and **NTLM workstation**. A `DOMAIN\username` username is accepted; an explicitly supplied domain takes precedence. Clear any saved Bearer token before selecting NTLM.
+
+The equivalent `/internal/repositories` proxy settings are:
+
+```json
+{
+  "remoteAuthenticationType": "ntlm",
+  "remoteUsername": "service-user",
+  "remotePassword": "<password>",
+  "remoteNtlmDomain": "DOMAIN",
+  "remoteNtlmHost": "KKREPO"
+}
+```
+
+The default `auto` mode preserves existing Basic/Bearer behavior. NTLM is explicitly selected and responds to an upstream NTLM challenge; it does not send a preemptive Basic password or fall back to Basic. This adds upstream NTLM authentication for NuGet proxy repositories, not Kerberos/SPNEGO or Windows login to kkRepo. Private upstream hosts still require the outbound allowlist described above. Availability of NTLM does not imply that every Azure DevOps-specific NuGet API behavior has been verified.
+
+Passwords use the existing encrypted `remotePassword` storage and redacted API responses. Nexus NuGet migration preserves NTLM type/domain/workstation when exported, and existing missing/masked-password checks still require the operator to re-enter unavailable secrets. Authenticated connections are isolated by repository, origin, outbound proxy and credential fingerprint. Each replica builds a disposable local pool from database-backed configuration; credential changes select a new pool, local update/delete evicts the old pool, and idle pools expire after `kkrepo.outbound-proxy.idle-ttl-ms`. Same-origin redirects retain authentication; cross-origin redirects require the usual allowlist and never carry NTLM credentials.
+
+NuGet service-index discovery does not delegate repository credentials to other origins. Discovered resources use the same origin check as other outbound requests; neither the private-host allowlist nor `allowedRedirectHosts` authorizes sharing Basic/Bearer/NTLM credentials. For an authenticated resource advertised under a canonical hostname, configure that origin as the upstream when it also serves the service index. Feeds requiring shared credentials across multiple origins need a separately configured credential-delegation feature, which is not currently supported.
+
+NuGet group package and registration links, including links without a query, carry an authenticated routing proof bound to the entry group, source member, package path, exact query and discovered resource. Every replica verifies it with the existing deployment credential secret; ordinary repository authorization still applies, and membership is checked against the current group configuration. Client queries cannot override resource-owned parameters. When hiding resource credentials would change a link's original query order or encoding, an authenticated encrypted envelope preserves the exact query. It is bound to the proxy repository, configured feed, discovered resource and client path/query, and any replica can restore it without local session state. Failed signed download requests are excluded from the canonical negative cache.
+
+The current Apache HttpClient dependency retains NTLM as a deprecated, opt-in scheme. The transport registers it explicitly for NTLM requests without changing the default authentication registry. Keep the NTLMv2 handshake tests when upgrading HttpClient. Reference comparison: `python3 compat-test/scripts/ntlm-upstream.py --nexus http://localhost:28090 --kkrepo http://localhost:18090` against disposable instances, with `--upstream-host` set to a hostname/IP reachable from both servers. Add `--dotnet` to verify a real .NET 8 restore using isolated package caches. The fixture verifies the NTLMv2 password proof, GET/HEAD results and exact package bytes, and removes its repositories and temporary Nexus SSRF exception.
+
+## Scan activity ordering
+
+Admin → Security Scanning → Tasks / Overview (scan runs) defaults to newest first by the actual completion time. Click the **Finished** (tasks) or **Completed** (runs) column header to toggle ascending/descending order; the arrow shows the current direction, matching the repository list. Tasks also display their finished timestamp. Unfinished tasks appear last in either direction; IDs break timestamp ties in the selected direction. Search and repository visibility are applied before pagination.
+
+The management API supports the same ordering:
+
+- `GET /internal/security/scanning/tasks?sort=finished_at&direction=desc&limit=25` (optionally add `status=FAILED`, `repositoryId`, or `q`).
+- `GET /internal/security/scanning/runs?sort=completed_at&direction=asc&limit=25` (optionally add `repositoryId` or `q`).
+
+Completion sorting defaults to `direction=desc` when direction is omitted. Pass the response's opaque `nextCursor` as `cursor` for the next page, keeping the same sort, direction, and filters; a null cursor means the end. Start a new page sequence after changing filters or ordering. Completion sorting does not use `after`/`nextAfter`. Omitting `sort` (or using `sort=id&direction=asc`) preserves the existing ascending ID API and `after`/`nextAfter` pagination for older clients. Unsupported sort fields, directions, malformed/mismatched cursors, and timestamps outside the JDBC connection's supported range return HTTP 400.
+
+The cursor carries the completion timestamp and ID, so any replica can continue the page without looking up the previous boundary row. Pages reflect live data rather than a frozen snapshot: retries, newly completed tasks, or retention deletions can change the list while browsing. Refresh from the first page for the latest activity.
+
+Completion pages use timestamp/ID indexes added by migration V55, with status-leading variants for filtered task lists (including repository-scoped lists). Tasks read completed and unfinished ranges separately, with at most the remaining page size fetched from each range; the server reads both in one read-only transaction. This avoids a history-wide null-rank sort while keeping unfinished tasks last. MySQL builds the indexes online; PostgreSQL builds them concurrently. The migrations support retry after interruption.
+
+### Proxy redirect host patterns
+
+`proxy.allowedRedirectHosts` accepts exact hosts and leading `*.` patterns, for example
+`["*.quay.io", "quay.io"]`. `*.quay.io` matches `cdn01.quay.io` and deeper subdomains,
+but not `quay.io`, `evilquay.io`, or `quay.io.example.com`. Exact entries keep their existing
+behavior. Rules are case-insensitive, trailing dots are normalized, and IDNs are stored as ASCII.
+Partial wildcards, single-label wildcard suffixes, IP wildcard patterns, schemes,
+ports and paths are rejected. There are at most 64 rules per repository.
+
+These database-backed rules are applied by every replica to both ordinary proxy and Docker
+redirects. They do not allow private addresses or forward Basic/Bearer/NTLM credentials across
+origins: the outbound address policy and DNS pinning still apply to every hop.
+
+
+A standalone `*` in `proxy.allowedRedirectHosts` opts into arbitrary public HTTPS content GET/HEAD
+destinations. Removing it restores the retained exact/domain rules. POST, authentication and token
+exchanges retain strict rules. Independent public-address validation, DNS pinning, TLS verification,
+downgrade rejection, credential/cookie isolation and redirect limits remain enforced. DNS-resolving
+outbound proxies cannot be combined with this option. See
+[public HTTPS content redirects](design/public-https-redirect-policy.md).

@@ -46,10 +46,10 @@ public class CleanupPolicyCapabilities {
     return java.util.Arrays.stream(RepositoryFormat.values())
         .map(format -> new FormatCapability(
             format,
-            true,
+            supportsExecute(format),
             versionComparators.containsKey(format),
-            true,
-            true))
+            supportsLastDownloaded(format),
+            supportsExecute(format)))
         .toList();
   }
 
@@ -62,11 +62,11 @@ public class CleanupPolicyCapabilities {
   }
 
   public boolean supportsLastDownloaded(RepositoryFormat format) {
-    return true;
+    return supportsExecute(format);
   }
 
   public boolean supportsExecute(RepositoryFormat format) {
-    return true;
+    return format != RepositoryFormat.GITLFS && format != RepositoryFormat.OHPM;
   }
 
   public record FormatCapability(

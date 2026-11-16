@@ -3,25 +3,32 @@ package com.github.klboke.kkrepo.server.securityscan;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.clearInvocations;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.github.klboke.kkrepo.auth.AccessDecision;
 import com.github.klboke.kkrepo.auth.PermissionSubject;
+import com.github.klboke.kkrepo.auth.PermissionAction;
 import com.github.klboke.kkrepo.auth.RepositoryPermission;
 import com.github.klboke.kkrepo.core.RepositoryFormat;
 import com.github.klboke.kkrepo.core.RepositoryType;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AssetDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.BrowseNodeDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.DockerRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.PersistenceHashes;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.SecurityScanDao;
@@ -38,6 +45,7 @@ import com.github.klboke.kkrepo.persistence.jdbc.api.SecurityScanDao.TaskDraft;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.AssetBlobRecord;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.AssetRecord;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.RepositoryRecord;
+import com.github.klboke.kkrepo.persistence.jdbc.api.model.docker.DockerManifestRecord;
 import com.github.klboke.kkrepo.security.scan.ScanEnums.EnforcementMode;
 import com.github.klboke.kkrepo.security.scan.ScanEnums.OciPlatformPolicy;
 import com.github.klboke.kkrepo.security.scan.ScanEnums.PolicyAction;
@@ -61,6 +69,9 @@ import java.util.Optional;
 import java.util.Set;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.mockito.ArgumentCaptor;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.server.ResponseStatusException;
@@ -70,6 +81,8 @@ class SecurityScanManagementServiceCoreTest {
   private SecurityScanDao scans;
   private RepositoryDao repositories;
   private AssetDao assets;
+  private BrowseNodeDao browseNodes;
+  private DockerRegistryDao docker;
   private SecurityManagementService security;
   private SecurityScanDocumentStore documents;
   private SecurityScanDocumentPersistence documentPersistence;
@@ -85,6 +98,8 @@ class SecurityScanManagementServiceCoreTest {
     scans = mock(SecurityScanDao.class);
     repositories = mock(RepositoryDao.class);
     assets = mock(AssetDao.class);
+    browseNodes = mock(BrowseNodeDao.class);
+    docker = mock(DockerRegistryDao.class);
     security = mock(SecurityManagementService.class);
     documents = mock(SecurityScanDocumentStore.class);
     documentPersistence = mock(SecurityScanDocumentPersistence.class);
@@ -107,11 +122,114 @@ class SecurityScanManagementServiceCoreTest {
         scans,
         repositories,
         assets,
+        browseNodes,
+        docker,
         security,
         documents,
         documentPersistence,
         properties,
         scope);
+  }
+
+  @Test
+  void readOnlyCapabilitiesNeverAuthorizeMutationEvenWithRepositoryAdministration() {
+    when(security.decide(actor.permissionSubject(), "nexus:security-scanning:update"))
+        .thenReturn(AccessDecision.deny("read only"));
+    assertFalse(service.repositoryPage(actor, null, 0, 10).items().getFirst().canConfigure());
+    var task = scanTask(7L, 20L);
+    when(scans.listTasks(1L, null, null, 0, 11, null)).thenReturn(List.of(task));
+    var view = service.taskPage(actor, 1L, null, null, 0, 10).items().getFirst();
+    assertFalse(view.canManage());
+    assertFalse(view.canRescan());
+    verify(scope, never()).effectiveConfigsForSource(anyLong());
+  }
+
+  @Test
+  void repositoryCapabilitiesRequireBothUpdateAndAdministration() {
+    assertTrue(service.repositoryViews(actor).getFirst().canConfigure());
+    when(security.decide(eq(actor.permissionSubject()),
+        argThat((RepositoryPermission permission) -> permission.action() == PermissionAction.ADMIN)))
+        .thenReturn(AccessDecision.deny("browse only"));
+    assertFalse(service.repositoryViews(actor).getFirst().canConfigure());
+    var task = scanTask(7L, 20L);
+    when(scans.listTasks(1L, null, null, 0, 11, null)).thenReturn(List.of(task));
+    var view = service.taskPage(actor, 1L, null, null, 0, 10).items().getFirst();
+    assertFalse(view.canManage());
+    assertFalse(view.canRescan());
+  }
+
+  @ParameterizedTest
+  @CsvSource(value = {
+      "null, null, true, null, NO_EXPIRY",
+      "null, 86400, true, 86400, POLICY",
+      "604800, null, true, 604800, REPOSITORY",
+      "604800, 86400, true, 86400, BOTH",
+      "86400, 604800, true, 86400, BOTH",
+      "86400, 86400, true, 86400, BOTH",
+      "null, 86400, false, null, NO_EXPIRY",
+      "604800, 86400, false, 604800, REPOSITORY"
+  }, nullValues = "null")
+  void repositoryPageResolvesRuntimeValidityWithoutChangingEditableConfig(
+      Long repositoryAge, Long policyAge, boolean enabled, Long effectiveAge, String source) {
+    RepositoryScanConfig config = new RepositoryScanConfig(
+        1L, true, 1L, true, true, EnforcementMode.ENFORCE,
+        PolicyAction.BLOCK, PolicyAction.ALLOW, PolicyAction.BLOCK,
+        repositoryAge, 10L, 1, NOW, NOW);
+    ScanPolicy policy = new ScanPolicy(
+        10L, "critical", enabled, Severity.CRITICAL, false, false, false,
+        policyAge, List.of(), 1, "admin", NOW, NOW);
+    when(scans.findRepositoryConfigs(any())).thenReturn(List.of(config));
+    when(scans.listPolicies()).thenReturn(List.of(policy));
+
+    var view = service.repositoryPage(actor, null, 0, 10).items().getFirst();
+
+    assertEquals(effectiveAge, view.resultValidity().maxResultAgeSeconds());
+    assertEquals(source, view.resultValidity().source());
+    assertEquals(enabled, view.policyEnabled());
+    assertSame(config, view.config());
+    assertEquals(repositoryAge, view.config().maxResultAgeSeconds());
+    assertEquals(PolicyAction.BLOCK, view.config().partialAction());
+    verify(scans, never()).findPolicy(anyLong());
+  }
+
+  @Test
+  void policyPageMarksHistoricalRevisionsUsingDatabaseHeadsOutsideThePage() {
+    var first = policy(10L, "critical", 1L);
+    var second = policy(20L, "other", 1L);
+    when(scans.listPolicies("critical", 0L, 2)).thenReturn(List.of(first, second));
+    when(scans.findLatestPolicyIds(List.of(10L))).thenReturn(List.of());
+    var page = service.policyPage(actor, "critical", 0L, 1);
+    assertEquals(first, page.items().getFirst().policy());
+    assertFalse(page.items().getFirst().latestRevision());
+    assertEquals(10L, page.nextAfter());
+    when(scans.findLatestPolicyIds(List.of(10L))).thenReturn(List.of(10L));
+    assertTrue(service.policyPage(actor, "critical", 0L, 1).items().getFirst().latestRevision());
+    verify(scans, never()).listPolicies();
+  }
+
+  @Test
+  void policyOptionsUseBoundedHeadQueryAndRetainAssignedRevision() {
+    when(scans.listPolicyOptions(10L, 0L, 2)).thenReturn(
+        List.of(policy(10L, "critical", 1L), policy(20L, "critical", 2L)));
+    var page = service.policyOptionPage(actor, 10L, 0L, 1);
+    assertEquals(List.of(10L), page.items().stream().map(ScanPolicy::id).toList());
+    assertEquals(10L, page.nextAfter());
+    verify(scans, never()).listPolicies();
+  }
+
+  @Test
+  void policyOptionsRequireGlobalScanReadPermission() {
+    when(security.decide(actor.permissionSubject(), "nexus:security-scanning:read"))
+        .thenReturn(AccessDecision.deny("denied"));
+    assertStatus(HttpStatus.FORBIDDEN, () -> service.policyOptionPage(actor, null, 0, 100));
+    verify(scans, never()).listPolicyOptions(any(), anyLong(), anyInt());
+  }
+
+  @Test
+  void repositoryViewWithoutAssignedPolicyUsesBaselineWithoutAnAgeLimit() {
+    var view = service.repositoryViews(actor).getFirst();
+    assertEquals(new SecurityScanResultValidity(null, "NO_EXPIRY"), view.resultValidity());
+    assertTrue(view.policyEnabled());
   }
 
   @Test
@@ -147,15 +265,35 @@ class SecurityScanManagementServiceCoreTest {
     when(task.requestReason()).thenReturn(RequestReason.MANUAL);
     when(task.status()).thenReturn(TaskStatus.PENDING);
     when(task.maxAttempts()).thenReturn(5);
-    when(scans.listTasks(1L, TaskStatus.PENDING, "demo", 0, 2))
+    when(scans.listTasks(1L, TaskStatus.PENDING, "demo", 0, 2, null))
         .thenReturn(List.of(task));
     var taskPage = service.taskPage(actor, 1L, TaskStatus.PENDING, "demo", 0, 1);
     assertEquals("maven-hosted", taskPage.items().getFirst().repository());
 
     ScanRun run = run(9L);
-    when(scans.listRuns(1L, "demo", 0, 2)).thenReturn(List.of(run));
+    when(scans.listRuns(1L, "demo", 0, 2, null)).thenReturn(List.of(run));
     var runPage = service.runPage(actor, 1L, "demo", 0, 1);
     assertEquals("COMPLETE", runPage.items().getFirst().status());
+
+    var order = new SecurityScanDao.CompletionOrder(false, 0, null);
+    when(task.finishedAt()).thenReturn(Instant.parse("2026-09-23T00:00:00Z"));
+    when(scans.listTasks(1L, TaskStatus.PENDING, "demo", 0, 2, order))
+        .thenReturn(List.of(task, task));
+    var completedTasks = service.taskPage(
+        actor, 1L, TaskStatus.PENDING, "demo", 0, 1, "finished_at", "desc", null);
+    assertNotNull(completedTasks.nextCursor());
+    assertEquals(task.finishedAt(), completedTasks.items().getFirst().finishedAt());
+    assertNull(completedTasks.nextAfter());
+    when(scans.listRuns(1L, "demo", 0, 2, order)).thenReturn(List.of(run, run));
+    var completedRuns = service.runPage(actor, 1L, "demo", 0, 1, "completed_at", "desc", null);
+    assertNotNull(completedRuns.nextCursor());
+    var boundary = ScanCompletionPagination.parse(
+        "completed_at", "completed_at", "desc", completedRuns.nextCursor(), 0);
+    service.runPage(actor, 1L, "demo", 0, 1, "completed_at", "desc", completedRuns.nextCursor());
+    verify(scans).listRuns(1L, "demo", 0, 2, boundary);
+    service.runPage(actor, null, "demo", 0, 1, "completed_at", "desc", null);
+    verify(scans).listRunsByRepositories(List.of(1L, 2L), "demo", 0, 2, order);
+
   }
 
   @Test
@@ -215,7 +353,8 @@ class SecurityScanManagementServiceCoreTest {
         eq(null),
         eq(null),
         eq(0L),
-        eq(11));
+        eq(11),
+        eq(null));
     assertEquals(300, taskScope.getValue().size());
     assertEquals(
         manyRepositories.stream()
@@ -244,9 +383,11 @@ class SecurityScanManagementServiceCoreTest {
     when(task.requestReason()).thenReturn(RequestReason.CONTENT_CHANGED);
     when(task.status()).thenReturn(TaskStatus.FAILED);
     when(task.maxAttempts()).thenReturn(5);
-    when(scans.listTasksByRepositories(List.of(2L), null, null, 0, 11))
+    when(scans.listTasksByRepositories(List.of(2L), null, null, 0, 11, null))
         .thenReturn(List.of(task));
     when(scans.findTask(77L)).thenReturn(Optional.of(task));
+    when(scope.effectiveConfigsForSources(List.of(repository)))
+        .thenReturn(Map.of(1L, List.of(config(2L, true, 1L, null))));
     when(scope.effectiveConfigsForSource(1L))
         .thenReturn(List.of(config(2L, true, 1L, null)));
     when(scans.requeueTask(eq(77L), any(), eq("admin"))).thenReturn(true);
@@ -254,10 +395,140 @@ class SecurityScanManagementServiceCoreTest {
     var page = service.taskPage(actor, null, null, null, 0, 10);
     assertEquals(1, page.items().size());
     assertEquals("maven-hosted", page.items().getFirst().repository());
+    assertTrue(page.items().getFirst().canManage());
+    assertFalse(page.items().getFirst().canRescan());
+    var order = new SecurityScanDao.CompletionOrder(true, 0, null);
+    when(scans.listTasksByRepositories(List.of(2L), null, null, 0, 11, order))
+        .thenReturn(List.of(task));
+    assertEquals(77L, service.taskPage(
+        actor, null, null, null, 0, 10, "finished_at", "asc", null).items().getFirst().id());
+    assertEquals(77L, service.taskPage(
+        actor, 2L, null, null, 0, 10, "finished_at", "asc", null).items().getFirst().id());
     service.retry(actor, 77L);
 
-    verify(scans).listTasksByRepositories(List.of(2L), null, null, 0, 11);
+    verify(scans).listTasksByRepositories(List.of(2L), null, null, 0, 11, null);
     verify(scans).requeueTask(eq(77L), any(), eq("admin"));
+  }
+
+  @Test
+  void taskPageResolvesAssetsInBatchesAndPreservesPaginationAndMissingAssets() {
+    ScanTask first = scanTask(7L, 20L);
+    ScanTask deleted = scanTask(8L, 21L);
+    ScanTask withoutAsset = scanTask(9L, null);
+    ScanTask next = scanTask(10L, 20L);
+    String path = "com/acme/demo/1.0/demo-1.0.jar";
+    when(scans.listTasks(1L, null, null, 0, 4, null))
+        .thenReturn(List.of(first, deleted, withoutAsset, next));
+    when(assets.findAssetsByIds(List.of(20L, 21L)))
+        .thenReturn(Map.of(20L, asset(20L, RepositoryFormat.MAVEN2, path, "artifact")));
+    when(browseNodes.findPathsByAssetIds(List.of(20L, 21L)))
+        .thenReturn(Map.of(20L, "projected/" + path));
+
+    var page = service.taskPage(actor, 1L, null, null, 0, 3);
+
+    assertEquals(3, page.items().size());
+    assertEquals(9L, page.nextAfter());
+    var resolved = page.items().getFirst();
+    assertEquals(path, resolved.assetPath());
+    assertEquals("projected/" + path, resolved.browsePath());
+    assertEquals("maven-hosted", resolved.browseRepository());
+    assertEquals(21L, page.items().get(1).assetId());
+    assertNull(page.items().get(1).assetPath());
+    assertNull(page.items().get(1).browseRepository());
+    assertNull(page.items().get(2).assetId());
+    verify(assets).findAssetsByIds(List.of(20L, 21L));
+    verify(assets, never()).findAssetById(anyLong());
+    var completion = new SecurityScanDao.CompletionOrder(false, 0, null);
+    when(first.finishedAt()).thenReturn(Instant.parse("2026-09-23T00:00:00Z"));
+    when(scans.listTasks(1L, null, null, 0, 2, completion)).thenReturn(List.of(first, next));
+    when(assets.findAssetsByIds(List.of(20L)))
+        .thenReturn(Map.of(20L, asset(20L, RepositoryFormat.MAVEN2, path, "artifact")));
+    when(browseNodes.findPathsByAssetIds(List.of(20L))).thenReturn(Map.of(20L, "projected/" + path));
+    var sorted = service.taskPage(actor, 1L, null, null, 0, 1, "finished_at", "desc", null);
+    assertEquals(path, sorted.items().getFirst().assetPath());
+    assertEquals("projected/" + path, sorted.items().getFirst().browsePath());
+    assertEquals("maven-hosted", sorted.items().getFirst().browseRepository());
+    assertNotNull(sorted.nextCursor());
+    assertNull(sorted.nextAfter());
+  }
+
+  @ParameterizedTest
+  @CsvSource({"true,true", "false,true", "true,false", "false,false"})
+  void taskLinksUseVisibleGroupContextWhenSelectedOrSourceIsHidden(
+      boolean selectGroup, boolean sourceVisible) {
+    RepositoryRecord group = repository(2L, "maven-group", RepositoryType.GROUP);
+    when(repositories.list()).thenReturn(List.of(repository, group));
+    when(repositories.findById(2L)).thenReturn(Optional.of(group));
+    when(scope.sourceRepositoryIds(2L)).thenReturn(List.of(1L));
+    if (!sourceVisible) {
+      when(security.decide(eq(actor.permissionSubject()),
+          argThat((RepositoryPermission permission) ->
+              permission.repository().equals(repository.name()))))
+          .thenReturn(AccessDecision.deny("group access only"));
+    }
+    List<Long> visibleIds = selectGroup || !sourceVisible ? List.of(2L) : List.of(2L, 1L);
+    ScanTask scanTask = scanTask(7L, 20L);
+    when(scans.listTasksByRepositories(visibleIds, null, null, 0, 11, null))
+        .thenReturn(List.of(scanTask));
+    when(assets.findAssetsByIds(List.of(20L)))
+        .thenReturn(Map.of(20L, asset(20L, RepositoryFormat.MAVEN2, "demo.jar", "artifact")));
+
+    var task = service.taskPage(actor, selectGroup ? 2L : null, null, null, 0, 10)
+        .items().getFirst();
+
+    assertEquals("maven-hosted", task.repository());
+    assertEquals(selectGroup || !sourceVisible ? "maven-group" : "maven-hosted",
+        task.browseRepository());
+    assertEquals("demo.jar", task.browsePath());
+  }
+
+  @Test
+  void taskPageDoesNotResolveAnAssetFromAnUnrelatedRepository() {
+    ScanTask scanTask = scanTask(7L, 20L);
+    when(scans.listTasks(1L, null, null, 0, 11, null))
+        .thenReturn(List.of(scanTask));
+    AssetRecord unrelated = mock(AssetRecord.class);
+    when(unrelated.repositoryId()).thenReturn(99L);
+    when(assets.findAssetsByIds(List.of(20L))).thenReturn(Map.of(20L, unrelated));
+
+    var task = service.taskPage(actor, 1L, null, null, 0, 10).items().getFirst();
+
+    assertNull(task.assetPath());
+    assertNull(task.browsePath());
+    assertNull(task.browseRepository());
+  }
+
+  @Test
+  void taskPageUsesLiveDockerManifestBrowsePath() {
+    String digest = "sha256:" + "a".repeat(64);
+    String storagePath = "docker/manifests/team/demo/sha256/" + "a".repeat(64);
+    ScanTask scanTask = scanTask(7L, 20L);
+    when(scans.listTasks(1L, null, null, 0, 11, null))
+        .thenReturn(List.of(scanTask));
+    when(assets.findAssetsByIds(List.of(20L)))
+        .thenReturn(Map.of(20L, asset(20L, RepositoryFormat.DOCKER, storagePath, "manifest")));
+    DockerManifestRecord manifest = mock(DockerManifestRecord.class);
+    when(manifest.hasDigestReference()).thenReturn(true);
+    when(manifest.imageName()).thenReturn("team/demo");
+    when(manifest.digest()).thenReturn(digest);
+    when(docker.findManifestsByAssetIds(List.of(20L))).thenReturn(Map.of(20L, manifest));
+
+    var task = service.taskPage(actor, 1L, null, null, 0, 10).items().getFirst();
+
+    assertEquals(storagePath, task.assetPath());
+    assertEquals("team/demo/manifests/" + digest, task.browsePath());
+  }
+
+  private static ScanTask scanTask(long id, Long assetId) {
+    ScanTask task = mock(ScanTask.class);
+    when(task.id()).thenReturn(id);
+    when(task.repositoryId()).thenReturn(1L);
+    when(task.assetId()).thenReturn(assetId);
+    when(task.subjectKind()).thenReturn(SubjectKind.ASSET_BLOB);
+    when(task.stage()).thenReturn(ScanStage.CATALOG_AND_MATCH);
+    when(task.requestReason()).thenReturn(RequestReason.MANUAL);
+    when(task.status()).thenReturn(TaskStatus.PENDING);
+    return task;
   }
 
   @Test
@@ -328,6 +599,43 @@ class SecurityScanManagementServiceCoreTest {
     assertStatus(HttpStatus.CONFLICT, () -> service.rescan(actor, 22L));
   }
 
+  @ParameterizedTest
+  @CsvSource({"false, 1", "true, 2"})
+  void groupScanConfigChangesLeaveMemberContentForPolicyReconciliation(
+      boolean previouslyEnabled, long previousProfileId) {
+    RepositoryRecord group = repository(3L, "maven-group", RepositoryType.GROUP);
+    when(repositories.findById(3L)).thenReturn(Optional.of(group));
+    when(scans.findProfile(1L)).thenReturn(Optional.of(profile));
+    when(scans.findRepositoryConfig(3L))
+        .thenReturn(Optional.of(config(3L, previouslyEnabled, previousProfileId, null)));
+    when(scans.upsertRepositoryConfig(any())).thenAnswer(invocation -> invocation.getArgument(0));
+    when(scope.sourceRepositoryIds(3L)).thenReturn(List.of(1L, 2L));
+    when(scope.appliesToSource(any(), anyLong())).thenReturn(true);
+
+    RepositoryScanConfig updated = service.updateRepositoryConfig(actor, 3L, new ConfigCommand(
+        true, 1L, true, true, null, null, null, null, null, null));
+
+    assertTrue(updated.enabled());
+    assertEquals(2L, updated.configRevision());
+    verify(scans, never()).createBackfillJob(anyLong(), anyString(), any());
+  }
+
+  @ParameterizedTest
+  @EnumSource(value = RepositoryType.class, names = {"HOSTED", "PROXY"})
+  void enablingSourceRepositoryScanningStillCreatesContentBackfill(RepositoryType type) {
+    when(repositories.findById(1L)).thenReturn(Optional.of(repository(1L, "source", type)));
+    when(scans.findProfile(1L)).thenReturn(Optional.of(profile));
+    when(scans.findRepositoryConfig(1L)).thenReturn(Optional.of(config(1L, false, 1L, null)));
+    when(scans.upsertRepositoryConfig(any())).thenAnswer(invocation -> invocation.getArgument(0));
+    when(scope.sourceRepositoryIds(1L)).thenReturn(List.of(1L));
+    when(scope.appliesToSource(any(), eq(1L))).thenReturn(true);
+
+    service.updateRepositoryConfig(actor, 1L, new ConfigCommand(
+        true, 1L, true, true, null, null, null, null, null, null));
+
+    verify(scans).createBackfillJob(eq(1L), eq("admin"), any());
+  }
+
   @Test
   void updatesRepositoryConfigurationAndCreatesPolicyRevisions() {
     RepositoryScanConfig previous = config(1L, false, 1L, null);
@@ -376,6 +684,27 @@ class SecurityScanManagementServiceCoreTest {
     ScanPolicy replacement = service.revisePolicy(actor, 10L, revise);
     assertEquals(2L, replacement.revision());
     verify(scans).replaceRepositoryPolicy(eq(10L), eq(replacement.id()), any());
+  }
+
+  @Test
+  void deletesOnlyUnusedLatestPoliciesWithGlobalWritePermission() {
+    ScanPolicy policy = policy(10L, "unused", 4L);
+    when(scans.findPolicy(10L)).thenReturn(Optional.of(policy));
+    when(scans.deletePolicyIfUnused(10L)).thenReturn(SecurityScanDao.PolicyDeletion.DELETED);
+    assertEquals(policy, service.deletePolicy(actor, 10L));
+    for (var outcome : List.of(SecurityScanDao.PolicyDeletion.IN_USE,
+        SecurityScanDao.PolicyDeletion.STALE_REVISION)) {
+      when(scans.deletePolicyIfUnused(10L)).thenReturn(outcome);
+      assertStatus(HttpStatus.CONFLICT, () -> service.deletePolicy(actor, 10L));
+    }
+    when(scans.deletePolicyIfUnused(10L)).thenReturn(SecurityScanDao.PolicyDeletion.NOT_FOUND);
+    assertStatus(HttpStatus.NOT_FOUND, () -> service.deletePolicy(actor, 10L));
+    assertStatus(HttpStatus.NOT_FOUND, () -> service.deletePolicy(actor, 404L));
+    clearInvocations(scans);
+    when(security.decide(eq(actor.permissionSubject()), anyString()))
+        .thenReturn(AccessDecision.deny("read only"));
+    assertStatus(HttpStatus.FORBIDDEN, () -> service.deletePolicy(actor, 10L));
+    verifyNoInteractions(scans);
   }
 
   @Test

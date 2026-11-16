@@ -11,7 +11,19 @@
   </parent>
   <artifactId>kkrepo-server</artifactId>
   <name>kkrepo-server</name>
+  <properties>
+    <!-- The upstream latest tag currently points only to arm64; this release has both architectures. -->
+    <spring-boot.build-image.builder>paketobuildpacks/builder-noble-java-tiny:0.0.200</spring-boot.build-image.builder>
+  </properties>
   <dependencies>
+    <dependency>
+      <groupId>de.marhali</groupId>
+      <artifactId>json5-java</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>rds</artifactId>
+    </dependency>
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-web</artifactId>
@@ -92,6 +104,10 @@
     </dependency>
     <dependency>
       <groupId>com.github.klboke</groupId>
+      <artifactId>kkrepo-storage-azure</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.github.klboke</groupId>
       <artifactId>kkrepo-cache</artifactId>
     </dependency>
     <dependency>
@@ -101,6 +117,10 @@
     <dependency>
       <groupId>com.github.klboke</groupId>
       <artifactId>kkrepo-protocol-npm</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.github.klboke</groupId>
+      <artifactId>kkrepo-protocol-ohpm</artifactId>
     </dependency>
     <dependency>
       <groupId>com.github.klboke</groupId>
@@ -153,6 +173,10 @@
     <dependency>
       <groupId>com.github.klboke</groupId>
       <artifactId>kkrepo-protocol-huggingface</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.github.klboke</groupId>
+      <artifactId>kkrepo-protocol-gitlfs</artifactId>
     </dependency>
     <dependency>
       <groupId>com.github.klboke</groupId>
@@ -260,7 +284,7 @@
     <dependency>
       <groupId>com.unboundid</groupId>
       <artifactId>unboundid-ldapsdk</artifactId>
-      <version>7.0.5</version>
+      <version>7.0.6</version>
       <scope>test</scope>
     </dependency>
     <dependency>
@@ -282,6 +306,10 @@
         <configuration>
           <mainClass>com.github.klboke.kkrepo.server.KkRepoApplication</mainClass>
           <skip>false</skip>
+          <image>
+            <!-- Pin the multi-architecture index: the moving latest tag can resolve to ARM64 only. -->
+            <builder>paketobuildpacks/builder-noble-java-tiny:0.0.200@sha256:7c62dd7e66b277ec9fa2b60d0ad74c4e9ef15db7910dcdf51126e62a02a31463</builder>
+          </image>
         </configuration>
       </plugin>
       <plugin>
@@ -322,4 +350,31 @@
       </plugin>
     </plugins>
   </build>
+  <profiles>
+    <profile>
+      <id>native-ci-cache</id>
+      <activation>
+        <property>
+          <name>env.KKREPO_NATIVE_BUILD_CACHE</name>
+        </property>
+      </activation>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-maven-plugin</artifactId>
+            <configuration>
+              <image>
+                <buildCache>
+                  <bind>
+                    <source>${env.KKREPO_NATIVE_BUILD_CACHE}</source>
+                  </bind>
+                </buildCache>
+              </image>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>

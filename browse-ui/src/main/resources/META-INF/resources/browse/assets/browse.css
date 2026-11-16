@@ -880,6 +880,14 @@ h1 {
   gap: 12px;
 }
 
+.upload-help {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .upload-file,
 .upload-path,
 .upload-form label:first-child,
@@ -1508,9 +1516,10 @@ h1 {
   overflow: hidden;
 }
 
+/* Tree/detail widths are user-resizable via .split-handle; --tree-pane-width is set from JS. */
 .tree-left {
-  flex: 0 0 60%;
-  width: 60%;
+  flex: 0 0 var(--tree-pane-width, 60%);
+  width: var(--tree-pane-width, 60%);
   min-width: 0;
   min-height: 0;
   overflow: auto;
@@ -1520,9 +1529,41 @@ h1 {
 
 .tree-left .tree-root { padding: 0; }
 
+.split-handle {
+  position: relative;
+  flex: 0 0 6px;
+  margin: 0 -3px;
+  z-index: 1;
+  cursor: col-resize;
+  touch-action: none;
+  outline: none;
+}
+
+.split-handle::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  width: 2px;
+  background: transparent;
+  transition: background-color 0.12s;
+}
+
+.split-handle:hover::after,
+.split-handle:focus-visible::after,
+.browse-split.is-resizing .split-handle::after {
+  background: var(--brand, #16883b);
+}
+
+.browse-split.is-resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+
 .detail-right {
-  flex: 0 0 40%;
-  width: 40%;
+  flex: 1 1 0;
+  min-width: 0;
   padding: 16px 18px 32px 18px;
   background: #ffffff;
   overflow-x: hidden;
@@ -2904,3 +2945,10 @@ body {
     padding: 0 10px;
   }
 }
+
+/* The bounded preview extends the shared deletion dialog. */
+.kk-confirm-dialog.directory-delete-dialog { width: min(640px, calc(100vw - 32px)); }
+.directory-delete-dialog details { margin: 16px 0; }
+.directory-delete-dialog summary { cursor: pointer; color: var(--ink-2); }
+.directory-delete-paths { max-height: 220px; overflow: auto; padding-left: 24px; }
+.directory-delete-error { color: var(--danger); }

@@ -1,0 +1,418 @@
+"""Regression checks for coverage preservation, disk guards and image reuse."""
+
+import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import subprocess
+import tarfile
+import tempfile
+import threading
+import unittest
+
+SCRIPTS = Path(__file__).resolve().parent
+EXPECTED = "raw maven npm pypi go helm cargo pub composer nuget rubygems yum apt alpine r conda conan gitlfs terraform swift ansible docker-oci ohpm".split()
+
+
+def load(name):
+    spec = importlib.util.spec_from_file_location(name, SCRIPTS / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class OrchestrationTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.env = dict(os.environ, PATH=f"{self.root}:{os.environ['PATH']}",
+                        TEST_ROOT=str(self.root), ARTIFACT_DIR=str(self.root),
+                        SCRIPT_DIR=str(SCRIPTS), STAMP="20261002000000")
+
+    def stub(self, name, body):
+        path = self.root / name
+        path.write_text("#!/usr/bin/env bash\nset -eu\n" + body)
+        path.chmod(0o755)
+
+    def run_script(self, name, *args):
+        return subprocess.run(["bash", str(SCRIPTS / name), *args], env=self.env,
+                              text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def dispatch(self, shard, override="all"):
+        # Execute the production dispatcher with protocol/network operations
+        # replaced by markers. This catches lost cleanup calls and selectors.
+        source = (SCRIPTS / "run-client-e2e.sh").read_text()
+        dispatcher = source.split("run_selected_tests() {", 1)[1].split("\nneed curl", 1)[0]
+        prelude = "set -euo pipefail\n"
+        for name in EXPECTED:
+            function = "test_" + name.replace("-", "_")
+            prelude += f'{function}() {{ echo "test:{name}"; SWIFT_CLEANUP_FIXTURE_AVAILABLE=true; }}\n'
+        prelude += '''log() { :; }
+register_cleanup_fixture() { echo "register:$4"; }
+run_registered_cleanup() { echo cleanup; }
+'''
+        self.stub("dart", ":\n")
+        self.stub("conan", ":\n")
+        env = dict(self.env, CLIENT_E2E_SHARD=shard, CLIENT_E2E_TESTS=override,
+                   CONDA_HOSTED_REPOSITORY="conda-hosted", APT_HOSTED_REPOSITORY="apt-hosted",
+                   ALPINE_HOSTED_REPOSITORY="alpine-hosted", R_HOSTED_REPOSITORY="r-hosted",
+                   CONAN_HOSTED_REPOSITORY="conan-hosted", CONAN_BIN="conan", ANSIBLE_GALAXY_BINS="fixture")
+        return subprocess.run(["bash"], input=prelude + "run_selected_tests() {" + dispatcher + "\nrun_selected_tests\n",
+                              env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def test_controlled_galaxy_fixture_is_installable_and_reproducible(self):
+        fixture = load("prepare-ansible-upstream")
+        archive = fixture.collection_archive("kkrepo_ci", "upstream", "1.0.0")
+        self.assertEqual(archive, fixture.collection_archive("kkrepo_ci", "upstream", "1.0.0"))
+        self.assertGreaterEqual(len(archive), 1024)  # Nexus publication minimum.
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+            manifest = json.load(tar.extractfile("MANIFEST.json"))
+            inventory = tar.extractfile("FILES.json").read()
+            self.assertEqual(manifest["collection_info"]["version"], "1.0.0")
+            self.assertEqual(manifest["file_manifest_file"]["chksum_sha256"],
+                             hashlib.sha256(inventory).hexdigest())
+            for item in json.loads(inventory)["files"]:
+                if item["ftype"] == "file":
+                    self.assertEqual(item["chksum_sha256"],
+                                     hashlib.sha256(tar.extractfile(item["name"]).read()).hexdigest())
+        with self.assertRaises(ValueError):
+            fixture.collection_archive("../escape", "upstream", "1.0.0")
+
+    def test_original_suite_order_and_cleanup_are_preserved(self):
+        result = self.dispatch("all")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual([x[5:] for x in lines if x.startswith("test:")], EXPECTED)
+        self.assertEqual([x[9:] for x in lines if x.startswith("register:")], [x for x in EXPECTED if x not in ("gitlfs", "ohpm")])
+        self.assertEqual(lines.count("cleanup"), len(EXPECTED))
+
+    def test_shards_execute_every_original_protocol_and_cleanup_once(self):
+        collected = []
+        for shard in ("core", "system", "swift"):
+            result = self.dispatch(shard)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = result.stdout.splitlines()
+            protocols = [x[5:] for x in lines if x.startswith("test:")]
+            self.assertEqual([x[9:] for x in lines if x.startswith("register:")], [x for x in protocols if x not in ("gitlfs", "ohpm")])
+            self.assertEqual(lines.count("cleanup"), len(protocols))
+            collected.extend(protocols)
+        self.assertCountEqual(collected, EXPECTED)
+
+    def test_unknown_shard_fails_instead_of_silently_running_nothing(self):
+        result = self.dispatch("typo")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("test:", result.stdout)
+
+    def test_explicit_protocol_selection_still_works(self):
+        result = self.dispatch("core", "swift")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("test:swift", result.stdout)
+        self.assertNotIn("test:maven", result.stdout)
+
+    def ohpm_matrix(self, skipped):
+        class LoginHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(json.dumps({"enabled": self.path.startswith("/enabled/")}).encode())
+
+            def log_message(self, *_):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), LoginHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        project = self.root / "ohpm-project"
+        scripts = project / "scripts/ci"
+        scripts.mkdir(parents=True)
+        for name in ("ohpm-client-e2e.sh", "run-ohpm-compat.sh"):
+            (scripts / name).write_text((SCRIPTS / name).read_text())
+        self.stub("ohpm", "echo 5.0.2\n")
+        self.stub("mvn", '''python3 - <<'PY'
+import json, os, pathlib
+report = pathlib.Path("compat-test/target/surefire-reports")
+report.mkdir(parents=True, exist_ok=True)
+skipped = os.environ["OHPM_TEST_SKIPPED"] if os.environ["OHPM_COMPAT_LOGIN_ENABLED"] == "true" else "0"
+(report / "TEST-com.github.klboke.kkrepo.compat.OhpmRepositoryBlackBoxCompatibilityTest.xml").write_text(
+    f'<testsuite tests="9" failures="0" errors="0" skipped="{skipped}"/>')
+pathlib.Path(os.environ["OHPM_CLEANUP_REPORT"]).write_text(json.dumps({
+    "automaticCleanupRejected": True, "protocolDeletionVerified": True}))
+PY
+''')
+        base = f"http://127.0.0.1:{server.server_port}"
+        env = dict(self.env, KKREPO_COMPAT_BASE_URL=base + "/disabled",
+                   OHPM_LOGIN_BASE_URL=base + "/enabled", KKREPO_COMPAT_PASSWORD="test-fixture",
+                   OHPM_COMMAND="ohpm", OHPM_TEST_SKIPPED=str(skipped),
+                   CLIENT_E2E_ARTIFACT_DIR=str(self.root / "reports"))
+        result = subprocess.run(["bash", str(scripts / "ohpm-client-e2e.sh")],
+                                env=env, text=True, capture_output=True)
+        return result, self.root / "reports"
+
+    def test_ohpm_matrix_preserves_both_login_reports_and_cleanup_proof(self):
+        result, directory = self.ohpm_matrix(0)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = json.loads((directory / "cleanup-ohpm.json").read_text())
+        self.assertEqual(set(report["loginVariants"]), {"false", "true"})
+        for login in ("false", "true"):
+            self.assertTrue((directory / "ohpm" / f"login-{login}" / "acceptance.log").exists())
+            self.assertTrue(report["loginVariants"][login]["protocolDeletionVerified"])
+
+    def test_ohpm_matrix_rejects_skipped_login_variant_and_retains_diagnostics(self):
+        result, directory = self.ohpm_matrix(1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((directory / "cleanup-ohpm.json").exists())
+        self.assertIn("Every requested OHPM acceptance test", result.stdout)
+        self.assertTrue(list((directory / "ohpm/login-true").glob("TEST-*.xml")))
+
+    def disk_stubs(self, before, after, fallback=None):
+        self.env.update(DISK_BEFORE=str(before * 1024 * 1024), DISK_AFTER=str(after * 1024 * 1024),
+                        DISK_FALLBACK=str((after if fallback is None else fallback) * 1024 * 1024))
+        self.stub("df", '''available="$DISK_BEFORE"
+[[ ! -f "$TEST_ROOT/cleaned" ]] || available="$DISK_AFTER"
+[[ ! -f "$TEST_ROOT/dotnet-cleaned" ]] || available="$DISK_FALLBACK"
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted\\n'
+printf '/dev/test 150000000 1 %s 1%% /\\n' "$available"
+''')
+        self.stub("sudo", '''printf "%s\\n" "$*" >> "$TEST_ROOT/cleanup-commands"
+touch "$TEST_ROOT/cleaned"
+if [[ "$*" == "rm -rf /usr/share/dotnet" ]]; then
+  touch "$TEST_ROOT/dotnet-cleaned"
+fi
+''')
+        self.stub("docker", 'echo "must not prune docker" >&2\nexit 99\n')
+
+    def test_sufficient_disk_never_invokes_cleanup(self):
+        self.disk_stubs(80, 98)
+        result = self.run_script("prepare-e2e-disk.sh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / "cleanup-commands").exists())
+
+    def test_low_disk_cleans_only_preinstalled_tools(self):
+        self.disk_stubs(20, 38)
+        result = self.run_script("prepare-e2e-disk.sh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("/usr/local/lib/android", (self.root / "cleanup-commands").read_text())
+        self.assertNotIn("/usr/share/dotnet", (self.root / "cleanup-commands").read_text())
+
+    def test_small_runner_reclaims_host_dotnet_when_first_cleanup_is_insufficient(self):
+        self.disk_stubs(14, 29, 38)
+        result = self.run_script("prepare-e2e-disk.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.root / "cleanup-commands").read_text().splitlines(), [
+            "rm -rf /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/local/lib/android",
+            "apt-get clean",
+            "rm -rf /usr/share/dotnet",
+        ])
+
+    def test_fallback_respects_custom_disk_budget(self):
+        self.disk_stubs(14, 35, 45)
+        self.env["E2E_MIN_FREE_DISK_GIB"] = "40"
+        result = self.run_script("prepare-e2e-disk.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.root / "dotnet-cleaned").exists())
+
+    def test_insufficient_disk_after_cleanup_fails_early(self):
+        self.disk_stubs(5, 23, 29)
+        self.assertNotEqual(self.run_script("prepare-e2e-disk.sh").returncode, 0)
+        self.assertTrue((self.root / "dotnet-cleaned").exists())
+
+    def test_invalid_disk_budget_cannot_trigger_deletion(self):
+        self.disk_stubs(80, 98)
+        self.env["E2E_MIN_FREE_DISK_GIB"] = "0"
+        self.assertEqual(self.run_script("prepare-e2e-disk.sh").returncode, 2)
+        self.assertFalse((self.root / "cleanup-commands").exists())
+
+    def test_cached_image_must_match_expected_identity(self):
+        identity = "sha256:" + "a" * 64
+        (self.root / "image.id").write_text(identity)
+        (self.root / "image.tar").touch()
+        self.env["IMAGE_ID"] = identity
+        self.stub("docker", '''case "$1" in
+load) echo loaded ;;
+image) echo "$IMAGE_ID" ;;
+*) exit 99 ;;
+esac
+''')
+        self.assertEqual(self.run_script("swift-e2e-image-cache.sh", "load", "5.7", str(self.root)).returncode, 0)
+        self.env["IMAGE_ID"] = "sha256:" + "b" * 64
+        self.assertNotEqual(self.run_script("swift-e2e-image-cache.sh", "load", "5.7", str(self.root)).returncode, 0)
+
+    def test_sdk_image_identity_is_checked_before_execution(self):
+        (self.root / "image.id").write_text("sha256:" + "a" * 64)
+        (self.root / "image.tar").touch()
+        self.stub("docker", '''case "$1" in
+load) : ;;
+image) printf 'sha256:%064d\\n' 0 ;;
+run) touch "$TEST_ROOT/executed-unverified-image" ;;
+*) exit 99 ;;
+esac
+''')
+        result = self.run_script("client-e2e-image-cache.sh", "load", "core", str(self.root))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / "executed-unverified-image").exists())
+
+    def test_sdk_container_preserves_host_paths_and_test_environment(self):
+        project = self.root / "project with spaces"
+        script = project / "scripts/ci/run-client-e2e-container.sh"
+        script.parent.mkdir(parents=True)
+        script.write_text((SCRIPTS / script.name).read_text())
+        runner = self.root / "runner with spaces"
+        self.env.update(RUNNER_TEMP=str(runner), CLIENT_E2E_IMAGE="kkrepo/client-e2e:swift-v1",
+                        SWIFT_E2E_REQUIRE_5_7_5_9_6="true", SWIFT_E2E_BINS="fixture",
+                        LIVE_COMPAT_START_TIMEOUT_SECONDS="360",
+                        GITHUB_TOKEN="must-not-be-forwarded")
+        self.stub("stat", "printf '127\\n'\n")
+        self.stub("docker", '''if [[ "$1" == image ]]; then
+  printf 'sha256:%064d\\n' 0
+else
+  python3 - "$@" <<'PY'
+import json, os, pathlib, sys
+pathlib.Path(os.environ["TEST_ROOT"], "docker-args.json").write_text(json.dumps(sys.argv[1:]))
+PY
+fi
+''')
+        result = subprocess.run(["bash", str(script), "scripts/ci/run-live-compat.sh", "swift"],
+                                env=self.env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = json.loads((self.root / "docker-args.json").read_text())
+        self.assertIn(f"type=bind,source={project},target={project}", args)
+        self.assertIn(f"type=bind,source={runner},target={runner}", args)
+        self.assertIn("type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock", args)
+        self.assertIn("host", args)
+        self.assertIn("--user", args)
+        self.assertIn(f"{os.getuid()}:{os.getgid()}", args)
+        self.assertIn("--group-add", args)
+        self.assertEqual(args[args.index("--group-add") + 1], "127")
+        self.assertIn("LIVE_COMPAT_START_TIMEOUT_SECONDS", args)
+        self.assertIn("SWIFT_E2E_BINS", args)
+        self.assertIn("SWIFT_E2E_REQUIRE_5_7_5_9_6", args)
+        self.assertIn(f"CLIENT_E2E_WORK_DIR={runner}/client-e2e-runtime/work", args)
+        self.assertNotIn("GITHUB_TOKEN", args)
+        self.assertNotIn("must-not-be-forwarded", args)
+        self.assertNotIn("PATH", args)
+        self.assertEqual(args[-2:], ["scripts/ci/run-live-compat.sh", "swift"])
+
+    def test_coverage_gate_rejects_missing_protocols_and_failed_cleanup(self):
+        verifier = load("verify-client-e2e-coverage")
+        for runtime in ("jvm", "native"):
+            for database in ("mysql", "postgresql"):
+                for shard, tests in verifier.plan.SHARDS.items():
+                    directory = self.root / f"full-{runtime}-client-live-compat-{database}-{shard}-logs" / "client-e2e"
+                    directory.mkdir(parents=True)
+                    (directory / "protocol-durations.tsv").write_text("".join(f"{test}\t1\n" for test in tests))
+                    for test in tests:
+                        (directory / f"cleanup-{test}.json").write_text(json.dumps({"loginVariants": {
+                            login: {"automaticCleanupRejected": True, "protocolDeletionVerified": True}
+                            for login in ("false", "true")
+                        }} if test == "ohpm" else {"automaticCleanupRejected": True} if test == "gitlfs" else {
+                            "tryRun": {"run": {"state": "SUCCEEDED", "matchedSubjects": 1}},
+                            "executeRun": {"run": {"state": "SUCCEEDED", "deletedSubjects": 1, "failedSubjects": 0}},
+                        }))
+        self.assertIn("Verified 92", verifier.verify(self.root))
+        ohpm = self.root / "full-native-client-live-compat-postgresql-core-logs" / "client-e2e" / "cleanup-ohpm.json"
+        complete = ohpm.read_text()
+        for login in ("false", "true"):
+            for field in ("automaticCleanupRejected", "protocolDeletionVerified"):
+                report = json.loads(complete)
+                report["loginVariants"][login][field] = False
+                ohpm.write_text(json.dumps(report))
+                with self.assertRaises(ValueError):
+                    verifier.verify(self.root)
+            report = json.loads(complete)
+            del report["loginVariants"][login]
+            ohpm.write_text(json.dumps(report))
+            with self.assertRaises(ValueError):
+                verifier.verify(self.root)
+        ohpm.unlink()
+        with self.assertRaises(FileNotFoundError):
+            verifier.verify(self.root)
+        ohpm.write_text(complete)
+        lfs = self.root / "full-native-client-live-compat-postgresql-system-logs" / "client-e2e" / "cleanup-gitlfs.json"
+        lfs.write_text('{"automaticCleanupRejected": false}')
+        with self.assertRaises(ValueError):
+            verifier.verify(self.root)
+        lfs.write_text('{"automaticCleanupRejected": true}')
+        missing = self.root / "full-native-client-live-compat-postgresql-swift-logs" / "client-e2e" / "protocol-durations.tsv"
+        missing.write_text("")
+        with self.assertRaises(ValueError):
+            verifier.verify(self.root)
+        missing.write_text("swift\t1\n")
+        cleanup = missing.with_name("cleanup-swift.json")
+        record = json.loads(cleanup.read_text())
+        record["executeRun"]["run"]["failedSubjects"] = 1
+        cleanup.write_text(json.dumps(record))
+        with self.assertRaises(ValueError):
+            verifier.verify(self.root)
+
+    def public_https_run(self, suite, skipped=0, report=True):
+        project = self.root / "fixture-project"
+        scripts = project / "scripts" / "ci"
+        scripts.mkdir(parents=True)
+        for name in ("run-live-compat.sh", "check-public-https-report.py"):
+            (scripts / name).write_bytes((SCRIPTS / name).read_bytes())
+        compat_scripts = project / "compat-test" / "scripts"
+        compat_scripts.mkdir(parents=True)
+        (compat_scripts / "docker-catalog-auth.py").write_text(
+            "import json, os, sys\nfrom pathlib import Path\n"
+            "Path(os.environ['TEST_ROOT'], 'catalog-args').write_text(json.dumps(sys.argv[1:]))\n")
+        for client in ("go", "helm", "docker"):
+            self.stub(client, ":\n")
+        self.stub("mvn", """printf '%s\n' "$*|${COMPAT_WRITE_ENABLED:-unset}|${PUBLIC_HTTPS_COMPAT_REQUIRED:-unset}" >> "$TEST_ROOT/maven-args"
+if [[ "$*" == *'-Dtest=PublicHttpsContentRedirectCompatibilityTest'* ]]; then
+  mkdir -p compat-test/target/surefire-reports
+  if [[ "$FAKE_REPORT" == true ]]; then
+    printf '<testsuite tests="3" skipped="%s" failures="0" errors="0"/>' "$FAKE_SKIPPED" > compat-test/target/surefire-reports/TEST-com.github.klboke.kkrepo.compat.PublicHttpsContentRedirectCompatibilityTest.xml
+  fi
+fi
+""")
+        env = dict(self.env, FAKE_SKIPPED=str(skipped), FAKE_REPORT=str(report).lower(),
+                   COMPAT_WRITE_ENABLED="false")
+        return subprocess.run(["bash", str(scripts / "run-live-compat.sh"), suite], env=env,
+                              text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def test_public_https_acceptance_executes_three_cases_with_write_enabled(self):
+        result = self.public_https_run("public-https")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("three executed tests, zero skips", result.stdout)
+        args = (self.root / "maven-args").read_text()
+        self.assertIn("-Dtest=PublicHttpsContentRedirectCompatibilityTest", args)
+        self.assertIn("|true|true", args)
+
+    def test_public_https_acceptance_rejects_skipped_tests(self):
+        result = self.public_https_run("public-https", skipped=1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires three passing tests", result.stderr)
+
+    def test_public_https_acceptance_requires_a_fresh_report(self):
+        result = self.public_https_run("public-https", report=False)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_nexus_entry_point_includes_public_https_acceptance(self):
+        result = self.public_https_run("nexus")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = (self.root / "maven-args").read_text().splitlines()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("NpmRepositoryBlackBoxCompatibilityTest", calls[0])
+        self.assertIn("-Dtest=PublicHttpsContentRedirectCompatibilityTest", calls[1])
+        self.assertTrue(calls[1].endswith("|true|true"))
+        catalog_args = json.loads((self.root / "catalog-args").read_text())
+        self.assertEqual(catalog_args[::2], ["--nexus", "--kkrepo"])
+        self.assertTrue(all(value.startswith("http") for value in catalog_args[1::2]))
+
+    def test_full_entry_point_runs_public_https_once_without_default_skips(self):
+        result = self.public_https_run("full")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = (self.root / "maven-args").read_text().splitlines()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("-Dtest=*,!PublicHttpsContentRedirectCompatibilityTest", calls[0])
+        self.assertIn("-Dtest=PublicHttpsContentRedirectCompatibilityTest", calls[1])
+
+
+if __name__ == "__main__":
+    unittest.main()

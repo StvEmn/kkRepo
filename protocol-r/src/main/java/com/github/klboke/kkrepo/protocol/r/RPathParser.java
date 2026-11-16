@@ -1,10 +1,6 @@
 package com.github.klboke.kkrepo.protocol.r;
 
-import java.io.ByteArrayOutputStream;
-import java.nio.ByteBuffer;
-import java.nio.charset.CharacterCodingException;
-import java.nio.charset.CodingErrorAction;
-import java.nio.charset.StandardCharsets;
+import com.github.klboke.kkrepo.core.http.UriPathDecoder;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -14,6 +10,14 @@ public final class RPathParser {
   private static final Pattern PACKAGE_NAME = Pattern.compile("[A-Za-z][A-Za-z0-9.]+(?<!\\.)");
   private static final Pattern SOURCE_FILE = Pattern.compile(
       "([A-Za-z][A-Za-z0-9.]+(?<!\\.))_([0-9]+(?:[.-][0-9]+)+)\\.tar\\.gz");
+  private static final Pattern PACKAGE_FILE = Pattern.compile(
+      "([A-Za-z][A-Za-z0-9.]+(?<!\\.))_([0-9]+(?:[.-][0-9]+)+)(\\.tar\\.gz|\\.tgz|\\.zip)");
+  private static final Pattern WINDOWS_NAMESPACE = Pattern.compile(
+      "bin/windows/(?:[A-Za-z0-9_-]+/)?contrib/[0-9]+\\.[0-9]+");
+  private static final Pattern MACOS_NAMESPACE = Pattern.compile(
+      "bin/macosx/(?:[A-Za-z0-9_-]+/)?contrib/[0-9]+\\.[0-9]+");
+  private static final Pattern LINUX_NAMESPACE = Pattern.compile(
+      "bin/linux/[A-Za-z0-9_-]+/[0-9]+\\.[0-9]+/src/contrib");
   private static final Pattern SAFE_SEGMENT = Pattern.compile("[A-Za-z0-9][A-Za-z0-9+._@()~-]{0,254}");
 
   public RPath parse(String rawPath) {
@@ -37,7 +41,8 @@ public final class RPathParser {
     String filename = segments[segments.length - 1];
     String namespace = segments.length == 1
         ? "" : normalized.substring(0, normalized.length() - filename.length() - 1);
-    if (SOURCE_NAMESPACE.equals(namespace)) {
+    String extension = packageExtension(namespace);
+    if (extension != null) {
       if ("PACKAGES".equals(filename)) {
         return path(RPath.Kind.PACKAGES, raw, normalized, namespace, filename, null, null);
       }
@@ -47,10 +52,11 @@ public final class RPathParser {
       if ("PACKAGES.rds".equals(filename)) {
         return path(RPath.Kind.PACKAGES_RDS, raw, normalized, namespace, filename, null, null);
       }
-      Matcher source = SOURCE_FILE.matcher(filename);
-      if (source.matches() && RVersions.isValid(source.group(2))) {
+      Matcher source = PACKAGE_FILE.matcher(filename);
+      if (source.matches() && extension.equals(source.group(3)) && RVersions.isValid(source.group(2))) {
         return path(
-            RPath.Kind.SOURCE_PACKAGE, raw, normalized, namespace, filename,
+            SOURCE_NAMESPACE.equals(namespace) ? RPath.Kind.SOURCE_PACKAGE : RPath.Kind.BINARY_PACKAGE,
+            raw, normalized, namespace, filename,
             source.group(1), source.group(2));
       }
     }
@@ -74,8 +80,52 @@ public final class RPathParser {
     return path(RPath.Kind.STATIC, raw, normalized, namespace, filename, null, null);
   }
 
+  public RPath parseBrowseProjection(String rawPath) {
+    RPath browse = parse(rawPath);
+    if (browse.normalized() == null) return unknown(rawPath);
+    String[] segments = browse.normalized().split("/", -1);
+    if (segments.length < 3) return unknown(rawPath);
+    int coordinateOffset = segments.length - 3;
+    String namespace = coordinateOffset == 0 ? SOURCE_NAMESPACE
+        : String.join("/", java.util.Arrays.copyOf(segments, coordinateOffset));
+    RPath candidate = parse(namespace + "/" + segments[coordinateOffset + 2]);
+    if (!candidate.hostedPackage()
+        || !segments[coordinateOffset].equals(candidate.packageName())
+        || !segments[coordinateOffset + 1].equals(candidate.version())) {
+      return unknown(rawPath);
+    }
+    return candidate;
+  }
+
   public static boolean validPackageName(String value) {
     return value != null && value.length() <= 255 && PACKAGE_NAME.matcher(value).matches();
+  }
+
+  public static String packageExtension(String namespace) {
+    if (SOURCE_NAMESPACE.equals(namespace)) return ".tar.gz";
+    if (namespace == null) return null;
+    if (WINDOWS_NAMESPACE.matcher(namespace).matches()) {
+      return ".zip";
+    }
+    if (MACOS_NAMESPACE.matcher(namespace).matches()) {
+      return ".tgz";
+    }
+    if (LINUX_NAMESPACE.matcher(namespace).matches()) {
+      return ".tar.gz";
+    }
+    return null;
+  }
+
+  public static String packageType(String namespace) {
+    if (packageExtension(namespace) == null) throw new IllegalArgumentException("Invalid R namespace");
+    return SOURCE_NAMESPACE.equals(namespace) ? "source" : "binary";
+  }
+
+  public static String packageFilename(String namespace, String packageName, String version) {
+    String source = sourceFilename(packageName, version);
+    String extension = packageExtension(namespace);
+    if (extension == null) throw new IllegalArgumentException("Invalid R namespace");
+    return source.substring(0, source.length() - ".tar.gz".length()) + extension;
   }
 
   public static String sourceFilename(String packageName, String version) {
@@ -113,31 +163,11 @@ public final class RPathParser {
         || raw.chars().anyMatch(value -> value == 0 || value < 0x20 || value == 0x7f)) {
       throw new IllegalArgumentException("Unsafe R repository path");
     }
-    byte[] source = raw.getBytes(StandardCharsets.UTF_8);
-    ByteArrayOutputStream decoded = new ByteArrayOutputStream(source.length);
-    for (int index = 0; index < source.length; index++) {
-      int value = source[index] & 0xff;
-      if (value != '%') {
-        decoded.write(value);
-        continue;
-      }
-      if (index + 2 >= source.length) throw new IllegalArgumentException("Incomplete encoding");
-      int high = Character.digit((char) source[++index], 16);
-      int low = Character.digit((char) source[++index], 16);
-      if (high < 0 || low < 0) throw new IllegalArgumentException("Invalid encoding");
-      int octet = (high << 4) | low;
-      if (octet == '/' || octet == '\\' || octet == '%' || octet == 0 || octet < 0x20) {
-        throw new IllegalArgumentException("Encoded separator or control");
-      }
-      decoded.write(octet);
+    String decoded = UriPathDecoder.decodePath(raw);
+    if (decoded.indexOf('%') >= 0) {
+      throw new IllegalArgumentException("Encoded percent sign is not allowed in this protocol path");
     }
-    try {
-      return StandardCharsets.UTF_8.newDecoder()
-          .onMalformedInput(CodingErrorAction.REPORT)
-          .onUnmappableCharacter(CodingErrorAction.REPORT)
-          .decode(ByteBuffer.wrap(decoded.toByteArray())).toString();
-    } catch (CharacterCodingException error) {
-      throw new IllegalArgumentException("Invalid UTF-8", error);
-    }
+    return decoded;
   }
+
 }

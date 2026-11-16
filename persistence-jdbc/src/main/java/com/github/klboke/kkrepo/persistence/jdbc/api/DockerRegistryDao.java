@@ -117,6 +117,18 @@ public interface DockerRegistryDao {
         .toList();
   }
 
+  default List<ComponentDao.ComponentSearchRow> searchTagsByRepositoryIds(
+      List<Long> repositoryIds, String keyword, ComponentDao.ComponentSearchCursor after, int limit) {
+    return searchTagsByRepositoryIds(repositoryIds, keyword, after, limit, Map.of());
+  }
+
+  /** Search live tags directly, including images pushed before search support was enabled. */
+  default List<ComponentDao.ComponentSearchRow> searchTagsByRepositoryIds(
+      List<Long> repositoryIds, String keyword, ComponentDao.ComponentSearchCursor after, int limit,
+      Map<Long, AssetPathFilter> imageFilters) {
+    return List.of();
+  }
+
   List<String> listCatalog(long repositoryId, String last, int limit);
 
   List<BrowseImageRow> listBrowseImages(long repositoryId, String parentPath);
@@ -125,6 +137,15 @@ public interface DockerRegistryDao {
 
   Optional<DockerManifestRecord> findBrowseManifestByReferencePath(
       long repositoryId, String path);
+
+  /** Lock an empty Docker registry against concurrent manifest insertion on all replicas. */
+  boolean lockEmptyRepositoryForMigrationCleanup(long repositoryId);
+
+  /** Caller holds the empty-repository lock; returned rows are locked, busy rows are skipped. */
+  List<Long> lockMigratedManifestAssetsForCleanup(long repositoryId, int limit);
+
+  /** Caller holds the empty-repository lock; only empty, migrated Docker components are eligible. */
+  List<Long> lockEmptyMigratedComponentsForCleanup(long repositoryId, int limit);
 
   record DeletedManifest(int deleted, Long assetId, Long assetBlobId) {
     public static DeletedManifest notFound() {

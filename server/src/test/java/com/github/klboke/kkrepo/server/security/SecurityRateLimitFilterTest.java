@@ -8,10 +8,68 @@ import com.github.klboke.kkrepo.server.support.InMemorySharedCache;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import jakarta.servlet.FilterChain;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
 
 class SecurityRateLimitFilterTest {
+  @Test
+  void spoofedPrefixesCannotResetTheClientRateLimit() throws Exception {
+    SecurityRateLimitFilter filter = filter(
+        1, 1, new InMemorySharedCache(), new ForwardedHeaderPolicy("127.0.0.1"),
+        new SimpleMeterRegistry(), false);
+    CountingChain chain = new CountingChain();
+    MockHttpServletRequest first = request("POST", "/internal/security/login", "127.0.0.1");
+    first.addHeader("X-Forwarded-For", "198.51.100.1, 203.0.113.45");
+    MockHttpServletRequest second = request("POST", "/internal/security/login", "127.0.0.1");
+    second.addHeader("X-Forwarded-For", "198.51.100.2, 203.0.113.45");
+    assertEquals(200, invoke(filter, first, chain).getStatus());
+    assertEquals(429, invoke(filter, second, chain).getStatus());
+    assertEquals(1, chain.calls);
+  }
+
+
+  @ParameterizedTest
+  @ValueSource(strings = {
+      "/%69nternal/security/login",
+      "/internal/security;%78/login",
+      "/internal/security/%6Cogin;x"
+  })
+  void equivalentLoginRoutesShareTheRateLimit(String path) throws Exception {
+    SecurityRateLimitFilter filter = filter(
+        1, 1, new InMemorySharedCache(), new ForwardedHeaderPolicy(""), new SimpleMeterRegistry(), false);
+    CountingChain chain = new CountingChain();
+    assertEquals(200, invoke(filter,
+        request("POST", "/internal/security/login", "198.51.100.55"), chain).getStatus());
+    assertEquals(429, invoke(filter, request("POST", path, "198.51.100.55"), chain).getStatus());
+    assertEquals(1, chain.calls);
+  }
+
+  @ParameterizedTest
+  @CsvSource({
+      "10.0.0.0/16, 10.0.12.34, 10.0.200.99",
+      "2001:db8::/32, 2001:db8::1, 2001:db8:1234::2"
+  })
+  void rotatingTrustedProxiesPreservePerClientRateLimits(String trustedProxies, String firstProxy, String secondProxy)
+      throws Exception {
+    SecurityRateLimitFilter filter = filter(
+        1, 1, new InMemorySharedCache(), new ForwardedHeaderPolicy(trustedProxies),
+        new SimpleMeterRegistry(), false);
+    CountingChain chain = new CountingChain();
+    MockHttpServletRequest first = request("POST", "/internal/security/login", firstProxy);
+    first.addHeader("X-Forwarded-For", "203.0.113.9");
+    MockHttpServletRequest second = request("POST", "/internal/security/login", secondProxy);
+    second.addHeader("X-Forwarded-For", "203.0.113.9");
+    MockHttpServletRequest anotherClient = request("POST", "/internal/security/login", secondProxy);
+    anotherClient.addHeader("X-Forwarded-For", "203.0.113.10");
+
+    assertEquals(200, invoke(filter, first, chain).getStatus());
+    assertEquals(429, invoke(filter, second, chain).getStatus());
+    assertEquals(200, invoke(filter, anotherClient, chain).getStatus());
+    assertEquals(2, chain.calls);
+  }
 
   @Test
   void repeatedLoginIsBlockedWithRetryHeaderAndMetric() throws Exception {
@@ -57,7 +115,7 @@ class SecurityRateLimitFilterTest {
   void managementAuthRequiresPresentedCredentialsAndUsesTrustedForwardedAddress() throws Exception {
     InMemorySharedCache cache = new InMemorySharedCache();
     SecurityRateLimitFilter filter = filter(
-        1, 1, cache, new ForwardedHeaderPolicy("127.0.0.1"),
+        1, 1, cache, new ForwardedHeaderPolicy("127.0.0.1,10.0.0.1"),
         new SimpleMeterRegistry(), false);
     CountingChain chain = new CountingChain();
     MockHttpServletRequest first = request(
@@ -78,10 +136,11 @@ class SecurityRateLimitFilterTest {
     assertEquals(2, chain.calls);
   }
 
-  @Test
-  void untrustedForwardedHeaderDoesNotMergeDifferentRemoteClients() throws Exception {
+  @ParameterizedTest
+  @ValueSource(strings = {"127.0.0.1", "10.0.0.0/16", "2001:db8::/32"})
+  void untrustedForwardedHeaderDoesNotMergeDifferentRemoteClients(String trustedProxies) throws Exception {
     SecurityRateLimitFilter filter = filter(
-        1, 1, new InMemorySharedCache(), new ForwardedHeaderPolicy("127.0.0.1"),
+        1, 1, new InMemorySharedCache(), new ForwardedHeaderPolicy(trustedProxies),
         new SimpleMeterRegistry(), false);
     CountingChain chain = new CountingChain();
     MockHttpServletRequest first = request("POST", "/internal/security/login", "198.51.100.30");

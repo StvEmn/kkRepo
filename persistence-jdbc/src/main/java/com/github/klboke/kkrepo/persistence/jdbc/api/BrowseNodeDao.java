@@ -2,6 +2,7 @@ package com.github.klboke.kkrepo.persistence.jdbc.api;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 public interface BrowseNodeDao {
@@ -19,6 +20,23 @@ public interface BrowseNodeDao {
   default Optional<BrowseChild> findNode(long repositoryId, String path) {
     return Optional.empty();
   }
+
+  /**
+   * Returns the repository-browser projection path for each requested asset.
+   *
+   * <p>Some formats store blobs under protocol paths that differ from the hierarchy exposed by
+   * the Repository Browser, so callers must not infer this value from {@code asset.path}.
+   */
+  default Map<Long, String> findPathsByAssetIds(List<Long> assetIds) {
+    return Map.of();
+  }
+
+  /** Indexed, bounded children for an administrative deletion preview. No repository-wide scan. */
+  default List<DeletionNode> listDeletionChildren(long repositoryId, List<Long> parentIds, int limit) {
+    throw new UnsupportedOperationException("Bounded Browse deletion listing is unavailable");
+  }
+
+  record DeletionNode(long id, String path, Long assetId) {}
 
   record BrowseChild(
       long id,

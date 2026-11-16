@@ -19,6 +19,9 @@ public final class RepositoryRecipes {
       new RepositoryRecipe("npm-hosted", RepositoryFormat.NPM, RepositoryType.HOSTED),
       new RepositoryRecipe("npm-proxy", RepositoryFormat.NPM, RepositoryType.PROXY),
       new RepositoryRecipe("npm-group", RepositoryFormat.NPM, RepositoryType.GROUP),
+      new RepositoryRecipe("ohpm-hosted", RepositoryFormat.OHPM, RepositoryType.HOSTED),
+      new RepositoryRecipe("ohpm-proxy", RepositoryFormat.OHPM, RepositoryType.PROXY),
+      new RepositoryRecipe("ohpm-group", RepositoryFormat.OHPM, RepositoryType.GROUP),
       new RepositoryRecipe("pypi-hosted", RepositoryFormat.PYPI, RepositoryType.HOSTED),
       new RepositoryRecipe("pypi-proxy", RepositoryFormat.PYPI, RepositoryType.PROXY),
       new RepositoryRecipe("pypi-group", RepositoryFormat.PYPI, RepositoryType.GROUP),
@@ -73,6 +76,7 @@ public final class RepositoryRecipes {
       new RepositoryRecipe("r-proxy", RepositoryFormat.R, RepositoryType.PROXY),
       new RepositoryRecipe("r-group", RepositoryFormat.R, RepositoryType.GROUP),
       new RepositoryRecipe("huggingface-proxy", RepositoryFormat.HUGGINGFACE, RepositoryType.PROXY),
+      new RepositoryRecipe("gitlfs-hosted", RepositoryFormat.GITLFS, RepositoryType.HOSTED),
       new RepositoryRecipe("raw-hosted", RepositoryFormat.RAW, RepositoryType.HOSTED),
       new RepositoryRecipe("raw-proxy", RepositoryFormat.RAW, RepositoryType.PROXY),
       new RepositoryRecipe("raw-group", RepositoryFormat.RAW, RepositoryType.GROUP));

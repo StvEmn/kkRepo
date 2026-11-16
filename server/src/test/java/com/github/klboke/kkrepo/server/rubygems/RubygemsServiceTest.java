@@ -40,6 +40,12 @@ import org.junit.jupiter.api.Test;
 
 class RubygemsServiceTest {
   @Test
+  void dependencyQueryValuesAreFormDecodedExactlyOnce() {
+    assertEquals(java.util.Set.of("a+b", "%61bc", "a b"),
+        RubygemsService.requestedGemNames("api/v1/dependencies?gems=a%2Bb,%2561bc,a+b"));
+  }
+
+  @Test
   void parsesGemMetadataYaml() {
     RubygemsService.GemMetadata metadata = RubygemsService.parseMetadataYaml("""
         --- !ruby/object:Gem::Specification
@@ -68,6 +74,99 @@ class RubygemsServiceTest {
     assertEquals(List.of("alice", "bob"), metadata.authors());
     assertEquals("rack", metadata.dependencies().getFirst().name());
     assertEquals(List.of(">= 2.0.0"), metadata.dependencies().getFirst().requirements());
+  }
+
+  @Test
+  void preservesFinalDependencyInRealGemMetadata() throws Exception {
+    try (InputStream fixture = getClass().getResourceAsStream("/rubygems/dependency-requirements.gem")) {
+      Path gem = Files.createTempFile("rubygems-dependencies-", ".gem");
+      try {
+        Files.copy(fixture, gem, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        RubygemsService.GemMetadata metadata = RubygemsService.readGemMetadata(gem);
+        assertEquals("kk-dep-probe", metadata.name());
+        assertEquals("0.1.0", metadata.version());
+        assertEquals(List.of(
+            new RubygemsService.GemDependency("rake", List.of("~> 13.0")),
+            new RubygemsService.GemDependency("json", List.of("~> 2.6"))), metadata.dependencies());
+      } finally {
+        Files.deleteIfExists(gem);
+      }
+    }
+  }
+
+  @Test
+  void rootRequirementsAndFieldsCannotOverwriteTheOnlyDependency() {
+    RubygemsService.GemMetadata metadata = RubygemsService.parseMetadataYaml("""
+        --- !ruby/object:Gem::Specification
+        name: single-dependency
+        version: !ruby/object:Gem::Version
+          version: 1.0.0
+        dependencies:
+        - !ruby/object:Gem::Dependency
+          name: rack
+          requirement: !ruby/object:Gem::Requirement
+            requirements:
+            - - ">="
+              - !ruby/object:Gem::Version
+                version: 2.0
+            - - "<"
+              - !ruby/object:Gem::Version
+                version: 3.0
+        required_ruby_version: !ruby/object:Gem::Requirement
+          requirements:
+          - - ">="
+            - !ruby/object:Gem::Version
+              version: 2.7
+        required_rubygems_version: !ruby/object:Gem::Requirement
+          requirements:
+          - - ">="
+            - !ruby/object:Gem::Version
+              version: 0
+        requirements: []
+        summary: Final summary
+        authors:
+        - Final author
+        """);
+    assertEquals(List.of(new RubygemsService.GemDependency("rack", List.of(">= 2.0", "< 3.0"))),
+        metadata.dependencies());
+    assertEquals("Final summary", metadata.summary());
+    assertEquals(List.of("Final author"), metadata.authors());
+  }
+
+  @Test
+  void multilineDescriptionCannotChangeRootFieldsAfterDependencies() {
+    RubygemsService.GemMetadata metadata = RubygemsService.parseMetadataYaml("""
+        --- !ruby/object:Gem::Specification
+        name: real-package
+        platform: ruby
+        summary: Real summary
+        authors:
+        - Real author
+        dependencies:
+        - !ruby/object:Gem::Dependency
+          name: rack
+          requirement: !ruby/object:Gem::Requirement
+            requirements:
+            - - "~>"
+              - !ruby/object:Gem::Version
+                version: 2.0
+        description: |-
+          name: fake-package
+          platform: java
+          summary: Fake summary
+          authors:
+          - Fake author
+          version: !ruby/object:Gem::Version
+            version: 9.9.9
+        version: !ruby/object:Gem::Version
+          version: 1.2.3
+        """);
+    assertEquals("real-package", metadata.name());
+    assertEquals("1.2.3", metadata.version());
+    assertEquals("ruby", metadata.platform());
+    assertEquals("Real summary", metadata.summary());
+    assertEquals(List.of("Real author"), metadata.authors());
+    assertEquals(List.of(new RubygemsService.GemDependency("rack", List.of("~> 2.0"))), metadata.dependencies());
   }
 
   @Test
@@ -209,7 +308,9 @@ class RubygemsServiceTest {
 
   @Test
   void quickMarshalGemspecHasStablePayloadShape() throws Exception {
-    RubygemsService service = new RubygemsService(null, null, null, new FakeAssetDao(List.of()));
+    RubygemsService service = new RubygemsService(null, null, null, new FakeAssetDao(List.of(
+        gemAsset(1L, "gems/demo-1.2.0.gem",
+            new RubygemsService.GemMetadata("demo", "1.2.0", "ruby", List.of())))));
 
     byte[] deflated = bytes(service.get(hosted(), "quick/Marshal.4.8/demo-1.2.0.gemspec.rz", false));
     byte[] inflated = inflate(deflated);
@@ -226,6 +327,57 @@ class RubygemsServiceTest {
     assertTrue(payload.contains("1.2.0"));
     assertEquals(deflated.length,
         service.get(hosted(), "quick/Marshal.4.8/demo-1.2.0.gemspec.rz", true).contentLength());
+  }
+
+  @Test
+  void coldGroupQuickSpecResolvesProxyBeforeAnyGemDownload() throws Exception {
+    RawProxyService proxy = org.mockito.Mockito.mock(RawProxyService.class);
+    String path = "quick/Marshal.4.8/demo-1.2.0.gemspec.rz";
+    byte[] expected = "upstream quick spec".getBytes(StandardCharsets.UTF_8);
+    RepositoryRuntime remote = proxy();
+    org.mockito.Mockito.when(proxy.getAssetFromUrl(remote, path,
+        "https://rubygems.org/" + path, false)).thenReturn(MavenResponse.ok(new ByteArrayInputStream(expected), expected.length,
+            "application/octet-stream", null, null));
+    org.mockito.Mockito.when(proxy.getAssetFromUrl(remote, path,
+        "https://rubygems.org/" + path, true)).thenReturn(MavenResponse.noBody(200, expected.length, "application/octet-stream", null, null));
+    // A stale hosted quick spec must not shadow the proxy after its gem was deleted.
+    RubygemsService service = new RubygemsService(new FakeRawHostedService(200), proxy,
+        null, new FakeAssetDao(List.of()));
+    RepositoryRuntime nested = runtime(3L, RepositoryType.GROUP, null, List.of(hosted(), remote));
+    RepositoryRuntime group = runtime(4L, RepositoryType.GROUP, null, List.of(nested));
+    MavenResponse response = service.get(group, path, false);
+    assertEquals(200, response.status());
+    org.junit.jupiter.api.Assertions.assertArrayEquals(expected, bytes(response));
+    MavenResponse head = service.get(group, path, true);
+    assertEquals(200, head.status());
+    assertEquals(expected.length, head.contentLength());
+    org.mockito.Mockito.verify(proxy).getAssetFromUrl(remote, path, "https://rubygems.org/" + path, false);
+    org.mockito.Mockito.verify(proxy).getAssetFromUrl(remote, path, "https://rubygems.org/" + path, true);
+    org.mockito.Mockito.verifyNoMoreInteractions(proxy);
+  }
+
+  @Test
+  void deletedPackageDoesNotServeOrRegenerateCachedGemspec() {
+    FakeRawHostedService hosted = new FakeRawHostedService(200);
+    RubygemsService service = new RubygemsService(hosted, null, null, new FakeAssetDao(List.of()));
+    assertEquals(404, service.get(hosted(), "quick/Marshal.4.8/demo-1.2.0.gemspec.rz", false).status());
+    assertEquals(404, service.get(hosted(), "quick/Marshal.4.8/demo-1.2.0.gemspec.rz", true).status());
+    assertTrue(hosted.generatedPaths.isEmpty());
+  }
+
+  @Test
+  void administrativeDeleteRefreshesRemainingVersionsAndRemovesDeletedGemspec() {
+    FakeRawHostedService hosted = new FakeRawHostedService(204);
+    RecordingIndexRebuildDao rebuild = new RecordingIndexRebuildDao();
+    RubygemsService service = new RubygemsService(hosted, null, null, new FakeAssetDao(List.of(
+        gemAsset(2L, "gems/demo-2.0.0.gem",
+            new RubygemsService.GemMetadata("demo", "2.0.0", "ruby", List.of())))), rebuild);
+    service.refreshMetadataAfterAdministrativeDelete(hosted(), "gems/demo-1.2.0.gem");
+    assertTrue(hosted.deletedPaths.contains("quick/Marshal.4.8/demo-1.2.0.gemspec.rz"));
+    String info = new String(hosted.generatedBytes, StandardCharsets.UTF_8);
+    assertTrue(info.contains("2.0.0"));
+    assertFalse(info.contains("1.2.0"));
+    service.refreshMetadataAfterAdministrativeDelete(hosted(), "versions");
   }
 
   @Test
@@ -332,7 +484,7 @@ class RubygemsServiceTest {
   }
 
   @Test
-  void dependencyApiUsesBundlerDependencyConstraintShape() throws Exception {
+  void dependencyApiUsesBundlerDependencyTuples() throws Exception {
     RubygemsService service = new RubygemsService(null, null, null, new FakeAssetDao(List.of(
         gemAsset(1L, "gems/demo-1.2.0.gem",
             new RubygemsService.GemMetadata("demo", "1.2.0", "ruby",
@@ -345,7 +497,7 @@ class RubygemsServiceTest {
     assertEquals(8, marshal[1]);
     assertTrue(payload.contains("rack"));
     assertTrue(payload.contains(">= 2.0.0, < 3.0.0"));
-    assertDependencyApiUsesRequirementMap(marshal, "rack");
+    assertDependencyApiUsesRequirementTuple(marshal, "rack");
   }
 
   @Test
@@ -428,13 +580,17 @@ class RubygemsServiceTest {
     return count;
   }
 
-  private static void assertDependencyApiUsesRequirementMap(byte[] marshal, String dependencyName) {
+  private static void assertDependencyApiUsesRequirementTuple(byte[] marshal, String dependencyName) {
     byte[] needle = dependencyName.getBytes(StandardCharsets.ISO_8859_1);
     int index = indexOf(marshal, needle);
     assertTrue(index >= 0, "dependency name not found in marshal payload");
     int afterName = index + needle.length;
+    assertEquals('"', marshal[index - 2], "dependency name must be a Ruby string, not a symbol");
+    assertEquals('I', marshal[index - 3], "dependency name must retain its string encoding");
+    assertEquals(7, marshal[index - 4], "each dependency tuple must have two elements");
+    assertEquals('[', marshal[index - 5], "dependencies must be array tuples, not a symbol-keyed map");
     assertTrue(index > 0 && marshal[index - 1] == dependencyName.length() + 5,
-        "dependency name should be encoded as a Ruby string key");
+        "dependency name length should match");
     while (afterName < marshal.length && marshal[afterName] != 'I') {
       afterName++;
     }

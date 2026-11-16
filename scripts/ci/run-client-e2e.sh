@@ -663,13 +663,18 @@ capture_rubygems_metadata() {
   local specs="$ARTIFACT_DIR/rubygems-specs.4.8.gz"
   local quick="$ARTIFACT_DIR/rubygems-quick-spec.rz"
   local gem="$ARTIFACT_DIR/rubygems-package.gem"
-  run_logged_output rubygems-dependencies "$dependencies" \
-    curl -m 10 -fsS -u "$KKREPO_AUTH" \
+  local dependency_status="$ARTIFACT_DIR/rubygems-dependencies-status"
+  run_logged_output rubygems-dependencies-status "$dependency_status" \
+    curl -m 60 -sS -o "$dependencies" -w '%{http_code}' -u "$KKREPO_AUTH" \
     "$KKREPO_URL/repository/rubygems-group/api/v1/dependencies?gems=$name"
-  run_logged rubygems-dependencies-decode ruby -e \
-    'p Marshal.load(File.binread(ARGV.fetch(0)))' "$dependencies"
+  case "$(cat "$dependency_status")" in
+    200) run_logged rubygems-dependencies-decode ruby -e \
+      'p Marshal.load(File.binread(ARGV.fetch(0)))' "$dependencies" ;;
+    404) echo '[client-e2e] RubyGems member has no optional dependency API; clients use compact or legacy indexes' ;;
+    *) echo '[client-e2e] Unexpected RubyGems dependency API status' >&2; return 1 ;;
+  esac
   run_logged_output rubygems-specs "$specs" \
-    curl -m 10 -fsS -u "$KKREPO_AUTH" \
+    curl -m 120 -fsS -u "$KKREPO_AUTH" \
     "$KKREPO_URL/repository/rubygems-group/specs.4.8.gz"
   run_logged rubygems-specs-decode ruby -rzlib -e \
     'p Marshal.load(Zlib.gunzip(File.binread(ARGV.fetch(0)))).select { |row| row[0].to_s == ARGV.fetch(1) }' "$specs" "$name"
@@ -748,6 +753,13 @@ EOF
   wait_for_body_contains maven-metadata "$version" \
     "$KKREPO_URL/repository/maven-public/com/github/klboke/kkrepo/e2e/$artifact/maven-metadata.xml" \
     "$ARTIFACT_DIR/maven-metadata.xml"
+  # Exercise snapshot build cleanup against the actual candidate (including Native),
+  # using the same disposable Nexus task comparison as the compatibility suite.
+  run_logged maven-snapshot-cleanup env MAVEN_SNAPSHOT_CLEANUP_COMPAT_ENABLED=true \
+    KKREPO_COMPAT_BASE_URL="$KKREPO_URL" KKREPO_COMPAT_USERNAME="$KKREPO_USER" \
+    KKREPO_COMPAT_PASSWORD="$KKREPO_PASSWORD" \
+    mvn -B -ntp -f "$PROJECT_ROOT/pom.xml" -pl compat-test -am \
+    -Dtest=MavenSnapshotCleanupCompatibilityTest -Dsurefire.failIfNoSpecifiedTests=false test
 }
 
 test_npm() {
@@ -841,7 +853,8 @@ test_go() {
   need go
   need zip
   local dir="$WORK_DIR/go"
-  local module="kkrepo-client-e2e.local/module-$STAMP"
+  local module="kkrepo-client-e2e.local/Module-$STAMP"
+  local escaped_module="kkrepo-client-e2e.local/!module-$STAMP"
   local version="v1.0.0"
   local hosted_root="$dir/hosted/$module@$version"
   mkdir -p "$hosted_root"
@@ -876,9 +889,9 @@ EOF
     GOMODCACHE="$dir/private/gomodcache" \
     GOCACHE="$dir/private/gocache" \
     go mod download -json "$module@$version"
-  test -f "$dir/private/gomodcache/cache/download/$module/@v/$version.info"
-  test -f "$dir/private/gomodcache/cache/download/$module/@v/$version.mod"
-  test -f "$dir/private/gomodcache/cache/download/$module/@v/$version.zip"
+  test -f "$dir/private/gomodcache/cache/download/$escaped_module/@v/$version.info"
+  test -f "$dir/private/gomodcache/cache/download/$escaped_module/@v/$version.mod"
+  test -f "$dir/private/gomodcache/cache/download/$escaped_module/@v/$version.zip"
 
   mkdir -p "$dir/public"
   cat >"$dir/public/go.mod" <<'EOF'
@@ -900,6 +913,17 @@ EOF
   test -f "$dir/public/gomodcache/cache/download/rsc.io/quote/@v/v1.5.2.info"
   test -f "$dir/public/gomodcache/cache/download/rsc.io/quote/@v/v1.5.2.mod"
   test -f "$dir/public/gomodcache/cache/download/rsc.io/quote/@v/v1.5.2.zip"
+
+  # The Go client sends ! as %21 for uppercase module identities (issue #299).
+  for recipe in go-proxy go-group; do
+    run_logged "go-uppercase-$recipe" env \
+      GOPROXY="$KKREPO_URL/repository/$recipe/" GOSUMDB=off \
+      GOMODCACHE="$dir/uppercase-$recipe/gomodcache" GOCACHE="$dir/uppercase-$recipe/gocache" \
+      go mod download -json github.com/BurntSushi/toml@v1.4.0
+    for ext in info mod zip; do
+      test -f "$dir/uppercase-$recipe/gomodcache/cache/download/github.com/!burnt!sushi/toml/@v/v1.4.0.$ext"
+    done
+  done
 }
 
 test_helm() {
@@ -1316,6 +1340,13 @@ EOF
 
 test_nuget() {
   need dotnet
+  run_logged nuget-ntlm-upstream env KKREPO_COMPAT_AUTH="$KKREPO_AUTH" \
+    python3 "$PROJECT_ROOT/compat-test/scripts/ntlm-upstream.py" \
+    --kkrepo "$KKREPO_URL" --dotnet --encoded-registration \
+    --upstream-host "${NUGET_NTLM_UPSTREAM_HOST:-host.docker.internal}"
+  run_logged nuget-group-registration-upstream env KKREPO_COMPAT_AUTH="$KKREPO_AUTH" \
+    python3 "$PROJECT_ROOT/compat-test/scripts/nuget-group-registration-upstream.py" \
+    --kkrepo "$KKREPO_URL" --upstream-host "${NUGET_NTLM_UPSTREAM_HOST:-host.docker.internal}"
   local dir="$WORK_DIR/nuget"
   local restore_dir="$WORK_DIR/nuget-restore"
   local packages_dir="$WORK_DIR/nuget-packages"
@@ -1341,6 +1372,23 @@ test_nuget() {
     --configfile "$restore_dir/NuGet.Config" \
     --packages "$packages_dir"
   test -f "$packages_dir/$(printf '%s' "$package" | tr '[:upper:]' '[:lower:]')/1.0.0/$(printf '%s' "$package" | tr '[:upper:]' '[:lower:]').1.0.0.nupkg"
+  # Restore alone does not exercise SearchQueryService (Visual Studio Browse/search).
+  local repository
+  for repository in nuget-proxy nuget-group; do
+    write_nuget_config "$dir/NuGet.Search.Config" "kkrepoSearch" "$KKREPO_URL/repository/$repository/index.json"
+    run_logged "nuget-search-$repository" dotnet package search Newtonsoft.Json \
+      --configfile "$dir/NuGet.Search.Config" --format json --take 10
+    python3 - "$ARTIFACT_DIR/nuget-search-$repository.log" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    output = stream.read()
+result = json.loads(output[output.index("{"):])
+assert not result.get("problems"), result.get("problems")
+assert any(package["id"].lower() == "newtonsoft.json"
+           for source in result["searchResult"] for package in source["packages"]), result
+PY
+  done
 }
 
 test_rubygems() {
@@ -1357,6 +1405,23 @@ test_rubygems() {
   mkdir -p "$dir/lib" "$gem_home" "$gem_user_home/.gem"
   printf -- '---\n:kkrepo: %s\n' "$token" >"$gem_credentials"
   chmod 0600 "$gem_credentials"
+  local dependency
+  for dependency in "${name}_first" "${name}_last"; do
+    cat >"$dir/$dependency.gemspec" <<EOF
+Gem::Specification.new do |spec|
+  spec.name = "$dependency"
+  spec.version = "1.1.0"
+  spec.summary = "kkrepo dependency e2e"
+  spec.authors = ["kkrepo"]
+  spec.files = []
+end
+EOF
+    run_logged_in "rubygems-build-$dependency" "$dir" gem build "$dependency.gemspec" --output "$dir/$dependency-1.1.0.gem"
+    run_logged "rubygems-push-$dependency" curl -m 60 --fail-with-body -sS \
+      -H "Authorization: $token" -H 'Content-Type: application/octet-stream' \
+      --data-binary "@$dir/$dependency-1.1.0.gem" \
+      "$KKREPO_URL/repository/rubygems-hosted/api/v1/gems"
+  done
   cat >"$dir/$name.gemspec" <<EOF
 Gem::Specification.new do |spec|
   spec.name = "$name"
@@ -1365,6 +1430,8 @@ Gem::Specification.new do |spec|
   spec.authors = ["kkrepo"]
   spec.files = ["lib/$name.rb"]
   spec.require_paths = ["lib"]
+  spec.add_runtime_dependency "${name}_first", "~> 1.0"
+  spec.add_runtime_dependency "${name}_last", ">= 1.0", "< 2.0"
 end
 EOF
   echo 'module KkRepoClientE2ERubyGems; VALUE = "kkrepo client e2e"; end' >"$dir/lib/$name.rb"
@@ -1376,17 +1443,32 @@ EOF
     "$KKREPO_URL/repository/rubygems-group/versions" \
     "$ARTIFACT_DIR/rubygems-versions"
   capture_rubygems_metadata "$name"
+  run_logged rubygems-dependency-requirements ruby -rzlib -rrubygems -e '
+    spec = Marshal.load(Zlib::Inflate.inflate(File.binread(ARGV[0])))
+    actual = spec.runtime_dependencies.to_h { |dependency| [dependency.name, dependency.requirement.to_s] }
+    expected = { "#{ARGV[1]}_first" => "~> 1.0", "#{ARGV[1]}_last" => ">= 1.0, < 2.0" }
+    abort "dependency requirements changed: #{actual.inspect}" unless actual == expected
+  ' "$ARTIFACT_DIR/rubygems-quick-spec.rz" "$name"
   run_logged rubygems-install env GEM_HOME="$gem_home" GEM_PATH="$gem_home" \
     gem install "$name" --version 1.0.0 --clear-sources \
     --source "$KKREPO_AUTH_URL/repository/rubygems-group/" \
     --no-document --verbose
   test -f "$gem_home/gems/$name-1.0.0/lib/$name.rb"
+  # This package has not been downloaded through the proxy yet: group discovery must use
+  # the upstream index, not only the proxy's locally cached .gem assets.
+  wait_for_body_contains rubygems-cold-public-info '1.3.5 ' \
+    "$KKREPO_URL/repository/rubygems-group/info/concurrent-ruby" \
+    "$ARTIFACT_DIR/rubygems-public-info"
+  run_logged rubygems-public-install env GEM_HOME="$gem_home" GEM_PATH="$gem_home" \
+    gem install concurrent-ruby --version 1.3.5 --clear-sources \
+    --source "$KKREPO_AUTH_URL/repository/rubygems-group/" --no-document --verbose
+  test -f "$gem_home/gems/concurrent-ruby-1.3.5/lib/concurrent-ruby/concurrent.rb"
 }
 
 test_yum() {
   need docker
   local dir="$WORK_DIR/yum"
-  local rpm_url="${CLIENT_E2E_YUM_FIXTURE_URL:-https://dl.fedoraproject.org/pub/epel/9/Everything/x86_64/Packages/6/6tunnel-0.13-1.el9.x86_64.rpm}"
+  local rpm_url="${CLIENT_E2E_YUM_FIXTURE_URL:-https://kojipkgs.fedoraproject.org/packages/6tunnel/0.13/1.el9/x86_64/6tunnel-0.13-1.el9.x86_64.rpm}"
   local rpm="$dir/$(basename "$rpm_url")"
   local upload_path="Packages/client-e2e-$STAMP/$(basename "$rpm_url")"
   mkdir -p "$dir"
@@ -1726,6 +1808,14 @@ PY
 test_docker_oci() {
   need docker
   wait_for_docker_registry
+  run_logged docker-proxy-pagination env KKREPO_COMPAT_AUTH="$KKREPO_USER:$KKREPO_PASSWORD" \
+    python3 compat-test/scripts/docker-pagination-upstream.py --kkrepo "$KKREPO_URL" \
+    --upstream-host "${DOCKER_PAGINATION_UPSTREAM_HOST:-host.docker.internal}"
+  run_logged docker-proxy-auth-pool env KKREPO_COMPAT_AUTH="$KKREPO_USER:$KKREPO_PASSWORD" \
+    python3 compat-test/scripts/docker-auth-pool-upstream.py --kkrepo "$KKREPO_URL" \
+    --upstream-host "${DOCKER_AUTH_POOL_UPSTREAM_HOST:-host.docker.internal}"
+  run_logged docker-catalog-auth env KKREPO_COMPAT_AUTH="$KKREPO_USER:$KKREPO_PASSWORD" \
+    python3 compat-test/scripts/docker-catalog-auth.py --kkrepo "$KKREPO_URL"
   local image="kkrepo-client-e2e/docker-oci"
   local ref="$KKREPO_DOCKER_HOSTED_REGISTRY/$image:$STAMP"
   run_logged docker-login bash -lc "printf '%s\n' \"$KKREPO_PASSWORD\" | docker login '$KKREPO_DOCKER_HOSTED_REGISTRY' --username '$KKREPO_USER' --password-stdin"
@@ -2749,9 +2839,9 @@ test_ansible_binary() {
   local app_dir="$dir/$app_name"
   local base_archive="$dir/dist/$namespace-$base_name-$version.tar.gz"
   local app_archive="$dir/dist/$namespace-$app_name-$version.tar.gz"
-  local hosted_url="$KKREPO_URL/repository/ansible-hosted/"
+  local hosted_url="$KKREPO_URL/repository/${ANSIBLE_E2E_HOSTED_REPOSITORY:-ansible-hosted}/"
   local hosted_api_url="${hosted_url%/}/api/v3"
-  local group_url="$KKREPO_URL/repository/ansible-group/"
+  local group_url="$KKREPO_URL/repository/${ANSIBLE_E2E_GROUP_REPOSITORY:-ansible-group}/"
   local bearer_token generic_token requirements install_dir download_dir token_option
 
   token_option="--api-key"
@@ -2845,20 +2935,23 @@ EOF
 
   if [[ "${ANSIBLE_E2E_PROXY_ENABLED:-true}" == "true" ]]; then
     local proxy_dir="$dir/proxy-install"
+    local proxy_namespace="${ANSIBLE_COMPAT_PROXY_NAMESPACE:-community}"
+    local proxy_collection="${ANSIBLE_COMPAT_PROXY_COLLECTION:-general}"
+    local proxy_version="${ANSIBLE_COMPAT_PROXY_VERSION:-10.4.0}"
     run_logged "ansible-$label_slug-install-proxy" env \
       LC_ALL="$locale_name" LANG="$locale_name" ANSIBLE_NOCOLOR=1 \
-      "$ansible_galaxy" collection install community.general:10.4.0 \
+      "$ansible_galaxy" collection install "$proxy_namespace.$proxy_collection:$proxy_version" \
       --server "$group_url" "$token_option" "$generic_token" \
       --collections-path "$proxy_dir" --force --no-deps
-    test -f "$proxy_dir/ansible_collections/community/general/MANIFEST.json"
+    test -f "$proxy_dir/ansible_collections/$proxy_namespace/$proxy_collection/MANIFEST.json"
   else
-    log "Ansible $label public Galaxy proxy flow skipped by ANSIBLE_E2E_PROXY_ENABLED=false"
+    log "Ansible $label Galaxy proxy flow skipped by ANSIBLE_E2E_PROXY_ENABLED=false"
   fi
 
   if [[ -n "${ANSIBLE_KKREPO_SECONDARY_BASE_URL:-}" ]]; then
     run_logged "ansible-$label_slug-secondary-read" curl -m 20 --fail-with-body -sS \
       -u "$KKREPO_AUTH" \
-      "${ANSIBLE_KKREPO_SECONDARY_BASE_URL%/}/repository/ansible-group/api/v3/collections/$namespace/$app_name/versions/$version/"
+      "${ANSIBLE_KKREPO_SECONDARY_BASE_URL%/}/repository/${ANSIBLE_E2E_GROUP_REPOSITORY:-ansible-group}/api/v3/collections/$namespace/$app_name/versions/$version/"
   fi
 }
 
@@ -3139,6 +3232,7 @@ import json
 import sys
 
 repository, metadata_mode, remote_url = sys.argv[1:]
+import os
 print(json.dumps({
     "name": repository,
     "recipe": "apt-proxy",
@@ -3147,6 +3241,7 @@ print(json.dumps({
     "strictContentTypeValidation": True,
     "proxy": {
         "remoteUrl": remote_url,
+        "streamingEnabled": os.environ.get("KKREPO_COMPAT_PROXY_STREAMING_ENABLED") == "true",
         "contentMaxAgeMinutes": 1440,
         "metadataMaxAgeMinutes": 60,
         "negativeCacheEnabled": True,
@@ -4008,24 +4103,46 @@ test_ansible() {
   fi
 }
 
+test_ohpm() {
+  KKREPO_COMPAT_BASE_URL="$KKREPO_URL" KKREPO_COMPAT_USERNAME="$KKREPO_USER" \
+    KKREPO_COMPAT_PASSWORD="$KKREPO_PASSWORD" CLIENT_E2E_ARTIFACT_DIR="$ARTIFACT_DIR" \
+    bash "$SCRIPT_DIR/ohpm-client-e2e.sh"
+}
+
+test_gitlfs() {
+  KKREPO_COMPAT_BASE_URL="$KKREPO_URL" KKREPO_COMPAT_USERNAME="$KKREPO_USER" \
+    KKREPO_COMPAT_PASSWORD="$KKREPO_PASSWORD" CLIENT_E2E_ARTIFACT_DIR="$ARTIFACT_DIR" \
+    bash "$SCRIPT_DIR/git-lfs-client-e2e.sh"
+  KKREPO_COMPAT_BASE_URL="$KKREPO_URL" KKREPO_COMPAT_USERNAME="$KKREPO_USER" \
+    KKREPO_COMPAT_PASSWORD="$KKREPO_PASSWORD" CLIENT_E2E_ARTIFACT_DIR="$ARTIFACT_DIR" \
+    python3 "$SCRIPT_DIR/git-lfs-resilience-e2e.py"
+}
+
 run_selected_tests() {
   local selection="${CLIENT_E2E_TESTS:-all}"
   local -a tests=()
-  local test
+  local test test_started
 
   if [[ -z "$selection" || "$selection" == "all" ]]; then
-    tests=(raw maven npm pypi go helm cargo pub composer nuget rubygems yum apt alpine r conda conan terraform swift ansible docker-oci)
-  else
-    IFS=',' read -r -a tests <<<"$selection"
+    selection="$(python3 "$SCRIPT_DIR/client-e2e-plan.py" "${CLIENT_E2E_SHARD:-all}")"
   fi
+  IFS=',' read -r -a tests <<<"$selection"
 
   for test in "${tests[@]}"; do
     test="${test//[[:space:]]/}"
+    test_started=$SECONDS
+    log "starting protocol $test"
     CLEANUP_FIXTURE_FORMAT=""
     CLEANUP_FIXTURE_REPOSITORY=""
     CLEANUP_FIXTURE_PATTERN=""
     CLEANUP_FIXTURE_LABEL=""
     case "$test" in
+      ohpm)
+        test_ohpm
+        ;;
+      gitlfs)
+        test_gitlfs
+        ;;
       raw)
         test_raw
         register_cleanup_fixture raw asset-api-raw-hosted "*$STAMP*" raw
@@ -4044,7 +4161,7 @@ run_selected_tests() {
         ;;
       go)
         test_go
-        register_cleanup_fixture go go-hosted "*module-$STAMP*" go
+        register_cleanup_fixture go go-hosted "*Module-$STAMP*" go
         ;;
       helm)
         test_helm
@@ -4113,7 +4230,7 @@ run_selected_tests() {
       ansible|ansible-galaxy)
         test_ansible
         if [[ -n "${ANSIBLE_GALAXY_BINS:-}" ]] || command -v ansible-galaxy >/dev/null 2>&1; then
-          register_cleanup_fixture ansiblegalaxy ansible-hosted "*${STAMP:0:14}*" ansible
+          register_cleanup_fixture ansiblegalaxy "${ANSIBLE_E2E_HOSTED_REPOSITORY:-ansible-hosted}" "*${STAMP:0:14}*" ansible
         fi
         ;;
       docker|docker-oci|oci)
@@ -4128,6 +4245,9 @@ run_selected_tests() {
         ;;
     esac
     run_registered_cleanup
+    # Includes Cleanup Try Run/Execute: these are coverage, not housekeeping.
+    printf '%s\t%s\n' "$test" "$((SECONDS - test_started))" >> "$ARTIFACT_DIR/protocol-durations.tsv"
+    df -Pk / >> "$ARTIFACT_DIR/disk-usage.txt"
   done
 }
 

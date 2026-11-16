@@ -7,8 +7,11 @@ import com.aliyun.sdk.service.oss2.transport.apache5client.Apache5HttpClient;
 import com.aliyun.sdk.service.oss2.transport.apache5client.Apache5HttpClientBuilder;
 import com.github.klboke.kkrepo.cache.LocalCache;
 import com.github.klboke.kkrepo.cache.LocalCacheFactory;
+import com.github.klboke.kkrepo.core.http.OutboundTlsTrust;
 import jakarta.annotation.PreDestroy;
 import java.time.Duration;
+import java.util.Set;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 /**
@@ -21,9 +24,19 @@ import org.springframework.stereotype.Component;
  */
 @Component
 public class OssClientFactory {
+  private final OutboundTlsTrust tlsTrust;
   private final LocalCache<Long, CachedClient> cache = LocalCacheFactory.standard()
       .<Long, CachedClient>builder("oss-clients")
       .build();
+
+  public OssClientFactory() {
+    this(OutboundTlsTrust.defaults());
+  }
+
+  @Autowired
+  public OssClientFactory(OutboundTlsTrust tlsTrust) {
+    this.tlsTrust = tlsTrust;
+  }
 
   public OSSClient client(S3BlobStoreConfig config) {
     String signature = config.signature();
@@ -49,24 +62,32 @@ public class OssClientFactory {
     }
   }
 
+  Set<Long> cachedStoreIds() {
+    return Set.copyOf(cache.asMap().keySet());
+  }
+
   @PreDestroy
   void shutdown() {
     cache.asMap().values().forEach(c -> closeQuietly(c.client));
     cache.invalidateAll();
   }
 
-  private static OSSClient build(S3BlobStoreConfig config) {
+  private OSSClient build(S3BlobStoreConfig config) {
     return OSSClient.newBuilder()
         .region(config.region())
         .endpoint(config.endpoint())
         .credentialsProvider(new StaticCredentialsProvider(config.accessKey(), config.secretKey()))
         .usePathStyle(config.pathStyleAccess())
         .retryMaxAttempts(3)
-        .httpClient(buildHttpClient(config))
+        .httpClient(buildHttpClient(config, tlsTrust))
         .build();
   }
 
   static Apache5HttpClient buildHttpClient(S3BlobStoreConfig config) {
+    return buildHttpClient(config, OutboundTlsTrust.defaults());
+  }
+
+  private static Apache5HttpClient buildHttpClient(S3BlobStoreConfig config, OutboundTlsTrust tlsTrust) {
     // Socket/connect timeout tuning lives in HTTP options; pool lease/max settings are builder-only
     // in Aliyun OSS SDK v2 0.4.1's Apache5 transport.
     HttpClientOptions httpOptions = HttpClientOptions.custom()
@@ -75,11 +96,14 @@ public class OssClientFactory {
         .readWriteTimeout(Duration.ofMillis(config.socketTimeoutMs()))
         .keepAliveTimeout(Duration.ofSeconds(30))
         .build();
-    return Apache5HttpClientBuilder.create()
+    var builder = Apache5HttpClientBuilder.create()
         .options(httpOptions)
         .maxConnections(config.maxConnections())
-        .connectionRequestTimeout(config.connectionAcquisitionTimeoutMs())
-        .build();
+        .connectionRequestTimeout(config.connectionAcquisitionTimeoutMs());
+    if (tlsTrust.configured()) {
+      builder.x509TrustManagers(tlsTrust.trustManagers());
+    }
+    return builder.build();
   }
 
   private static void closeQuietly(OSSClient client) {

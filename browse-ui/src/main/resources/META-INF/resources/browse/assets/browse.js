@@ -1,18 +1,24 @@
+const {
+  close: closeUserMenu,
+  open: openUserMenu,
+  scheduleClose: scheduleCloseUserMenu,
+  toggle: toggleUserMenu,
+} = window.nexusPlusAccountMenu;
+
 // Live data backing the /browse UI.
 //   state.mode = "repos" → repo list
 //   state.mode = "tree" → Nexus-style expandable tree for state.repo (root = "")
 // Children of each path are fetched lazily on first expand and cached in `treeCache`.
 
-installCsrfFetch();
-
-const state = { mode: "repos", repo: null, path: "" };
-const treeCache = new Map(); // key = `${repo}::${path}`, value = entries[]
+const state = { mode: "repos", repo: null, path: "", source: "" };
+const treeCache = new Map(); // key = `${repo}::${source}::${path}`, value = entries[]
 const expanded = new Set();   // keys (same shape as treeCache) currently expanded
 const treeMountLoads = new WeakMap();
 const treeNodeEntries = new WeakMap();
-let userMenuCloseTimer = null;
 
 let repositoriesCache = [];
+let initialDataLoaded = false;
+let discoveryVersion = 0;
 let uploadRepositoriesCache = [];
 let uploadRepositoriesLoaded = false;
 let uploadRepositoriesPromise = null;
@@ -59,10 +65,12 @@ const SEARCH_ROUTE_FORMAT = {
   alpine: "alpine",
   r: "r",
   huggingface: "huggingface",
+  gitlfs: "gitlfs",
   pypi: "pypi",
   rubygems: "rubygems",
   yum: "yum",
   npm: "npm",
+  ohpm: "ohpm",
   docker: "docker",
   raw: "raw",
 };
@@ -85,10 +93,12 @@ const FORMAT_ROUTE_SEGMENT = {
   alpine: "alpine",
   r: "r",
   huggingface: "huggingface",
+  gitlfs: "gitlfs",
   pypi: "pypi",
   rubygems: "rubygems",
   yum: "yum",
   npm: "npm",
+  ohpm: "ohpm",
   docker: "docker",
   raw: "raw",
 };
@@ -111,44 +121,15 @@ const SEARCH_FORMAT_LABEL = {
   alpine: "Alpine / APK",
   r: "R / CRAN",
   huggingface: "Hugging Face Models",
+  gitlfs: "Git LFS",
   pypi: "PyPI",
   rubygems: "RubyGems",
   yum: "Yum",
   npm: "npm",
+  ohpm: "OHPM / HarmonyOS",
   docker: "Docker / OCI",
   raw: "Raw",
 };
-
-function installCsrfFetch() {
-  if (window.__nexusPlusCsrfFetchInstalled) return;
-  window.__nexusPlusCsrfFetchInstalled = true;
-  const nativeFetch = window.fetch.bind(window);
-  window.fetch = (input, init = {}) => {
-    const method = String(init.method || "GET").toUpperCase();
-    if (["POST", "PUT", "PATCH", "DELETE", "MKCOL"].includes(method) && sameOrigin(input)) {
-      const token = csrfToken();
-      if (token) {
-        const headers = new Headers(init.headers || {});
-        headers.set("X-Nexus-Plus-CSRF-Token", token);
-        init = { ...init, headers };
-      }
-    }
-    return nativeFetch(input, init);
-  };
-}
-
-function sameOrigin(input) {
-  const url = typeof input === "string" ? input : input.url;
-  return new URL(url, window.location.origin).origin === window.location.origin;
-}
-
-function csrfToken() {
-  return document.cookie
-    .split(";")
-    .map((part) => part.trim())
-    .find((part) => part.startsWith("KKREPO_CSRF="))
-    ?.substring("KKREPO_CSRF=".length) || "";
-}
 
 function browseListHash() {
   return `#${BROWSE_HASH}`;
@@ -194,11 +175,15 @@ function searchHash(format, keyword = "", customFormat = DEFAULT_SEARCH_FORMAT) 
   return query ? `${base}?${query}` : base;
 }
 
-function repositoryBrowseHash(repoName, path = "") {
+function repositoryBrowseHash(repoName, path = "", sourceRepository = "") {
   const hash = `#${BROWSE_HASH}:${encodeURIComponent(repoName)}`;
-  if (!path) return hash;
-  const params = new URLSearchParams({ path });
-  return `${hash}?${params.toString()}`;
+  const params = new URLSearchParams();
+  if (path) params.set("path", path);
+  if (sourceRepository && sourceRepository !== repoName) {
+    params.set("source", sourceRepository);
+  }
+  const query = params.toString();
+  return query ? `${hash}?${query}` : hash;
 }
 
 function componentBrowsePath(component) {
@@ -293,11 +278,13 @@ function parseBrowseHash() {
   const encodedRepo = separator === -1 ? routeValue : routeValue.slice(0, separator);
   const query = separator === -1 ? "" : routeValue.slice(separator + 1);
   if (!encodedRepo) return { view: "browse", repo: null };
-  const path = new URLSearchParams(query).get("path") || "";
+  const params = new URLSearchParams(query);
+  const path = params.get("path") || "";
+  const source = params.get("source") || "";
   try {
-    return { view: "browse", repo: decodeURIComponent(encodedRepo), path };
+    return { view: "browse", repo: decodeURIComponent(encodedRepo), path, source };
   } catch {
-    return { view: "browse", repo: encodedRepo, path };
+    return { view: "browse", repo: encodedRepo, path, source };
   }
 }
 
@@ -327,8 +314,7 @@ function currentReturnTo() {
 }
 
 function safeLocalReturnTo(value) {
-  if (!value || !value.startsWith("/") || value.startsWith("//")) return "";
-  return value;
+  return window.kkrepoSafeReturnTo(value, "");
 }
 
 function readPendingLoginReturnTo() {
@@ -538,10 +524,19 @@ function applyUiContext(context) {
   updateTopbarAuth();
 }
 
-function permissionPartMatches(grantedPart, requestedPart) {
-  const requested = (requestedPart || "*").toLowerCase();
+function permissionPartMatches(grantedPart, requestedPart, action = false) {
+  const normalize = (part) => {
+    const value = (part || "*").trim().toLowerCase();
+    if (!action) return value;
+    if (value === "create") return "add";
+    if (value === "update") return "edit";
+    return value === "all" ? "*" : value;
+  };
+  const requested = normalize(requestedPart);
   return (grantedPart || "*").split(",").some((part) => {
-    const normalized = part.trim().toLowerCase();
+    // Backend ALL grants concrete actions, but only a literal * satisfies a wildcard request.
+    if (action && (requestedPart || "*").trim() === "*") return part.trim() === "*";
+    const normalized = normalize(part);
     return normalized === "*" || normalized === requested;
   });
 }
@@ -549,9 +544,13 @@ function permissionPartMatches(grantedPart, requestedPart) {
 function permissionMatches(granted, requested) {
   const grantedParts = (granted || "").toLowerCase().split(":");
   const requestedParts = (requested || "").toLowerCase().split(":");
+  const domain = requestedParts[1];
+  const actionIndex = ["repository-view", "repository-admin"].includes(domain) ? 4
+    : domain === "repository-content-selector" ? 5
+    : grantedParts[0] === "nexus" && requestedParts[0] === "nexus" ? 2 : -1;
   const length = Math.max(grantedParts.length, requestedParts.length);
   for (let index = 0; index < length; index += 1) {
-    if (!permissionPartMatches(grantedParts[index], requestedParts[index])) return false;
+    if (!permissionPartMatches(grantedParts[index], requestedParts[index], index === actionIndex)) return false;
   }
   return true;
 }
@@ -561,12 +560,47 @@ function can(permission) {
 }
 
 function hasAdminEntryPermission() {
-  return can("nexus:*") || ["read", "create", "update", "delete"]
+  return can("nexus:*") || can("nexus:security-scanning:read")
+    || ["read", "create", "update", "delete"]
     .some((action) => can(`nexus:selectors:${action}`));
 }
 
 function canDeleteBrowseContent() {
   return Boolean(currentSession && can("nexus:*"));
+}
+
+function canDeleteBrowseDirectory(entry) {
+  const repo = currentRepository();
+  return canDeleteBrowseContent() && entry && !entry.leaf && Boolean(entry.path)
+    && String(repo?.type).toLowerCase() === "hosted"
+    && ["maven2", "npm", "pypi", "nuget", "yum", "rubygems", "raw"].includes(repo?.format);
+}
+
+// Usage snippets can describe arbitrary prefixes; they do not establish a deletable component.
+function canDeleteBrowseComponentDirectory(entry) {
+  if (!canDeleteBrowseContent() || !entry || entry.leaf || !entry.path) return false;
+  const format = currentRepository()?.format;
+  const parts = pathSegments(entry.path);
+  if (format === "ohpm") {
+    const packageParts = parts[0]?.startsWith("@") ? 2 : 1;
+    return parts.length === packageParts
+      || (parts.length === packageParts + 1 && VERSION_DIR_RE.test(parts.at(-1)));
+  }
+  if (["pypi", "npm", "cargo", "go", "pub", "composer"].includes(format)) {
+    return hasDirectoryUsage(entry);
+  }
+  if (format === "maven2") return parts.length >= 3 && VERSION_DIR_RE.test(parts.at(-1));
+  if (format === "nuget") return parts.length === 2 && VERSION_DIR_RE.test(parts.at(-1));
+  if (format === "swift") return parts.length === 3 && VERSION_DIR_RE.test(parts.at(-1));
+  if (format === "terraform") {
+    return parts[0] === "v1" && VERSION_DIR_RE.test(parts.at(-1))
+      && ((parts[1] === "modules" && parts.length === 6)
+        || (parts[1] === "providers" && parts.length === 5));
+  }
+  if (format === "docker") {
+    return Boolean(imageNameFromDockerPath(entry.path)) && parts.at(-2) === "manifests";
+  }
+  return false;
 }
 
 function hasUploadPermission() {
@@ -582,10 +616,28 @@ function hasRepositoryUploadPermission() {
   });
 }
 
-function canUseUpload() {
-  if (!currentSession || !hasUploadPermission()) return false;
-  if (!uploadRepositoriesLoaded) return true;
-  return uploadableRepositories(uploadRepositoriesCache).length > 0;
+// The Upload entry is offered to signed-in users that hold an add/create permission. Whether
+// any repository can actually take a web upload is explained on the page itself instead of
+// silently redirecting away from it.
+function canShowUploadNav() {
+  return Boolean(currentSession && hasUploadPermission());
+}
+
+// Deliberately neutral: the Upload entry is gated on add/create permissions, while the backend
+// lists a repository as uploadable only when the account may edit it, so the page cannot tell
+// a missing repository from a missing permission and must not recommend a specific grant.
+function uploadEmptyStateMessage() {
+  return "No repository is available for web upload with your current account. Web upload needs an "
+    + "online hosted repository in a format that supports it (for example Raw, Maven, npm or PyPI) "
+    + "and permission to edit it; ask an administrator if you expect one. Docker images are pushed "
+    + "with \"docker push\" instead.";
+}
+
+function adminEntryUrl() {
+  if (can("nexus:*")) return "/admin/";
+  return can("nexus:security-scanning:read")
+    ? "/admin/#admin/security/artifact-scanning"
+    : "/admin/#admin/repository/content-selectors";
 }
 
 function updateTopbarAuth() {
@@ -601,7 +653,7 @@ function updateTopbarAuth() {
   const signedIn = Boolean(currentSession && currentSession.userId);
   if (adminLink) {
     adminLink.hidden = !signedIn || !hasAdminEntryPermission();
-    adminLink.href = can("nexus:*") ? "/admin/" : "/admin/#admin/repository/content-selectors";
+    adminLink.href = adminEntryUrl();
   }
   loginButton.hidden = signedIn;
   userMenu.hidden = !signedIn;
@@ -619,9 +671,8 @@ function updateTopbarAuth() {
     userMenuTrigger.setAttribute("aria-label", `Account menu for ${qualifiedUser}`);
   }
 
-  const uploadVisible = canUseUpload();
-  uploadNav.hidden = !uploadVisible;
-  if (!uploadVisible && document.getElementById("upload-view").classList.contains("is-active")) {
+  uploadNav.hidden = !canShowUploadNav();
+  if (!signedIn && document.getElementById("upload-view").classList.contains("is-active")) {
     showRepositoryList();
   }
   if (!signedIn && document.getElementById("my-token-view").classList.contains("is-active")) {
@@ -638,50 +689,10 @@ function logout() {
   window.location.href = `/internal/security/logout?returnTo=${encodeURIComponent("/browse/#browse/welcome")}`;
 }
 
-function closeUserMenu() {
-  if (userMenuCloseTimer) {
-    clearTimeout(userMenuCloseTimer);
-    userMenuCloseTimer = null;
-  }
-  const trigger = document.getElementById("user-menu-trigger");
-  const popover = document.getElementById("user-menu-popover");
-  if (!trigger || !popover) return;
-  trigger.setAttribute("aria-expanded", "false");
-  popover.classList.remove("is-open");
-  popover.setAttribute("aria-hidden", "true");
-}
-
-function openUserMenu() {
-  if (userMenuCloseTimer) {
-    clearTimeout(userMenuCloseTimer);
-    userMenuCloseTimer = null;
-  }
-  const menu = document.getElementById("user-menu");
-  const trigger = document.getElementById("user-menu-trigger");
-  const popover = document.getElementById("user-menu-popover");
-  if (!menu || !trigger || !popover || menu.hidden) return;
-  trigger.setAttribute("aria-expanded", "true");
-  popover.classList.add("is-open");
-  popover.setAttribute("aria-hidden", "false");
-}
-
-function scheduleCloseUserMenu() {
-  if (userMenuCloseTimer) clearTimeout(userMenuCloseTimer);
-  userMenuCloseTimer = setTimeout(() => {
-    userMenuCloseTimer = null;
-    closeUserMenu();
-  }, 120);
-}
-
-function toggleUserMenu() {
-  const popover = document.getElementById("user-menu-popover");
-  if (!popover) return;
-  if (!popover.classList.contains("is-open")) openUserMenu();
-  else closeUserMenu();
-}
-
 function repositoryBaseUrl(repoName = state.repo) {
-  return new URL(`/repository/${encodeURIComponent(repoName)}/`, window.location.origin).href;
+  const repository = repositoriesCache.find(repo => repo.name === repoName);
+  const path = repository?.url || `/repository/${encodeURIComponent(repoName)}/`;
+  return new URL(path, window.location.origin).href;
 }
 
 function dockerRepositoryBaseUrl(repo = currentRepository()) {
@@ -723,6 +734,7 @@ function normalizeRepository(repo) {
     online: repo.online,
     url: repo.url,
     docker: repo.docker || null,
+    apt: repo.apt || null,
     hostedVersionPolicy: repo.hosted ? repo.hosted.versionPolicy : null,
     status: repo.online ? "Online" : "Offline",
   };
@@ -736,9 +748,14 @@ async function fetchUploadSpecs() {
 }
 
 async function fetchChildren(repo, path) {
-  const key = `${repo}::${path}`;
+  const source = state.repo === repo ? state.source : "";
+  const key = `${repo}::${source}::${path}`;
   if (treeCache.has(key)) return treeCache.get(key);
-  const url = `/internal/browse/${encodeURIComponent(repo)}${path ? `?path=${encodeURIComponent(path)}` : ""}`;
+  const params = new URLSearchParams();
+  if (path) params.set("path", path);
+  if (source) params.set("source", source);
+  const query = params.toString();
+  const url = `/internal/browse/${encodeURIComponent(repo)}${query ? `?${query}` : ""}`;
   const res = await fetch(url, { headers: { Accept: "application/json" } });
   if (!res.ok) throw new Error(`Browse failed: ${res.status}`);
   const data = await res.json();
@@ -759,8 +776,9 @@ function componentSearchParams(format, keyword, customFormat = DEFAULT_SEARCH_FO
   return params;
 }
 
-async function fetchSearchComponents(format, keyword, customFormat = DEFAULT_SEARCH_FORMAT) {
+async function fetchSearchComponents(format, keyword, customFormat = DEFAULT_SEARCH_FORMAT, dockerCursor = null) {
   const params = componentSearchParams(format, keyword, customFormat);
+  if (dockerCursor) params.set("dockerCursor", dockerCursor);
   const res = await fetch(`/internal/search/components?${params.toString()}`, {
     headers: { Accept: "application/json" },
     cache: "no-store",
@@ -782,6 +800,7 @@ function repoIcon(type) {
 const FORMAT_ICON_NAMES = Object.freeze({
   maven2: "maven",
   npm: "npm",
+  ohpm: "ohpm",
   pypi: "pypi",
   cargo: "cargo",
   pub: "pub",
@@ -795,6 +814,7 @@ const FORMAT_ICON_NAMES = Object.freeze({
   alpine: "alpine",
   r: "r",
   huggingface: "huggingface",
+  gitlfs: "gitlfs",
   go: "go",
   helm: "helm",
   docker: "docker",
@@ -988,21 +1008,23 @@ function showRepositoryList(syncHash = true) {
   state.mode = "repos";
   state.repo = null;
   state.path = "";
+  state.source = "";
   expanded.clear();
   restoreBrowseListLayout();
   renderRepoList();
 }
 
-function showRepositoryTree(repoName, syncHash = true, path = "") {
+function showRepositoryTree(repoName, syncHash = true, path = "", sourceRepository = "") {
   if (!repoName) {
     showRepositoryList(syncHash);
     return;
   }
-  if (syncHash) pushBrowseRoute(repositoryBrowseHash(repoName, path));
+  if (syncHash) pushBrowseRoute(repositoryBrowseHash(repoName, path, sourceRepository));
   switchView("browse");
   state.mode = "tree";
   state.repo = repoName;
   state.path = path || "";
+  state.source = sourceRepository || "";
   expanded.clear();
   treeCache.clear();
   renderTree();
@@ -1014,7 +1036,7 @@ function showWelcome(syncHash = true) {
 }
 
 function showUpload(syncHash = true) {
-  if (!canUseUpload()) {
+  if (!currentSession) {
     showRepositoryList(true);
     return;
   }
@@ -1232,7 +1254,11 @@ async function resetCurrentApiKey(id) {
 }
 
 async function deleteCurrentApiKey(id) {
-  if (!id || !window.confirm("Delete this API key?")) return;
+  if (!id || !await window.kkrepoConfirmDelete({
+    title: "Delete API key?",
+    description: "Clients and CI jobs using this key will no longer be able to authenticate with it.",
+    details: [{ label: "API key ID", value: String(id) }]
+  })) return;
   setMyTokenBusy(true);
   setMyTokenStatus("Deleting...");
   try {
@@ -1291,7 +1317,7 @@ function showSearch(
 
 function openSearchResult(component) {
   if (!component || !component.repository) return;
-  showRepositoryTree(component.repository, true, componentBrowsePath(component));
+  showRepositoryTree(component.repository, true, componentBrowsePath(component), component.details?.sourceRepository || "");
 }
 
 function renderRepoList() {
@@ -1433,17 +1459,108 @@ function renderTree() {
       <div class="tree-left">
         <div class="tree-root" id="tree-root">Loading…</div>
       </div>
+      <div class="split-handle" role="separator" aria-orientation="vertical" aria-label="Resize tree and detail panes" tabindex="0"></div>
       <aside class="detail-right" id="detail-right">
         <div class="detail-placeholder">Select a component or file in the tree to view details.</div>
       </aside>
     </div>
   `;
+  initSplitResizer(drill.querySelector(".browse-split"));
   drill.querySelector(".crumb[data-crumb-root]").addEventListener("click", () => showRepositoryList());
   drill.querySelector("#advanced-search-link").addEventListener("click", (e) => {
     e.preventDefault();
     showSearch(currentRepository()?.format || DEFAULT_SEARCH_FORMAT);
   });
   ensureTreeLevelLoaded("", document.getElementById("tree-root"), 0).then(() => selectInitialTreePath());
+}
+
+// Drag (or arrow-key) the handle between tree and detail panes. The width is a per-browser
+// preference only, so localStorage failures are ignored and the default 60% is used.
+// The preferred percentage is kept separately from the effective (clamped) one so that the
+// panes honour their minimum width again after the container shrinks or grows back.
+const SPLIT_WIDTH_KEY = "kkrepo.browse.treePaneWidthPct";
+const SPLIT_DEFAULT_PCT = 60;
+const SPLIT_MIN_PANE_PX = 220;
+
+function clampSplitPct(pct, totalPx) {
+  const total = totalPx > 0 ? totalPx : 1;
+  const min = Math.min(45, (SPLIT_MIN_PANE_PX / total) * 100);
+  return Math.max(min, Math.min(100 - min, pct));
+}
+
+function initSplitResizer(split) {
+  const handle = split?.querySelector(".split-handle");
+  const tree = split?.querySelector(".tree-left");
+  if (!handle || !tree) return;
+
+  const splitWidth = () => split.getBoundingClientRect().width;
+  const currentPct = () => (tree.getBoundingClientRect().width / (splitWidth() || 1)) * 100;
+
+  let preferredPct = SPLIT_DEFAULT_PCT;
+  try {
+    const stored = parseFloat(localStorage.getItem(SPLIT_WIDTH_KEY));
+    if (Number.isFinite(stored)) preferredPct = stored;
+  } catch { /* ignore */ }
+
+  // Renders the effective width for the current container size without touching the preference.
+  const render = () => {
+    const value = clampSplitPct(preferredPct, splitWidth());
+    split.style.setProperty("--tree-pane-width", `${value}%`);
+    handle.setAttribute("aria-valuenow", String(Math.round(value)));
+    return value;
+  };
+  // Records a user-chosen width as the new preference, optionally persisting it.
+  const setPreferred = (pct, persist) => {
+    preferredPct = clampSplitPct(pct, splitWidth());
+    render();
+    if (persist) {
+      try { localStorage.setItem(SPLIT_WIDTH_KEY, String(preferredPct)); } catch { /* ignore */ }
+    }
+  };
+  render();
+
+  // The tree is rebuilt on every repository render, so stop observing once this split is detached.
+  if (typeof ResizeObserver === "function") {
+    const observer = new ResizeObserver(() => {
+      if (!split.isConnected) {
+        observer.disconnect();
+        return;
+      }
+      render();
+    });
+    observer.observe(split);
+  }
+
+  handle.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    handle.setPointerCapture(event.pointerId);
+    split.classList.add("is-resizing");
+    const onMove = (e) => {
+      const rect = split.getBoundingClientRect();
+      setPreferred(((e.clientX - rect.left) / rect.width) * 100, false);
+    };
+    const onEnd = (e) => {
+      handle.removeEventListener("pointermove", onMove);
+      handle.removeEventListener("pointerup", onEnd);
+      handle.removeEventListener("pointercancel", onEnd);
+      try { handle.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+      split.classList.remove("is-resizing");
+      setPreferred(preferredPct, true);
+    };
+    handle.addEventListener("pointermove", onMove);
+    handle.addEventListener("pointerup", onEnd);
+    handle.addEventListener("pointercancel", onEnd);
+  });
+
+  handle.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowLeft") setPreferred(currentPct() - 2, true);
+    else if (event.key === "ArrowRight") setPreferred(currentPct() + 2, true);
+    else if (event.key === "Home" || event.key === "Enter") setPreferred(SPLIT_DEFAULT_PCT, true);
+    else return;
+    event.preventDefault();
+  });
+  handle.addEventListener("dblclick", () => setPreferred(SPLIT_DEFAULT_PCT, true));
 }
 
 async function loadAndRenderTreeLevel(path, mountEl, depth) {
@@ -1487,9 +1604,7 @@ async function ensureTreeLevelLoaded(path, mountEl, depth) {
 
 async function activateTreeBranch(entry, toggleExpand) {
   const expansion = toggleExpand();
-  if (VERSION_DIR_RE.test(entry.name) || hasDirectoryUsage(entry)) {
-    await showComponentDetail(entry);
-  }
+  await showComponentDetail(entry);
   await expansion;
 }
 
@@ -1588,7 +1703,7 @@ function selectRow(row) {
 function syncTreePath(entry) {
   if (!state.repo || !entry || !entry.path) return;
   state.path = entry.path;
-  const target = `/browse/${repositoryBrowseHash(state.repo, entry.path)}`;
+  const target = `/browse/${repositoryBrowseHash(state.repo, entry.path, state.source)}`;
   const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
   if (current !== target) {
     window.history.replaceState(null, "", target);
@@ -1628,7 +1743,7 @@ async function selectInitialTreePath() {
   const entry = treeNodeEntries.get(node) || findCachedTreeEntry(state.path);
   if (!entry) return;
   if (entry.leaf) await showAssetDetail(entry);
-  else if (VERSION_DIR_RE.test(entry.name) || hasDirectoryUsage(entry)) await showComponentDetail(entry);
+  else await showComponentDetail(entry);
 }
 
 async function revealTreePath(path) {
@@ -1764,6 +1879,7 @@ function renderAttributesSection(detail, opts = {}) {
     renderAttributeGroup("Content", detail.content),
     opts.hideDocker ? "" : renderAttributeGroup("Docker", detail.docker),
     renderAttributeGroup("Npm", detail.npm),
+    renderAttributeGroup("OHPM", detail.ohpm),
     renderAttributeGroup("Pub", detail.pub),
     renderAttributeGroup("Composer", detail.composer),
     renderAttributeGroup("Conda", detail.conda),
@@ -1844,15 +1960,31 @@ function bindDeleteControl(mount, entry) {
 
 async function deleteBrowseEntry(entry, button) {
   if (!entry || !entry.path || !state.repo) return;
-  const label = entry.leaf ? entry.name : entry.path;
-  if (!window.confirm(`Delete ${label}?`)) return;
+  if (canDeleteBrowseDirectory(entry)) return previewDirectoryDeletion(entry, button);
+  if (!entry.leaf && !canDeleteBrowseComponentDirectory(entry)) return;
+  const repository = state.repo;
+  const sourceRepository = entry.sourceRepository || repository;
+  const path = entry.path;
+  const description = currentRepository()?.format === "gitlfs"
+    ? "Deleting this LFS object may break checkouts of Git commits that reference it."
+    : currentRepository()?.format === "ohpm"
+      ? "This unpublishes the selected package or version, including its HAR, paired HSP and distribution tags. Existing installations may no longer be reproducible."
+    : entry.leaf
+      ? "The selected file will be removed. Depending on the package format, associated files may also be deleted. Builds and clients that depend on them may fail."
+      : "The selected component and its associated files will be removed. Builds and clients that depend on them may fail.";
+  if (!await window.kkrepoConfirmDelete({
+    title: entry.leaf ? "Delete file?" : "Delete component?",
+    description,
+    details: [{ label: "Repository", value: sourceRepository }, { label: "Path", value: path }]
+  })) return;
+  if (state.repo !== repository || state.path !== path || !button.isConnected) return;
   button.disabled = true;
   const originalText = button.textContent;
   button.textContent = "Deleting";
-  const params = new URLSearchParams({ path: entry.path });
+  const params = new URLSearchParams({ path });
   if (entry.sourceRepository) params.set("source", entry.sourceRepository);
   try {
-    const res = await fetch(`/internal/browse/${encodeURIComponent(state.repo)}?${params.toString()}`, {
+    const res = await fetch(`/internal/browse/${encodeURIComponent(repository)}?${params.toString()}`, {
       method: "DELETE",
       headers: { Accept: "application/json" },
       cache: "no-store",
@@ -1865,19 +1997,198 @@ async function deleteBrowseEntry(entry, button) {
     if (!res.ok) {
       throw new Error(await deleteError(res));
     }
-    treeCache.clear();
-    const deletedKey = `${state.repo}::${entry.path}`;
-    for (const key of Array.from(expanded)) {
-      if (key === deletedKey || key.startsWith(`${deletedKey}/`)) {
-        expanded.delete(key);
-      }
-    }
-    renderTree();
+    await refreshTreeAfterDeletion(repository, entry);
   } catch (error) {
     button.disabled = false;
     button.textContent = originalText;
     window.alert(`Delete failed: ${error.message}`);
   }
+}
+
+async function previewDirectoryDeletion(entry, button) {
+  if (!canDeleteBrowseDirectory(entry)) return;
+  const repository = state.repo;
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "Reviewing…";
+  try {
+    const params = new URLSearchParams({ path: entry.path });
+    const response = await fetch(`/internal/browse/${encodeURIComponent(repository)}/directory-deletion?${params}`, {
+      headers: { Accept: "application/json" }, cache: "no-store",
+    });
+    if (response.status === 401) {
+      sessionStorage.removeItem(AUTH_SNAPSHOT_KEY);
+      window.location.href = "/browse/#browse/welcome";
+      return;
+    }
+    if (!response.ok) throw new Error(await deleteError(response));
+    const preview = await response.json();
+    if (state.repo !== repository || state.path !== entry.path) return;
+    showDirectoryDeletionDialog(repository, entry, preview, button);
+  } catch (error) {
+    window.alert(`Cannot delete directory: ${error.message}`);
+  } finally {
+    button.disabled = false;
+    button.textContent = originalText;
+  }
+}
+
+function showDirectoryDeletionDialog(repository, entry, preview, trigger) {
+  const dialog = document.createElement("dialog");
+  dialog.className = "kk-confirm-dialog directory-delete-dialog";
+  dialog.setAttribute("aria-labelledby", "directory-delete-title");
+  dialog.setAttribute("aria-describedby", "directory-delete-warning");
+  dialog.innerHTML = `
+    <form>
+      <div class="kk-confirm-heading">
+        <span class="kk-confirm-icon lucide-icon icon-triangle-alert" aria-hidden="true"></span>
+        <h2 id="directory-delete-title">Delete directory contents?</h2>
+      </div>
+      <dl class="kk-confirm-details">
+        <dt>Repository</dt><dd><code data-i18n-skip>${escapeHtml(repository)}</code></dd>
+        <dt>Directory</dt><dd><code data-i18n-skip>${escapeHtml(preview.path)}</code></dd>
+        <dt>Contents</dt><dd><strong>${preview.assetCount}</strong> <span>${preview.assetCount === 1 ? "file" : "files"}</span> ·
+          <strong>${preview.componentCount}</strong> <span>${preview.componentCount === 1 ? "component" : "components"}</span> · ${formatBytes(preview.estimatedBytes)}</dd>
+      </dl>
+      <p>The selected files will be deleted, including files in subdirectories.</p>
+      <p id="directory-delete-warning" class="kk-confirm-warning">Deletion is permanent. This action cannot be undone.</p>
+      ${preview.metadataAssetCount ? `<p><strong>${preview.metadataAssetCount}</strong> <span>generated metadata files may remain or be regenerated by the package protocol.</span></p>` : ""}
+      <details><summary>Review all affected paths</summary>
+        <ul class="directory-delete-paths">${preview.items.map((item) => `<li><code data-i18n-skip>${escapeHtml(item.path)}</code>${item.action === "PROTOCOL_METADATA" ? " <span>(protocol metadata)</span>" : ""}</li>`).join("")}</ul>
+      </details>
+      <label for="directory-delete-confirmation">Type the exact directory path to confirm:</label>
+      <input id="directory-delete-confirmation" type="text" autocomplete="off" spellcheck="false" required>
+      <p class="directory-delete-error" role="alert"></p>
+      <div class="kk-confirm-actions directory-delete-actions">
+        <button type="button" class="kk-confirm-cancel" data-delete-cancel autofocus>Cancel</button>
+        <button type="button" class="kk-confirm-cancel" data-delete-refresh hidden>Review again</button>
+        <button type="submit" class="kk-confirm-delete" data-delete-confirm disabled>Delete files</button>
+      </div>
+    </form>`;
+  document.body.appendChild(dialog);
+  const input = dialog.querySelector("input");
+  const confirm = dialog.querySelector("[data-delete-confirm]");
+  const cancel = dialog.querySelector("[data-delete-cancel]");
+  const refresh = dialog.querySelector("[data-delete-refresh]");
+  const error = dialog.querySelector(".directory-delete-error");
+  let deleting = false;
+  let invalidated = false;
+  const navigate = () => { if (!deleting) dialog.close(); };
+  window.addEventListener("hashchange", navigate);
+  window.addEventListener("pagehide", navigate);
+  input.addEventListener("input", () => {
+    confirm.disabled = deleting || invalidated || input.value !== preview.path;
+  });
+  cancel.addEventListener("click", () => dialog.close());
+  dialog.addEventListener("cancel", (event) => { if (deleting) event.preventDefault(); });
+  dialog.addEventListener("close", () => {
+    window.removeEventListener("hashchange", navigate);
+    window.removeEventListener("pagehide", navigate);
+    dialog.remove();
+    if (trigger.isConnected) trigger.focus({ preventScroll: true });
+  });
+  refresh.addEventListener("click", () => {
+    dialog.close();
+    if (state.repo === repository && state.path === entry.path) previewDirectoryDeletion(entry, trigger);
+  });
+  dialog.querySelector("form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (deleting || invalidated || input.value !== preview.path) return;
+    // Capture the repository and path from the reviewed preview, never from changing navigation.
+    deleting = true;
+    confirm.disabled = true;
+    cancel.disabled = true;
+    input.disabled = true;
+    confirm.textContent = "Deleting…";
+    error.textContent = "";
+    try {
+      const response = await fetch(`/internal/browse/${encodeURIComponent(repository)}/directory-deletion`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ path: preview.path, confirmationPath: input.value, selectionToken: preview.selectionToken }),
+      });
+      if (response.status === 401) {
+        sessionStorage.removeItem(AUTH_SNAPSHOT_KEY);
+        dialog.close();
+        window.location.href = "/browse/#browse/welcome";
+        return;
+      }
+      if (!response.ok) throw new Error(await deleteError(response));
+      dialog.close();
+      try {
+        await refreshTreeAfterDeletion(repository, entry);
+      } catch (refreshFailure) {
+        window.alert(`Directory deleted, but Browse could not refresh: ${refreshFailure.message}. Reload the page.`);
+      }
+    } catch (failure) {
+      // An ambiguous network failure may follow a committed deletion. Always require a fresh
+      // preview before retrying, including when the server rejects a changed selection (409).
+      invalidated = true;
+      error.textContent = failure.message;
+      refresh.hidden = false;
+    } finally {
+      deleting = false;
+      cancel.disabled = false;
+      confirm.textContent = "Delete files";
+    }
+  });
+  window.kkrepoI18n?.apply(dialog);
+  dialog.showModal();
+  cancel.focus();
+}
+
+async function refreshTreeAfterDeletion(repository, entry) {
+  treeCache.clear();
+  const deletedKey = `${repository}::${entry.path}`;
+  for (const key of Array.from(expanded)) {
+    if (key === deletedKey || key.startsWith(`${deletedKey}/`)) expanded.delete(key);
+  }
+  if (state.repo !== repository) return;
+  const tree = document.querySelector(".tree-left");
+  const root = document.getElementById("tree-root");
+  if (!tree || !root) return;
+  const position = { top: tree.scrollTop, left: tree.scrollLeft };
+  const selectedPath = state.path;
+  const oldMinHeight = root.style.minHeight;
+  // Preserve the scroll extent while expanded branches are being reloaded asynchronously.
+  root.style.minHeight = `${root.scrollHeight}px`;
+  try {
+    await loadAndRenderTreeLevel("", root, 0);
+    await settleExpandedTreeLoads(root);
+    if (state.repo !== repository || !root.isConnected) return;
+    if (state.path === selectedPath) {
+      let path = selectedPath;
+      let node;
+      while (path && !(node = root.querySelector(`.tree-node[data-path="${pathSelectorValue(path)}"]`))) {
+        path = pathSegments(path).slice(0, -1).join("/");
+      }
+      if (node) {
+        const selectedEntry = treeNodeEntries.get(node);
+        selectRow(node.querySelector(":scope > .tree-row"));
+        syncTreePath(selectedEntry);
+        if (selectedEntry.leaf) await showAssetDetail(selectedEntry);
+        else await showComponentDetail(selectedEntry);
+      } else {
+        state.path = "";
+        window.history.replaceState(null, "", `/browse/${repositoryBrowseHash(repository, "", state.source)}`);
+        detailPaneMount().innerHTML = '<div class="detail-placeholder">Select a component or file in the tree to view details.</div>';
+      }
+    }
+  } finally {
+    root.style.minHeight = oldMinHeight;
+    if (state.repo === repository && root.isConnected) {
+      tree.scrollTop = position.top;
+      tree.scrollLeft = position.left;
+    }
+  }
+}
+
+async function settleExpandedTreeLoads(root) {
+  const pending = Array.from(root.querySelectorAll(".tree-children"))
+    .map((mount) => treeMountLoads.get(mount)).filter(Boolean);
+  if (!pending.length) return;
+  await Promise.all(pending);
+  await settleExpandedTreeLoads(root);
 }
 
 async function deleteError(response) {
@@ -2435,10 +2746,31 @@ function dockerTagFromDockerPath(path) {
   return "";
 }
 
+function dockerImageReferenceBase(repo = currentRepository()) {
+  if (!repo) return "";
+  const docker = repo.docker || {};
+  if (docker.connectorEnabled && docker.connectorPublicUrl) {
+    const value = docker.connectorPublicUrl.trim();
+    try {
+      const url = new URL(/^https?:\/\//i.test(value) ? value
+        : value.startsWith("//") ? `${window.location.protocol}${value}` : `https://${value}`);
+      if (url.host && !url.username && !url.password) {
+        return `${url.host}${url.pathname.replace(/\/+$/, "").replace(/\/v2$/, "")}`;
+      }
+    } catch (_) {
+      // Old saved configurations may contain an invalid public URL; retain usable routing below.
+    }
+  }
+  if (docker.connectorEnabled && docker.connectorPort) {
+    return `${window.location.hostname}:${docker.connectorPort}`;
+  }
+  return `${window.location.host}/${repo.name}`;
+}
+
 function dockerUsageDetail(entry, detail = null) {
   const { image, reference, digest } = dockerCoordinates(entry, detail);
   if (!image) return null;
-  const base = dockerRepositoryBaseUrl();
+  const base = dockerImageReferenceBase();
   const byTag = `${base}/${image}:${reference || "latest"}`;
   const snippets = [
     usageSnippet("docker pull", `docker pull ${byTag}`),
@@ -2999,10 +3331,18 @@ function rUsageDetail(entry, detail = null) {
   const repositoryUrl = repositoryBaseUrl().replace(/\/+$/, "");
   const packageName = metadata.package || entry.name || "<package>";
   const version = metadata.version || entry.version || "";
+  const namespace = metadata.namespace || "src/contrib";
+  const source = namespace === "src/contrib";
+  const packageType = namespace.startsWith("bin/windows/") ? "win.binary"
+    : namespace.startsWith("bin/macosx/") ? "mac.binary" : "source";
+  const location = source ? `repos = '${repositoryUrl}'`
+    : `contriburl = '${repositoryUrl}/${namespace}'`;
+  const extension = packageType === "win.binary" ? ".zip" : packageType === "mac.binary" ? ".tgz" : ".tar.gz";
+  const filename = metadata.filename || `${packageName}_${version || "1.0.0"}${extension}`;
   const summaryRows = [
     ["Repository", state.repo],
     ["Format", "r"],
-    ["Namespace", "src/contrib"],
+    ["Namespace", namespace],
     ["Package", packageName],
     ["Version", version || "-"],
   ];
@@ -3017,17 +3357,17 @@ function rUsageDetail(entry, detail = null) {
     ),
     usageSnippet(
       "Available packages",
-      `available.packages(repos = '${repositoryUrl}', type = 'source')`,
+      `available.packages(${location}, type = '${packageType}')`,
     ),
     usageSnippet(
       "Install",
-      `install.packages('${packageName}', repos = '${repositoryUrl}', type = 'source')`,
+      `install.packages('${packageName}', ${location}, type = '${packageType}')`,
     ),
   ];
   if (String(repo?.type || "").toLowerCase() === "hosted") {
     snippets.push(usageSnippet(
       "Publish",
-      `curl --fail --user '<username>:<token>' -F 'r.asset=@${packageName}_${version || "1.0.0"}.tar.gz' '${window.location.origin}/service/rest/v1/components?repository=${encodeURIComponent(state.repo)}'`,
+      `curl --fail --user '<username>:<token>' -F 'r.asset.pathId=${namespace}' -F 'r.asset=@${filename}' '${window.location.origin}/service/rest/v1/components?repository=${encodeURIComponent(state.repo)}'`,
       "The server validates DESCRIPTION and archive limits without executing package code",
     ));
   }
@@ -3090,6 +3430,14 @@ async function usageDetailForEntry(entry, detail = null) {
   if (repo.format === "apt") return aptUsageDetail(entry, detail);
   if (repo.format === "alpine") return alpineUsageDetail(entry, detail);
   if (repo.format === "r") return rUsageDetail(entry, detail);
+  if (repo.format === "gitlfs") return {
+    crumbText: entry.path,
+    summaryRows: [["Repository", state.repo], ["Format", "Git LFS"], ["OID (SHA-256)", entry.path]],
+    snippets: [
+      usageSnippet("Configure", `git config -f .lfsconfig lfs.url '${repositoryBaseUrl().replace(/\/+$/, "")}/info/lfs'`, "Keep the Git remote on your Git server; use a credential helper for kkRepo access"),
+      usageSnippet("Verify", "git lfs fetch --all\ngit lfs fsck", "Deleting an LFS object can break checkout of historical commits. Automatic cleanup is disabled."),
+    ],
+  };
   if (repo.format === "huggingface") return huggingFaceUsageDetail(entry, detail);
   if (repo.format === "docker") return dockerUsageDetail(entry);
   return null;
@@ -3098,17 +3446,20 @@ async function usageDetailForEntry(entry, detail = null) {
 async function showComponentDetail(entry) {
   const mount = detailPaneMount();
   if (!mount) return;
+  const repository = state.repo;
   const detail = await usageDetailForEntry(entry);
-  if (!detail) {
-    mount.innerHTML = `<div class="detail-placeholder">No component coordinates for this path.</div>`;
-    return;
-  }
+  if (state.repo !== repository || state.path !== entry.path || !mount.isConnected) return;
   renderDetailPane({
     crumbIcon: repositoryFormatIcon(),
-    crumbText: detail.crumbText,
-    summaryRows: detail.summaryRows,
-    snippets: detail.snippets,
-    deleteEntry: entry,
+    crumbText: detail?.crumbText || entry.path,
+    summaryRows: detail?.summaryRows || [
+      ["Repository", repository],
+      ["Directory", entry.path],
+    ],
+    snippets: detail?.snippets || [],
+    // Preserve existing protocol component actions; only supported hosted formats gain a
+    // delete action for arbitrary directories without component coordinates.
+    deleteEntry: canDeleteBrowseDirectory(entry) || canDeleteBrowseComponentDirectory(entry) ? entry : null,
   });
 }
 
@@ -3124,11 +3475,7 @@ async function showAssetDetail(entry) {
   const sourceRepository = detail?.sourceRepository || entry.sourceRepository || "";
   const dockerDetail = isDockerDetail(detail);
   const downloadUrl = dockerDetail ? (entry.downloadUrl || detail?.downloadUrl) : (detail?.downloadUrl || entry.downloadUrl);
-  const download = downloadUrl
-    ? `<div class="download-row">
-        <a class="copy-button" href="${downloadUrl}" target="_blank">${lucideIcon("download")} Download</a>
-      </div>`
-    : "";
+  const download = renderAssetDownloadLink(downloadUrl);
   mount.innerHTML = `
     <div class="detail-pane">
       ${detailHead(iconForFile(entry.name || entry.path, "crumb-icon"), entry.path, browseOnly ? null : entry)}
@@ -3142,6 +3489,14 @@ async function showAssetDetail(entry) {
     </div>`;
   if (dockerUsage || usage) bindUsageControls(mount, (dockerUsage || usage).snippets);
   bindDeleteControl(mount, browseOnly ? null : entry);
+}
+
+function renderAssetDownloadLink(downloadUrl) {
+  const target = typeof downloadUrl === "string" ? downloadUrl : "";
+  if (!target) return "";
+  return `<div class="download-row">
+      <a class="copy-button" href="${escapeHtml(target)}" target="_blank" rel="noopener noreferrer">${lucideIcon("download")} Download</a>
+    </div>`;
 }
 
 async function fetchAssetAttributes(entry) {
@@ -3192,6 +3547,12 @@ function renderUpload() {
     select.value = uploadRepos[0].name;
   }
   renderUploadFields();
+  if (uploadRepos.length === 0) {
+    select.innerHTML = '<option value="">No repositories available</option>';
+    select.disabled = true;
+    document.getElementById("upload-fields").innerHTML =
+      `<div class="muted-row upload-empty" role="note">${escapeHtml(uploadEmptyStateMessage())}</div>`;
+  }
   updateUploadPath();
 }
 
@@ -3217,6 +3578,27 @@ function renderUploadFields() {
   const fields = document.getElementById("upload-fields");
   if (!repo) {
     fields.innerHTML = '<div class="muted-row upload-empty">No supported hosted repository selected.</div>';
+    return;
+  }
+  if (repo.format === "ohpm") {
+    fields.innerHTML = `
+      <label class="upload-file">
+        <span>HAR archive or HSP bundle</span>
+        <input id="upload-file" type="file" accept=".har,.tgz,.tar.gz" required>
+      </label>
+      <label class="upload-file">
+        <span>Paired HSP (required for an interface HAR)</span>
+        <input id="upload-ohpm-hsp" type="file" accept=".hsp">
+      </label>
+      <label>
+        <span>Distribution tag</span>
+        <input id="upload-ohpm-tag" type="text" value="latest" required>
+      </label>
+      <p class="upload-help">Select a HAR with its paired HSP, or a complete HSP tgz bundle. Package name and version come from the HAR. Existing versions cannot be overwritten.</p>
+      <label class="upload-path">
+        <span>Selected archive</span>
+        <input id="upload-path" type="text" readonly>
+      </label>`;
     return;
   }
   if (repo.format === "maven2") {
@@ -3479,13 +3861,19 @@ function renderUploadFields() {
   if (repo.format === "r") {
     fields.innerHTML = `
       <label class="upload-file">
-        <span>R source package</span>
-        <input id="upload-file" type="file" accept=".tar.gz,application/gzip,application/x-gzip" required>
+        <span>R package</span>
+        <input id="upload-file" type="file" accept=".tar.gz,.tgz,.zip,application/gzip,application/x-gzip,application/zip" required>
       </label>
-      <div class="muted-row full-width">Upload the canonical <code>Package_Version.tar.gz</code> produced by <code>R CMD build</code>. The server validates the archive and <code>DESCRIPTION</code> without executing package code, then atomically publishes <code>PACKAGES.gz</code>.</div>
+      <p class="upload-help">Upload a source <code>.tar.gz</code>, Windows <code>.zip</code>, macOS <code>.tgz</code>, or Linux <code>.tar.gz</code> package. Choose a directory matching the target platform and R version.</p>
       <label class="upload-path">
         <span>Package path</span>
-        <input id="upload-path" type="text" value="src/contrib/Package_Version.tar.gz" readonly>
+        <input id="upload-r-namespace" type="text" value="src/contrib" list="upload-r-namespaces" required>
+        <datalist id="upload-r-namespaces">
+          <option value="src/contrib">Source</option>
+          <option value="bin/windows/contrib/4.5">Windows / R 4.5</option>
+          <option value="bin/macosx/big-sur-arm64/contrib/4.5">macOS ARM64 / R 4.5</option>
+          <option value="bin/linux/noble-x86_64/4.5/src/contrib">Linux noble x86_64 / R 4.5</option>
+        </datalist>
       </label>
     `;
     return;
@@ -3869,6 +4257,18 @@ function clearUploadForm() {
 }
 
 function buildUploadForm(repo, form) {
+  if (repo.format === "ohpm") {
+    const har = document.getElementById("upload-file")?.files?.[0];
+    const hsp = document.getElementById("upload-ohpm-hsp")?.files?.[0];
+    const bundle = har && /\.(tgz|tar\.gz)$/.test(har.name);
+    if (!har || (!bundle && !har.name.endsWith(".har")) || (hsp && !hsp.name.endsWith(".hsp")) || (bundle && hsp)) {
+      throw new Error("Select a HAR archive with its paired HSP, or one complete HSP tgz bundle.");
+    }
+    form.append("ohpm.asset", har, har.name);
+    if (hsp) form.append("ohpm.hsp", hsp, hsp.name);
+    form.append("ohpm.tag", uploadFieldValue("upload-ohpm-tag") || "latest");
+    return;
+  }
   if (repo.format === "maven2") {
     const groupId = uploadFieldValue("upload-group-id");
     const artifactId = uploadFieldValue("upload-artifact-id");
@@ -4045,9 +4445,11 @@ function buildUploadForm(repo, form) {
   }
   if (repo.format === "r") {
     const file = document.getElementById("upload-file")?.files?.[0];
-    if (!file || !file.name.toLowerCase().endsWith(".tar.gz")) {
-      throw new Error("A canonical R source .tar.gz package is required.");
+    const namespace = document.getElementById("upload-r-namespace")?.value?.trim();
+    if (!namespace || !file || !/\.(tar\.gz|tgz|zip)$/.test(file.name)) {
+      throw new Error("An R package (.tar.gz, .tgz or .zip) and Package Path are required.");
     }
+    form.append("r.asset.pathId", namespace);
     form.append("r.asset", file, file.name);
     return;
   }
@@ -4096,7 +4498,9 @@ async function uploadError(response) {
 
 async function renderSearch(
     format = DEFAULT_SEARCH_FORMAT,
-    customFormat = activeCustomSearchFormat) {
+    customFormat = activeCustomSearchFormat,
+    dockerCursor = null,
+    previousRows = []) {
   const seq = ++searchRequestSeq;
   const normalizedFormat = normalizeSearchFormat(format);
   activeCustomSearchFormat = normalizeCustomSearchFormat(customFormat);
@@ -4112,7 +4516,8 @@ async function renderSearch(
     payload = await fetchSearchComponents(
         normalizedFormat,
         keyword,
-        activeCustomSearchFormat);
+        activeCustomSearchFormat,
+        dockerCursor);
   } catch (error) {
     if (seq !== searchRequestSeq) return;
     document.getElementById("component-total").textContent = "0";
@@ -4121,31 +4526,41 @@ async function renderSearch(
     return;
   }
   if (seq !== searchRequestSeq) return;
-  const rows = payload.items || [];
+  const rows = [...previousRows, ...(payload.items || [])];
   componentsCache = rows;
   document.getElementById("component-total").textContent = rows.length.toLocaleString("en-US");
   if (!rows.length) {
     document.getElementById("component-table").innerHTML =
-      '<tr><td colspan="7" class="muted-row">No components found.</td></tr>';
-    return;
+      `<tr><td colspan="7" class="muted-row">${payload.dockerCursor ? "No matching components in this page." : "No components found."}</td></tr>`;
+  } else {
+    document.getElementById("component-table").innerHTML = rows.map((component, index) => {
+      const browsePath = componentBrowsePath(component);
+      const title = browsePath
+        ? `Open ${component.repository}/${browsePath} in Browse`
+        : `Open ${component.repository} in Browse`;
+      return `
+      <tr class="component-result-row" data-component-result-index="${index}" tabindex="0" title="${escapeHtml(title)}">
+        <td class="icon-column">${lucideIcon("package-search", "component-icon")}</td>
+        <td>${escapeHtml(component.name)}</td>
+        <td>${component.group ? escapeHtml(component.group) : lucideIcon("circle-slash", "health-muted")}</td>
+        <td>${escapeHtml(component.version)}</td>
+        <td>${escapeHtml(component.format)}</td>
+        <td>${escapeHtml(component.repository)}${component.details?.sourceRepository && component.details.sourceRepository !== component.repository
+          ? ` <span class="health-muted">(${escapeHtml(component.details.sourceRepository)})</span>` : ""}</td>
+        <td class="expand-column">${lucideIcon("chevron-right")}</td>
+      </tr>
+    `;
+    }).join("");
   }
-  document.getElementById("component-table").innerHTML = rows.map((component, index) => {
-    const browsePath = componentBrowsePath(component);
-    const title = browsePath
-      ? `Open ${component.repository}/${browsePath} in Browse`
-      : `Open ${component.repository} in Browse`;
-    return `
-    <tr class="component-result-row" data-component-result-index="${index}" tabindex="0" title="${escapeHtml(title)}">
-      <td class="icon-column">${lucideIcon("package-search", "component-icon")}</td>
-      <td>${escapeHtml(component.name)}</td>
-      <td>${component.group ? escapeHtml(component.group) : lucideIcon("circle-slash", "health-muted")}</td>
-      <td>${escapeHtml(component.version)}</td>
-      <td>${escapeHtml(component.format)}</td>
-      <td>${escapeHtml(component.repository)}</td>
-      <td class="expand-column">${lucideIcon("chevron-right")}</td>
-    </tr>
-  `;
-  }).join("");
+  if (payload.dockerCursor) {
+    const table = document.getElementById("component-table");
+    table.insertAdjacentHTML("beforeend", '<tr><td colspan="7"><button type="button" id="continue-docker-search">Continue Docker search</button></td></tr>');
+    document.getElementById("continue-docker-search").addEventListener("click", () => {
+      const unchanged = document.getElementById("component-keyword").value.trim().toLowerCase() === keyword;
+      return renderSearch(normalizedFormat, activeCustomSearchFormat,
+          unchanged ? payload.dockerCursor : null, unchanged ? rows : []);
+    });
+  }
   document.querySelectorAll("#component-table .component-result-row").forEach((tr) => {
     const result = rows[Number(tr.dataset.componentResultIndex)];
     tr.addEventListener("click", () => openSearchResult(result));
@@ -4387,6 +4802,12 @@ function selectSearchFormat(format, customFormat = activeCustomSearchFormat) {
 
 function applyHashRoute() {
   const route = parseBrowseHash();
+  // Resolve data-dependent routes only after session and repository discovery. In particular,
+  // an empty startup cache must not redirect signed-in users or discard repository deep links.
+  if (!initialDataLoaded) {
+    switchView(!route || route.view === "welcome" ? "welcome" : "loading");
+    return Boolean(route);
+  }
   if (!route) return false;
   if (route.view === "welcome") {
     showWelcome(false);
@@ -4408,19 +4829,22 @@ function applyHashRoute() {
     return true;
   }
   switchView("browse");
-  if (route.repo && repositoryExists(route.repo)) showRepositoryTree(route.repo, false, route.path || "");
+  if (route.repo && repositoryExists(route.repo)) {
+    showRepositoryTree(route.repo, false, route.path || "", route.source || "");
+  }
   else showRepositoryList(false);
   canonicalizeBrowseRoute();
   return true;
 }
 
 async function bootstrap() {
+  const version = ++discoveryVersion;
+  applyHashRoute();
   hydrateAuthSnapshot();
-  const initialRoute = parseBrowseHash();
-  if (initialRoute?.view === "welcome") showWelcome(false);
 
   const contextPromise = fetchUiContext()
     .then((context) => {
+      if (version !== discoveryVersion) return false;
       applyUiContext(context);
       return true;
     })
@@ -4430,11 +4854,13 @@ async function bootstrap() {
       fetchUploadSpecs(),
     ])
     .then(([repositories, uploadSpecs]) => {
+      if (version !== discoveryVersion) return false;
       repositoriesCache = repositories;
       uploadSpecsCache = uploadSpecs;
       return true;
     })
     .catch((error) => {
+      if (version !== discoveryVersion) return false;
       repositoriesCache = [];
       uploadSpecsCache = new Map();
       document.getElementById("repository-table").innerHTML =
@@ -4443,7 +4869,10 @@ async function bootstrap() {
     });
 
   await Promise.all([contextPromise, repositoriesPromise]);
-  if (!applyHashRoute()) renderRepoList();
+  if (version !== discoveryVersion) return;
+  initialDataLoaded = true;
+  // Re-read the current hash: the user may have navigated while the requests were pending.
+  if (!applyHashRoute()) showWelcome(false);
   openPendingLoginIfRequested();
 }
 
@@ -4476,6 +4905,9 @@ function ensureUploadableRepositories(force = false) {
 }
 
 async function handleLoginSuccess(event) {
+  // A successful login starts a newer discovery. Its data and route must not wait for,
+  // or be overwritten by, an earlier anonymous bootstrap or login refresh.
+  const version = ++discoveryVersion;
   const target = safeLocalReturnTo(event.detail?.returnTo) || currentReturnTo();
   try {
     const [context, repositories, uploadSpecs] = await Promise.all([
@@ -4483,13 +4915,16 @@ async function handleLoginSuccess(event) {
       fetchRepositories(),
       fetchUploadSpecs(),
     ]);
+    if (version !== discoveryVersion) return;
     applyUiContext(context);
     repositoriesCache = repositories;
     uploadSpecsCache = uploadSpecs;
     uploadRepositoriesLoaded = false;
     uploadRepositoriesCache = [];
-    if (!applyHashRoute()) renderRepoList();
+    initialDataLoaded = true;
+    if (!applyHashRoute()) showWelcome(false);
   } catch (error) {
+    if (version !== discoveryVersion) return;
     window.location.href = target;
     return;
   }

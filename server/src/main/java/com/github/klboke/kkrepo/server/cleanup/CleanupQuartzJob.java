@@ -2,12 +2,14 @@ package com.github.klboke.kkrepo.server.cleanup;
 
 import com.github.klboke.kkrepo.persistence.jdbc.api.CleanupPolicyDao;
 import java.time.Instant;
+import java.util.Date;
 import org.quartz.DisallowConcurrentExecution;
 import org.quartz.JobExecutionContext;
 import org.quartz.JobExecutionException;
+import org.quartz.Scheduler;
+import org.quartz.Trigger;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.quartz.QuartzJobBean;
 
 /** Executes one policy fire selected by the clustered Quartz JDBC JobStore. */
@@ -19,14 +21,18 @@ public class CleanupQuartzJob extends QuartzJobBean {
 
   private static final Logger log = LoggerFactory.getLogger(CleanupQuartzJob.class);
 
-  @Autowired
-  private CleanupPolicyDao cleanupDao;
+  private final CleanupPolicyDao cleanupDao;
+  private final CleanupRunService runs;
+  private final CleanupRuntimeProperties runtimeProperties;
 
-  @Autowired
-  private CleanupRunService runs;
-
-  @Autowired
-  private CleanupRuntimeProperties runtimeProperties;
+  public CleanupQuartzJob(
+      CleanupPolicyDao cleanupDao,
+      CleanupRunService runs,
+      CleanupRuntimeProperties runtimeProperties) {
+    this.cleanupDao = java.util.Objects.requireNonNull(cleanupDao);
+    this.runs = java.util.Objects.requireNonNull(runs);
+    this.runtimeProperties = java.util.Objects.requireNonNull(runtimeProperties);
+  }
 
   @Override
   protected void executeInternal(JobExecutionContext context) throws JobExecutionException {
@@ -36,7 +42,7 @@ public class CleanupQuartzJob extends QuartzJobBean {
       log.info("Ignoring cleanup Quartz fire while cleanup execution is disabled: policy={}", policyId);
       return;
     }
-    Instant scheduledFor = context.getScheduledFireTime().toInstant();
+    Instant scheduledFor = resolveScheduledFor(context, policyId, expectedRevision);
     try {
       boolean current = cleanupDao.findPolicy(policyId)
           .filter(policy -> policy.revision() == expectedRevision && "ACTIVE".equals(policy.state()))
@@ -64,6 +70,88 @@ public class CleanupQuartzJob extends QuartzJobBean {
           e);
       throw new JobExecutionException(
           e, context.getRefireCount() < MAX_IMMEDIATE_REFIRE_COUNT);
+    }
+  }
+
+  private static Instant resolveScheduledFor(
+      JobExecutionContext context, long policyId, long expectedRevision)
+      throws JobExecutionException {
+    Date scheduledFireTime = context.getScheduledFireTime();
+    if (scheduledFireTime != null) {
+      return scheduledFireTime.toInstant();
+    }
+
+    Date fireTime = context.getFireTime();
+    Trigger trigger = context.getTrigger();
+    Object triggerKey = trigger == null ? null : trigger.getKey();
+    Object originalScheduledFireTime = context.getMergedJobDataMap()
+        .get(Scheduler.FAILED_JOB_ORIGINAL_TRIGGER_SCHEDULED_FIRETIME_IN_MILLISECONDS);
+    if (context.isRecovering()) {
+      Instant recoveredScheduledFor = recoveryScheduledFor(originalScheduledFireTime);
+      if (recoveredScheduledFor != null) {
+        log.warn(
+            "Cleanup Quartz recovery fire has no scheduled fire time; using original trigger "
+                + "metadata: policy={} revision={} scheduledFor={} fireTime={} trigger={} "
+                + "fireInstanceId={}",
+            policyId,
+            expectedRevision,
+            recoveredScheduledFor,
+            fireTime == null ? null : fireTime.toInstant(),
+            triggerKey,
+            context.getFireInstanceId());
+        return recoveredScheduledFor;
+      }
+
+      IllegalStateException missingRecoveryIdentity = new IllegalStateException(
+          "Recovering Quartz context has neither scheduled fire time nor valid original trigger "
+              + "scheduled-fire-time metadata");
+      log.error(
+          "Rejecting cleanup Quartz recovery fire without its original scheduled identity: "
+              + "policy={} revision={} fireTime={} originalScheduledFireTime={} trigger={} "
+              + "fireInstanceId={}",
+          policyId,
+          expectedRevision,
+          fireTime == null ? null : fireTime.toInstant(),
+          originalScheduledFireTime,
+          triggerKey,
+          context.getFireInstanceId(),
+          missingRecoveryIdentity);
+      throw new JobExecutionException(missingRecoveryIdentity, false);
+    }
+
+    if (fireTime != null) {
+      log.warn(
+          "Cleanup Quartz fire has no scheduled fire time; using actual fire time: "
+              + "policy={} revision={} fireTime={} trigger={} fireInstanceId={} recovering={}",
+          policyId,
+          expectedRevision,
+          fireTime.toInstant(),
+          triggerKey,
+          context.getFireInstanceId(),
+          context.isRecovering());
+      return fireTime.toInstant();
+    }
+
+    IllegalStateException missingFireTime =
+        new IllegalStateException("Quartz context has neither scheduled nor actual fire time");
+    log.error(
+        "Rejecting cleanup Quartz fire without a usable fire time: "
+            + "policy={} revision={} trigger={} fireInstanceId={} recovering={}",
+        policyId,
+        expectedRevision,
+        triggerKey,
+        context.getFireInstanceId(),
+        context.isRecovering(),
+        missingFireTime);
+    throw new JobExecutionException(missingFireTime, false);
+  }
+
+  private static Instant recoveryScheduledFor(Object originalScheduledFireTime) {
+    if (originalScheduledFireTime == null) return null;
+    try {
+      return Instant.ofEpochMilli(Long.parseLong(originalScheduledFireTime.toString()));
+    } catch (NumberFormatException invalid) {
+      return null;
     }
   }
 }

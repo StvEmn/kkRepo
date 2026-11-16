@@ -18,9 +18,14 @@ import com.github.klboke.kkrepo.server.maven.BlobStorageRegistry;
 import com.github.klboke.kkrepo.server.maven.MavenResponse;
 import com.github.klboke.kkrepo.server.maven.RepositoryRuntime;
 import com.github.klboke.kkrepo.server.securityscan.ArtifactDownloadPolicy;
+import com.github.klboke.kkrepo.server.transaction.TransientTransactionRetry;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -46,6 +51,7 @@ public class NpmHostedService {
   private final AssetMetadataCache assetMetadataCache;
   private final ArtifactDownloadPolicy downloadPolicy;
   private final NpmPublishParser publishParser;
+  private final TransientTransactionRetry publicationRetry;
 
   private record PublishWritePlan(Optional<Map<String, Object>> existingPackageRoot, String effectiveRevision) {}
 
@@ -58,7 +64,6 @@ public class NpmHostedService {
     this(assetDao, blobStorageRegistry, writer, mapper, assetMetadataCache, null);
   }
 
-  @org.springframework.beans.factory.annotation.Autowired
   public NpmHostedService(
       AssetDao assetDao,
       BlobStorageRegistry blobStorageRegistry,
@@ -76,6 +81,15 @@ public class NpmHostedService {
         new NpmPublishParser(mapper));
   }
 
+  @org.springframework.beans.factory.annotation.Autowired
+  public NpmHostedService(
+      AssetDao assetDao, BlobStorageRegistry blobStorageRegistry, NpmAssetWriter writer,
+      ObjectMapper mapper, AssetMetadataCache assetMetadataCache,
+      ArtifactDownloadPolicy downloadPolicy, TransientTransactionRetry publicationRetry) {
+    this(assetDao, blobStorageRegistry, writer, mapper, assetMetadataCache, downloadPolicy,
+        new NpmPublishParser(mapper), publicationRetry);
+  }
+
   NpmHostedService(
       AssetDao assetDao,
       BlobStorageRegistry blobStorageRegistry,
@@ -84,6 +98,15 @@ public class NpmHostedService {
       AssetMetadataCache assetMetadataCache,
       ArtifactDownloadPolicy downloadPolicy,
       NpmPublishParser publishParser) {
+    this(assetDao, blobStorageRegistry, writer, mapper, assetMetadataCache, downloadPolicy,
+        publishParser, null);
+  }
+
+  NpmHostedService(
+      AssetDao assetDao, BlobStorageRegistry blobStorageRegistry, NpmAssetWriter writer,
+      ObjectMapper mapper, AssetMetadataCache assetMetadataCache,
+      ArtifactDownloadPolicy downloadPolicy, NpmPublishParser publishParser,
+      TransientTransactionRetry publicationRetry) {
     this.assetDao = assetDao;
     this.blobStorageRegistry = blobStorageRegistry;
     this.writer = writer;
@@ -91,6 +114,7 @@ public class NpmHostedService {
     this.assetMetadataCache = assetMetadataCache;
     this.downloadPolicy = downloadPolicy;
     this.publishParser = publishParser;
+    this.publicationRetry = publicationRetry;
   }
 
   public MavenResponse get(RepositoryRuntime runtime, NpmPath path, String repositoryBaseUrl, boolean headOnly) {
@@ -110,7 +134,7 @@ public class NpmHostedService {
       return getPackage(runtime, path.packageId(), repositoryBaseUrl, headOnly, variant);
     }
     if (path.isTarball()) {
-      return getTarball(runtime, path.packageId(), path.tarballName(), headOnly);
+      return getTarball(runtime, path.packageId(), path.readTarballName(), headOnly);
     }
     if (path.kind() == NpmPath.Kind.DIST_TAGS) {
       return getDistTags(runtime, path.packageId(), headOnly);
@@ -127,30 +151,33 @@ public class NpmHostedService {
       String createdByIp) {
     enforceHosted(runtime);
     try (NpmPublishParser.PublishRequest publish = publishParser.parse(body)) {
-      Map<String, Object> incoming = publish.packageRoot();
-      String payloadName = NpmMetadata.stringValue(incoming.get(NpmMetadata.NAME), packageId.id());
-      if (!packageId.id().equals(payloadName)) {
-        throw new NpmExceptions.BadRequestException(
-            "Package name mismatch. Path is " + packageId.id() + " but payload is " + payloadName);
-      }
+      return publicationTransaction("Publish npm package " + runtime.name() + "/" + packageId.id(), () -> {
+        // Each transaction gets fresh metadata and fresh streams from the request-scoped staging files.
+        Map<String, Object> incoming = NpmMetadata.deepCopy(publish.packageRoot());
+        String payloadName = NpmMetadata.stringValue(incoming.get(NpmMetadata.NAME), packageId.id());
+        if (!packageId.id().equals(payloadName)) {
+          throw new NpmExceptions.BadRequestException(
+              "Package name mismatch. Path is " + packageId.id() + " but payload is " + payloadName);
+        }
 
-      PublishWritePlan plan = packageRootWritePlan(runtime, packageId, revision, incoming);
-      validateAttachmentsWrite(runtime, packageId, incoming, publish.attachments());
-      long blobStoreId = requireBlobStore(runtime);
-      BlobStorage storage = blobStorageRegistry.forBlobStoreId(blobStoreId);
-      writeAttachments(
-          runtime,
-          storage,
-          blobStoreId,
-          packageId,
-          incoming,
-          publish.attachments(),
-          createdBy,
-          createdByIp);
-      Map<String, Object> toStore = packageRootForStorage(packageId, incoming, plan);
-      byte[] json = NpmResponseSupport.write(mapper, toStore);
-      writer.writePackageRoot(runtime, storage, blobStoreId, packageId, json, createdBy, createdByIp);
-      return NpmResponseSupport.success(mapper);
+        PublishWritePlan plan = packageRootWritePlan(runtime, packageId, revision, incoming);
+        validateAttachmentsWrite(runtime, packageId, incoming, publish.attachments());
+        long blobStoreId = requireBlobStore(runtime);
+        BlobStorage storage = blobStorageRegistry.forBlobStoreId(blobStoreId);
+        writeAttachments(
+            runtime,
+            storage,
+            blobStoreId,
+            packageId,
+            incoming,
+            publish.attachments(),
+            createdBy,
+            createdByIp);
+        Map<String, Object> toStore = packageRootForStorage(packageId, incoming, plan);
+        byte[] json = NpmResponseSupport.write(mapper, toStore);
+        writer.writePackageRoot(runtime, storage, blobStoreId, packageId, json, createdBy, createdByIp);
+        return NpmResponseSupport.success(mapper);
+      });
     } catch (IOException e) {
       throw new NpmExceptions.BadRequestException("Invalid npm publish JSON", e);
     }
@@ -159,14 +186,16 @@ public class NpmHostedService {
   public MavenResponse deletePackage(RepositoryRuntime runtime, NpmPackageId packageId, String revision) {
     enforceHosted(runtime);
     enforceDeletePolicy(runtime, "package");
-    assertRevisionIfPresent(runtime, packageId, revision);
-    long blobStoreId = requireBlobStore(runtime);
-    BlobStorage storage = blobStorageRegistry.forBlobStoreId(blobStoreId);
-    int deleted = writer.deletePackage(runtime, storage, packageId);
-    if (deleted == 0) {
-      throw new NpmExceptions.NpmNotFoundException("Package '" + packageId.id() + "' not found");
-    }
-    return NpmResponseSupport.success(mapper);
+    return mutatePackageRoot(runtime, packageId, existing -> {
+      assertRevisionIfPresent(packageId, revision, existing);
+      long blobStoreId = requireBlobStore(runtime);
+      BlobStorage storage = blobStorageRegistry.forBlobStoreId(blobStoreId);
+      int deleted = writer.deletePackage(runtime, storage, packageId);
+      if (deleted == 0) {
+        throw new NpmExceptions.NpmNotFoundException("Package '" + packageId.id() + "' not found");
+      }
+      return NpmResponseSupport.success(mapper);
+    });
   }
 
   public MavenResponse uploadTarball(
@@ -183,7 +212,30 @@ public class NpmHostedService {
       throw new NpmExceptions.BadRequestException("npm upload only accepts .tgz package archives");
     }
 
-    Map<String, Object> packageJson = readPackageJson(asset);
+    try (StagedArchive archive = new StagedArchive(Files.createTempFile("kkrepo-npm-multipart-", ".tgz"))) {
+      try (InputStream input = asset.getInputStream()) {
+        Files.copy(input, archive.file(), StandardCopyOption.REPLACE_EXISTING);
+      }
+      Map<String, Object> packageJson = readPackageJson(archive.file());
+      try {
+        return publicationTransaction("Upload npm tarball " + runtime.name() + "/" + tarballName, () -> {
+          try {
+            return persistTarball(runtime, tarballName, asset.getContentType(), archive.file(),
+                packageJson, createdBy, createdByIp);
+          } catch (IOException failure) {
+            // TransactionTemplate needs a runtime failure to roll back checked I/O errors.
+            throw new UncheckedIOException(failure);
+          }
+        });
+      } catch (UncheckedIOException failure) {
+        throw failure.getCause();
+      }
+    }
+  }
+
+  private MavenResponse persistTarball(
+      RepositoryRuntime runtime, String tarballName, String contentType, Path archive,
+      Map<String, Object> packageJson, String createdBy, String createdByIp) throws IOException {
     String packageName = NpmMetadata.stringValue(packageJson.get(NpmMetadata.NAME), null);
     String version = NpmMetadata.stringValue(packageJson.get(NpmMetadata.VERSION), null);
     if (packageName == null || packageName.isBlank()) {
@@ -200,7 +252,7 @@ public class NpmHostedService {
       throw new NpmExceptions.BadRequestException(e.getMessage(), e);
     }
 
-    Optional<Map<String, Object>> existingRoot = loadPackageRootMap(runtime, packageId);
+    Optional<Map<String, Object>> existingRoot = loadPackageRootMapForUpdate(runtime, packageId);
     enforceWritePolicy(runtime, "package-root", false);
     if (existingRoot.map(root -> NpmMetadata.versions(root).containsKey(version)).orElse(false)) {
       throw new NpmExceptions.WritePolicyDenied(
@@ -216,9 +268,9 @@ public class NpmHostedService {
     long blobStoreId = requireBlobStore(runtime);
     BlobStorage storage = blobStorageRegistry.forBlobStoreId(blobStoreId);
     NpmAssetWriter.Stored stored;
-    try (InputStream body = asset.getInputStream()) {
+    try (InputStream body = Files.newInputStream(archive)) {
       stored = writer.writeTarball(runtime, storage, blobStoreId, packageId, version, tarballName,
-          body, asset.getContentType(), createdBy, createdByIp, Map.of());
+          body, contentType, createdBy, createdByIp, Map.of());
     }
 
     Map<String, Object> packageRoot = existingRoot
@@ -241,6 +293,15 @@ public class NpmHostedService {
     return MavenResponse.created();
   }
 
+  private <T> T publicationTransaction(String operation, java.util.function.Supplier<T> publication) {
+    // The complete publication, including policy revalidation, owns every retry transaction.
+    return publicationRetry == null ? publication.get() : publicationRetry.execute(operation, publication);
+  }
+
+  private record StagedArchive(Path file) implements java.io.Closeable {
+    @Override public void close() throws IOException { Files.deleteIfExists(file); }
+  }
+
   public MavenResponse deleteTarball(
       RepositoryRuntime runtime,
       NpmPackageId packageId,
@@ -248,15 +309,19 @@ public class NpmHostedService {
       String revision) {
     enforceHosted(runtime);
     enforceDeletePolicy(runtime, "tarball");
-    long blobStoreId = requireBlobStore(runtime);
-    BlobStorage storage = blobStorageRegistry.forBlobStoreId(blobStoreId);
-    int deleted = writer.deletePath(runtime, storage, packageId.tarballPath(tarballName));
-    if (deleted == 0) {
-      throw new NpmExceptions.NpmNotFoundException(
-          "Tarball '" + tarballName + "' in package '" + packageId.id() + "' not found");
-    }
-    removeVersionForTarball(runtime, packageId, tarballName, "system", null);
-    return NpmResponseSupport.success(mapper);
+    return mutatePackageRoot(runtime, packageId, existing -> {
+      long blobStoreId = requireBlobStore(runtime);
+      BlobStorage storage = blobStorageRegistry.forBlobStoreId(blobStoreId);
+      int deleted = writer.deletePath(runtime, storage, packageId.tarballPath(tarballName));
+      if (deleted == 0) {
+        throw new NpmExceptions.NpmNotFoundException(
+            "Tarball '" + tarballName + "' in package '" + packageId.id() + "' not found");
+      }
+      if (existing.isPresent() && removeVersionsForTarballs(existing.get(), List.of(tarballName))) {
+        savePackageRoot(runtime, packageId, existing.get(), "system", null);
+      }
+      return NpmResponseSupport.success(mapper);
+    });
   }
 
   /**
@@ -293,13 +358,13 @@ public class NpmHostedService {
     }
     long blobStoreId = requireBlobStore(runtime);
     BlobStorage storage = blobStorageRegistry.forBlobStoreId(blobStoreId);
-    Map<String, Object> packageRoot = loadPackageRootMap(runtime, packageId).orElse(null);
+    Map<String, Object> packageRoot = loadPackageRootMapForUpdate(runtime, packageId).orElse(null);
     List<Integer> deleted = new ArrayList<>(paths.size());
     List<String> deletedTarballs = new ArrayList<>();
     for (NpmPath path : paths) {
       int count = writer.deletePath(runtime, storage, path.assetPath());
       deleted.add(count);
-      if (count > 0) deletedTarballs.add(path.tarballName());
+      if (count > 0) deletedTarballs.add(path.readTarballName());
     }
     if (packageRoot != null && removeVersionsForTarballs(packageRoot, deletedTarballs)) {
       savePackageRoot(
@@ -330,18 +395,19 @@ public class NpmHostedService {
     } catch (IOException e) {
       throw new NpmExceptions.BadRequestException("dist-tag payload must be a JSON string", e);
     }
-    Optional<Map<String, Object>> packageRootOpt = loadPackageRootMap(runtime, packageId);
-    if (packageRootOpt.isEmpty()) {
+    return mutatePackageRoot(runtime, packageId, packageRootOpt -> {
+      if (packageRootOpt.isEmpty()) {
+        return NpmResponseSupport.success(mapper);
+      }
+      Map<String, Object> packageRoot = packageRootOpt.get();
+      if (!NpmMetadata.versions(packageRoot).containsKey(version)) {
+        throw new NpmExceptions.BadRequestException(
+            "version " + version + " of package " + packageId.id() + " is not present in repository " + runtime.name());
+      }
+      NpmMetadata.distTags(packageRoot).put(tag, version);
+      savePackageRoot(runtime, packageId, packageRoot, createdBy, createdByIp);
       return NpmResponseSupport.success(mapper);
-    }
-    Map<String, Object> packageRoot = packageRootOpt.get();
-    if (!NpmMetadata.versions(packageRoot).containsKey(version)) {
-      throw new NpmExceptions.BadRequestException(
-          "version " + version + " of package " + packageId.id() + " is not present in repository " + runtime.name());
-    }
-    NpmMetadata.distTags(packageRoot).put(tag, version);
-    savePackageRoot(runtime, packageId, packageRoot, createdBy, createdByIp);
-    return NpmResponseSupport.success(mapper);
+    });
   }
 
   public MavenResponse deleteDistTag(
@@ -355,14 +421,15 @@ public class NpmHostedService {
     if ("latest".equals(tag)) {
       throw new NpmExceptions.BadRequestException("Unable to delete latest");
     }
-    Optional<Map<String, Object>> packageRootOpt = loadPackageRootMap(runtime, packageId);
-    if (packageRootOpt.isEmpty()) {
+    return mutatePackageRoot(runtime, packageId, packageRootOpt -> {
+      if (packageRootOpt.isEmpty()) {
+        return NpmResponseSupport.success(mapper);
+      }
+      Map<String, Object> packageRoot = packageRootOpt.get();
+      NpmMetadata.distTags(packageRoot).remove(tag);
+      savePackageRoot(runtime, packageId, packageRoot, createdBy, createdByIp);
       return NpmResponseSupport.success(mapper);
-    }
-    Map<String, Object> packageRoot = packageRootOpt.get();
-    NpmMetadata.distTags(packageRoot).remove(tag);
-    savePackageRoot(runtime, packageId, packageRoot, createdBy, createdByIp);
-    return NpmResponseSupport.success(mapper);
+    });
   }
 
   Optional<Map<String, Object>> packageRoot(RepositoryRuntime runtime, NpmPackageId packageId) {
@@ -406,8 +473,14 @@ public class NpmHostedService {
             "Package '" + packageId.id() + "' not found"));
     Map<String, Object> packageRoot = packageRoot(metadata)
         .orElseThrow(() -> new NpmExceptions.NpmNotFoundException("Package '" + packageId.id() + "' not found"));
+    if (runtime.isHosted()) {
+      // Publish attachments are stored by their basename, including existing hosted metadata.
+      // Proxy caches use this reader too, and must retain the upstream suffix instead.
+      NpmMetadata.rewriteTarballUrls(packageRoot, packageId, repositoryBaseUrl, false);
+    }
     byte[] bytes = NpmPackumentResponseWriter.write(
-        mapper, packageRoot, null, null, variant, packageId, repositoryBaseUrl);
+        mapper, packageRoot, null, null, variant, packageId,
+        runtime.isHosted() ? null : repositoryBaseUrl);
     AssetBlobRecord blob = metadata.toBlobRecord();
     if (downloadPolicy != null) {
       downloadPolicy.beforeReadFromRepository(
@@ -501,6 +574,7 @@ public class NpmHostedService {
     return contentType;
   }
 
+  @SuppressWarnings("unchecked")
   private void writeAttachments(
       RepositoryRuntime runtime,
       BlobStorage storage,
@@ -521,6 +595,10 @@ public class NpmHostedService {
       try (InputStream tarball = attachment.openStream()) {
         writer.writeTarball(runtime, storage, blobStoreId, packageId, version, tarballName,
             tarball, attachment.contentType(), createdBy, createdByIp, Map.of());
+        Object versionMetadata = NpmMetadata.versions(packageRoot).get(version);
+        if (versionMetadata instanceof Map<?, ?> fields && fields.get(NpmMetadata.DIST) instanceof Map<?, ?> dist) {
+          ((Map<String, Object>) dist).put(NpmMetadata.TARBALL, tarballName);
+        }
       } catch (IOException e) {
         throw new IllegalStateException("Failed to read staged npm attachment " + tarballName, e);
       }
@@ -548,7 +626,7 @@ public class NpmHostedService {
       NpmPackageId packageId,
       String revision,
       Map<String, Object> incoming) {
-    Optional<Map<String, Object>> existingOpt = loadPackageRootMap(runtime, packageId);
+    Optional<Map<String, Object>> existingOpt = loadPackageRootMapForUpdate(runtime, packageId);
     Optional<AssetRecord> existingAsset = assetDao.findAssetByPath(runtime.id(), packageId.id());
     enforceWritePolicy(runtime, "package-root", existingAsset.isPresent());
     String effectiveRevision = revision == null
@@ -583,22 +661,6 @@ public class NpmHostedService {
     return packageRoot;
   }
 
-  private void removeVersionForTarball(
-      RepositoryRuntime runtime,
-      NpmPackageId packageId,
-      String tarballName,
-      String createdBy,
-      String createdByIp) {
-    Optional<Map<String, Object>> packageRootOpt = loadPackageRootMap(runtime, packageId);
-    if (packageRootOpt.isEmpty()) {
-      return;
-    }
-    Map<String, Object> packageRoot = packageRootOpt.get();
-    if (removeVersionsForTarballs(packageRoot, List.of(tarballName))) {
-      savePackageRoot(runtime, packageId, packageRoot, createdBy, createdByIp);
-    }
-  }
-
   private static boolean removeVersionsForTarballs(
       Map<String, Object> packageRoot, List<String> tarballNames) {
     if (tarballNames == null || tarballNames.isEmpty()) return false;
@@ -629,12 +691,35 @@ public class NpmHostedService {
         NpmResponseSupport.write(mapper, packageRoot), createdBy, createdByIp);
   }
 
+  private <T> T mutatePackageRoot(RepositoryRuntime runtime, NpmPackageId packageId,
+      java.util.function.Function<Optional<Map<String, Object>>, T> mutation) {
+    return publicationTransaction("Modify npm package " + runtime.name() + "/" + packageId.id(),
+        () -> mutation.apply(loadPackageRootMapForUpdate(runtime, packageId)));
+  }
+
+  private Optional<Map<String, Object>> loadPackageRootMapForUpdate(RepositoryRuntime runtime, NpmPackageId packageId) {
+    // Do not gap-lock an absent package: first publication still arbitrates through unique inserts.
+    Optional<AssetRecord> existing = assetDao.findAssetByPath(runtime.id(), packageId.id());
+    if (existing.isEmpty()) return Optional.empty();
+    AssetRecord current = assetDao.findAssetByIdForUpdate(existing.get().id())
+        .orElseThrow(() -> new org.springframework.dao.CannotAcquireLockException(
+            "npm package root changed while acquiring its publication lock"));
+    return loadPackageRootMap(packageId, Optional.of(current), true);
+  }
+
   private Optional<Map<String, Object>> loadPackageRootMap(RepositoryRuntime runtime, NpmPackageId packageId) {
-    Optional<AssetRecord> asset = assetDao.findAssetByPath(runtime.id(), packageId.id());
+    return loadPackageRootMap(packageId, assetDao.findAssetByPath(runtime.id(), packageId.id()), false);
+  }
+
+  private Optional<Map<String, Object>> loadPackageRootMap(
+      NpmPackageId packageId, Optional<AssetRecord> asset, boolean locked) {
     if (asset.isEmpty() || asset.get().assetBlobId() == null) {
       return Optional.empty();
     }
-    AssetBlobRecord blob = assetDao.findBlobById(asset.get().assetBlobId()).orElse(null);
+    // A lock wait can advance the root past a MySQL repeatable-read snapshot. Use a
+    // current read for its immutable blob too, so the new root cannot appear empty.
+    AssetBlobRecord blob = (locked ? assetDao.lockLiveBlobById(asset.get().assetBlobId())
+        : assetDao.findBlobById(asset.get().assetBlobId())).orElse(null);
     if (blob == null) {
       return Optional.empty();
     }
@@ -650,11 +735,12 @@ public class NpmHostedService {
     }
   }
 
-  private void assertRevisionIfPresent(RepositoryRuntime runtime, NpmPackageId packageId, String revision) {
+  private void assertRevisionIfPresent(NpmPackageId packageId, String revision,
+      Optional<Map<String, Object>> packageRoot) {
     if (revision == null) {
       return;
     }
-    Map<String, Object> existing = loadPackageRootMap(runtime, packageId)
+    Map<String, Object> existing = packageRoot
         .orElseThrow(() -> new NpmExceptions.NpmNotFoundException("Package '" + packageId.id() + "' not found"));
     String oldRev = NpmMetadata.stringValue(existing.get(NpmMetadata.META_REV), null);
     if (!revision.equals(oldRev)) {
@@ -693,8 +779,8 @@ public class NpmHostedService {
     return id;
   }
 
-  private Map<String, Object> readPackageJson(MultipartFile asset) throws IOException {
-    try (InputStream raw = asset.getInputStream();
+  private Map<String, Object> readPackageJson(Path archive) throws IOException {
+    try (InputStream raw = Files.newInputStream(archive);
         GzipCompressorInputStream gzip = new GzipCompressorInputStream(raw);
         TarArchiveInputStream tar = new TarArchiveInputStream(gzip)) {
       TarArchiveEntry entry;

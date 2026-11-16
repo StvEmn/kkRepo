@@ -1,5 +1,6 @@
 package com.github.klboke.kkrepo.server.browse;
 
+import com.github.klboke.kkrepo.server.config.RepositoryUrlPrefix;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.klboke.kkrepo.core.BlobReference;
@@ -33,6 +34,8 @@ import com.github.klboke.kkrepo.protocol.ansible.AnsibleGalaxyPathParser;
 import com.github.klboke.kkrepo.protocol.conda.CondaPath;
 import com.github.klboke.kkrepo.protocol.npm.NpmMetadata;
 import com.github.klboke.kkrepo.protocol.npm.NpmPackageId;
+import com.github.klboke.kkrepo.protocol.ohpm.OhpmBrowsePath;
+import com.github.klboke.kkrepo.server.ohpm.OhpmBrowseService;
 import com.github.klboke.kkrepo.protocol.r.RPathParser;
 import com.github.klboke.kkrepo.protocol.swift.SwiftPath;
 import com.github.klboke.kkrepo.protocol.swift.SwiftPathParser;
@@ -83,6 +86,12 @@ public class BrowseAssetDetailService {
   private RRegistryDao rDao;
   private BrowseNodeDao browseNodeDao;
   private ConanRegistryDao conanDao;
+  private OhpmBrowseService ohpmBrowse;
+
+  @Autowired
+  void setOhpmBrowseService(OhpmBrowseService ohpmBrowse) {
+    this.ohpmBrowse = ohpmBrowse;
+  }
   private final BlobStorageRegistry blobStorageRegistry;
   private final ObjectMapper objectMapper;
 
@@ -274,7 +283,9 @@ public class BrowseAssetDetailService {
         asset.size(),
         asset.contentType(),
         asset.lastUpdatedAt(),
-        BrowseDownloadUrls.asset(visibleRepository, downloadPath),
+        source.format() == RepositoryFormat.OHPM
+            ? ohpmBrowse.downloadUrl(visibleRepository, source, publicPath)
+            : BrowseDownloadUrls.asset(visibleRepository, downloadPath),
         text(firstPresent(asset.attributes().get("createdBy"), blob.createdBy())),
         text(firstPresent(asset.attributes().get("createdByIp"), blob.createdByIp())),
         checksum,
@@ -290,6 +301,7 @@ public class BrowseAssetDetailService {
         huggingFace,
         swift,
         ansible,
+        source.format() == RepositoryFormat.OHPM ? ohpmBrowse.attributes(source, publicPath) : Map.of(),
         provenance);
   }
 
@@ -610,6 +622,7 @@ public class BrowseAssetDetailService {
           Map.of(),
           swiftReleaseAttributes(source, row),
           Map.of(),
+          Map.of(),
           Map.of("dynamic", true, "hashes_not_verified", false)));
     }
     return Optional.empty();
@@ -711,6 +724,7 @@ public class BrowseAssetDetailService {
           Map.of(),
           Map.of(),
           swiftManifestAttributes(source, row, manifestRow),
+          Map.of(),
           Map.of(),
           Map.of("dynamic", true, "hashes_not_verified", false)));
     }
@@ -858,6 +872,7 @@ public class BrowseAssetDetailService {
         Map.of(),
         Map.of(),
         Map.of(),
+        Map.of(),
         provenance);
   }
 
@@ -877,11 +892,12 @@ public class BrowseAssetDetailService {
         null,
         "application/json",
         null,
-        "/repository/" + repository.name() + "/config.json",
+        RepositoryUrlPrefix.currentPath() + repository.name() + "/config.json",
         "kkrepo",
         null,
         Map.of(),
         content,
+        Map.of(),
         Map.of(),
         Map.of(),
         Map.of(),
@@ -949,13 +965,8 @@ public class BrowseAssetDetailService {
           .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Asset not found"));
       return new ResolvedAsset(visibleRepository, asset, null);
     }
-    List<RepositoryRecord> members = visibleRepository.format() == RepositoryFormat.SWIFT
-        ? BrowseRepositorySources.swiftSources(visibleRepository, repositoryDao)
-        : visibleRepository.format() == RepositoryFormat.ANSIBLEGALAXY
-            ? BrowseRepositorySources.ansibleSources(visibleRepository, repositoryDao)
-            : visibleRepository.format() == RepositoryFormat.CONDA
-                ? BrowseRepositorySources.condaSources(visibleRepository, repositoryDao)
-            : repositoryDao.listMembers(visibleRepository.id());
+    List<RepositoryRecord> members = BrowseRepositorySources.sources(
+        visibleRepository, repositoryDao);
     if (sourceRepositoryName != null && !sourceRepositoryName.isBlank()) {
       RepositoryRecord source = members.stream()
           .filter(member -> member.name().equals(sourceRepositoryName))
@@ -1025,7 +1036,7 @@ public class BrowseAssetDetailService {
           visibleRepository, normalized, sourceRepositoryName, "Hugging Face");
     }
     if (visibleRepository.format() == RepositoryFormat.R
-        && isRBrowseProjection(normalized)) {
+        && new RPathParser().parseBrowseProjection(normalized).hostedPackage()) {
       return projectedStoragePath(
           visibleRepository, normalized, sourceRepositoryName, "R");
     }
@@ -1044,10 +1055,7 @@ public class BrowseAssetDetailService {
       }
     }
     if (visibleRepository.format() == RepositoryFormat.PYPI
-        && !normalized.isEmpty()
-        && !normalized.equals("simple")
-        && !normalized.startsWith("simple/")
-        && !normalized.startsWith("packages/")) {
+        && !normalized.isEmpty()) {
       return new ResolvedStoragePath("packages/" + normalized, sourceRepositoryName);
     }
     if (visibleRepository.format() == RepositoryFormat.ANSIBLEGALAXY) {
@@ -1056,6 +1064,15 @@ public class BrowseAssetDetailService {
           && AnsibleGalaxyPathParser.isArtifactFilename(segments[3])) {
         return new ResolvedStoragePath(
             AnsibleGalaxyPathParser.ARTIFACT_BASE + segments[3], sourceRepositoryName);
+      }
+    }
+    if (visibleRepository.format() == RepositoryFormat.OHPM) {
+      try {
+        var path = OhpmBrowsePath.parse(normalized);
+        if (path.filename() == null) throw new IllegalArgumentException("Select an OHPM archive");
+        return new ResolvedStoragePath(path.storagePath(), sourceRepositoryName);
+      } catch (IllegalArgumentException invalid) {
+        throw new ResponseStatusException(HttpStatus.BAD_REQUEST, invalid.getMessage());
       }
     }
     if (visibleRepository.format() == RepositoryFormat.CONDA) {
@@ -1095,27 +1112,6 @@ public class BrowseAssetDetailService {
       }
     }
     return new ResolvedStoragePath(normalized, sourceRepositoryName);
-  }
-
-  private static boolean isRBrowseProjection(String path) {
-    String[] segments = path.split("/", -1);
-    int coordinateOffset;
-    if (segments.length == 5
-        && "src".equals(segments[0])
-        && "contrib".equals(segments[1])) {
-      coordinateOffset = 2;
-    } else if (segments.length == 3) {
-      // Accept the pre-alignment projection long enough for existing nodes to remain operable.
-      coordinateOffset = 0;
-    } else {
-      return false;
-    }
-    try {
-      return segments[coordinateOffset + 2].equals(RPathParser.sourceFilename(
-          segments[coordinateOffset], segments[coordinateOffset + 1]));
-    } catch (IllegalArgumentException ignored) {
-      return false;
-    }
   }
 
   private ResolvedStoragePath projectedStoragePath(
@@ -1698,5 +1694,6 @@ public class BrowseAssetDetailService {
       Map<String, Object> huggingface,
       Map<String, Object> swift,
       Map<String, Object> ansible,
+      Map<String, Object> ohpm,
       Map<String, Object> provenance) {}
 }

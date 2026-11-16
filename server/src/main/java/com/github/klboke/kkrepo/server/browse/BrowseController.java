@@ -1,5 +1,6 @@
 package com.github.klboke.kkrepo.server.browse;
 
+import com.github.klboke.kkrepo.server.config.RepositoryUrlPrefix;
 import com.github.klboke.kkrepo.auth.AccessDecision;
 import com.github.klboke.kkrepo.auth.PermissionAction;
 import com.github.klboke.kkrepo.auth.RepositoryPermission;
@@ -14,6 +15,7 @@ import com.github.klboke.kkrepo.protocol.ansible.AnsibleGalaxyPathParser;
 import com.github.klboke.kkrepo.protocol.conan.ConanPaths;
 import com.github.klboke.kkrepo.protocol.conan.ConanReference;
 import com.github.klboke.kkrepo.server.conda.CondaBrowsePaths;
+import com.github.klboke.kkrepo.server.ohpm.OhpmBrowseService;
 import com.github.klboke.kkrepo.server.repositories.RepositoryNotFoundException;
 import com.github.klboke.kkrepo.server.security.AuthenticatedSubject;
 import com.github.klboke.kkrepo.server.security.SecurityAuthenticationService;
@@ -53,6 +55,12 @@ public class BrowseController {
   private final SecurityManagementService securityService;
   private AssetDao assetDao;
   private ConanRegistryDao conanDao;
+  private OhpmBrowseService ohpmBrowse;
+
+  @Autowired
+  void setOhpmBrowseService(OhpmBrowseService ohpmBrowse) {
+    this.ohpmBrowse = ohpmBrowse;
+  }
 
   @Autowired
   public BrowseController(
@@ -106,6 +114,7 @@ public class BrowseController {
   public BrowseListing list(
       @PathVariable("repository") String repository,
       @RequestParam(value = "path", required = false) String path,
+      @RequestParam(value = "source", required = false) String sourceRepository,
       HttpServletRequest request) {
     RepositoryRecord repo = repositoryDao.findByName(repository)
         .orElseThrow(() -> new RepositoryNotFoundException(repository));
@@ -116,15 +125,8 @@ public class BrowseController {
     rejectHiddenPath(repo.format(), parent);
     // For GROUP repos browse_node has nothing of its own — fan out across members and merge.
     // The first member that surfaces a given path wins (matches Maven group "first-win" rules).
-    List<RepositoryRecord> sources = repo.type() == RepositoryType.GROUP
-        ? repo.format() == RepositoryFormat.SWIFT
-            ? BrowseRepositorySources.swiftSources(repo, repositoryDao)
-            : repo.format() == RepositoryFormat.ANSIBLEGALAXY
-                ? BrowseRepositorySources.ansibleSources(repo, repositoryDao)
-                : repo.format() == RepositoryFormat.CONDA
-                    ? BrowseRepositorySources.condaSources(repo, repositoryDao)
-            : repositoryDao.listMembers(repo.id())
-        : List.of(repo);
+    List<RepositoryRecord> sources = BrowseRepositorySources.sources(repo, repositoryDao);
+    sources = selectSources(repo, sources, sourceRepository);
     if (repo.format() == RepositoryFormat.DOCKER && dockerBrowseService != null) {
       return new BrowseListing(repo.name(), parent, dockerBrowseService.list(repo, sources, parent));
     }
@@ -149,7 +151,9 @@ public class BrowseController {
         }
         if (isNpmInternalTarballDirectory(repo, browsePath.storageParent(), row)) {
           for (BrowseNodeDao.BrowseChild tarball : browseNodeDao.listChildren(source.id(), row.path())) {
-            if (tarball.leaf()) {
+            // Scoped and custom tarball suffixes may contain directories. Hide only the
+            // protocol's dash level, retaining navigable subtrees and their canonical paths.
+            if (tarball.hasAssetSubtree() && !BrowseAssetVisibility.hidden(repo.format(), tarball.path())) {
               mergeEntry(merged, toEntry(repo, source, tarball, browsePath));
             }
           }
@@ -173,6 +177,26 @@ public class BrowseController {
     // Final ordering: directories first then files, alphabetical within each bucket.
     entries = sorted(repo.format(), entries);
     return new BrowseListing(repo.name(), browsePath.publicParent(), entries);
+  }
+
+  BrowseListing list(
+      String repository, String path, HttpServletRequest request) {
+    return list(repository, path, null, request);
+  }
+
+  private static List<RepositoryRecord> selectSources(
+      RepositoryRecord visibleRepository,
+      List<RepositoryRecord> sources,
+      String requestedSource) {
+    if (requestedSource == null || requestedSource.isBlank()) return sources;
+    String normalized = requestedSource.trim();
+    return sources.stream()
+        .filter(source -> source.name().equals(normalized))
+        .findFirst()
+        .map(List::of)
+        .orElseThrow(() -> new ResponseStatusException(
+            HttpStatus.BAD_REQUEST,
+            "source is not available through " + visibleRepository.name()));
   }
 
   private static List<BrowseEntry> sorted(List<BrowseEntry> entries) {
@@ -220,7 +244,7 @@ public class BrowseController {
         "application/json",
         null,
         null,
-        "/repository/" + repo.name() + "/config.json"));
+        RepositoryUrlPrefix.currentPath() + repo.name() + "/config.json"));
   }
 
   @GetMapping("/{repository}/attributes")
@@ -260,7 +284,9 @@ public class BrowseController {
         row.assetContentType(),
         row.assetSha1(),
         row.assetLastUpdatedAt(),
-        row.leaf() ? BrowseDownloadUrls.asset(visibleRepository, downloadPath(
+        row.leaf() && visibleRepository.format() == RepositoryFormat.OHPM
+            ? ohpmBrowse.downloadUrl(visibleRepository, sourceRepository, publicPath)
+            : row.leaf() ? BrowseDownloadUrls.asset(visibleRepository, downloadPath(
             visibleRepository.format(), sourceRepository, publicPath, row)) : null);
   }
 
@@ -341,9 +367,6 @@ public class BrowseController {
     }
     if (parent.isEmpty()) {
       return new BrowsePath("packages", "", true);
-    }
-    if (parent.equals("simple") || parent.startsWith("simple/")) {
-      return new BrowsePath(parent, parent, false);
     }
     return new BrowsePath("packages/" + parent, parent, true);
   }

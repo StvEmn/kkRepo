@@ -10,6 +10,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -36,6 +37,7 @@ import com.github.klboke.kkrepo.persistence.jdbc.api.model.docker.DockerManifest
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.docker.DockerManifestReferenceRecord;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.docker.DockerTagRecord;
 import com.github.klboke.kkrepo.protocol.docker.DockerConstants;
+import com.github.klboke.kkrepo.protocol.docker.DockerProtocolException;
 import com.github.klboke.kkrepo.protocol.maven.path.HashType;
 import com.github.klboke.kkrepo.protocol.maven.path.MavenPath;
 import com.github.klboke.kkrepo.protocol.maven.path.MavenPathParser;
@@ -65,6 +67,8 @@ import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
 import org.apache.commons.compress.compressors.gzip.GzipCompressorOutputStream;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.ArgumentCaptor;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
@@ -75,6 +79,109 @@ import org.springframework.transaction.support.SimpleTransactionStatus;
 class RepositoryDataMigrationWriterTest {
   private static final byte[] SAMPLE = "kkrepo migration checksum\n".getBytes(StandardCharsets.UTF_8);
   private static final MavenPathParser MAVEN_PATH_PARSER = new MavenPathParser();
+
+  @Test
+  void npmMigrationReplacesMetadataAndInvalidatesHostedAndGroupCaches() {
+    RepositoryRecord repository = new RepositoryRecord(
+        16L, "npm-hosted", RepositoryFormat.NPM, RepositoryType.HOSTED,
+        "npm-hosted", true, 1L, null, null, null, null, "ALLOW_ONCE", true, Map.of());
+    RepositoryDao repositories = mock(RepositoryDao.class);
+    when(repositories.findById(repository.id())).thenReturn(Optional.of(repository));
+    RecordingAssetDao assets = new RecordingAssetDao();
+    var metadataCache = mock(com.github.klboke.kkrepo.server.cache.AssetMetadataCache.class);
+    var packumentCache = mock(com.github.klboke.kkrepo.server.npm.NpmGroupPackumentCache.class);
+    var memberCache = mock(com.github.klboke.kkrepo.server.cache.GroupMemberAssetCache.class);
+    RepositoryDataMigrationWriter writer = new RepositoryDataMigrationWriter(
+        repositories, mock(ComponentDao.class), assets, mock(BrowseNodeDao.class),
+        new FixedBlobStorageRegistry(new MemoryBlobStorage()), mock(RepositoryIndexRebuildDao.class),
+        mock(DockerRegistryDao.class), new DockerManifestParser(new ObjectMapper()), null,
+        new TransientTransactionRetry(new RecordingTransactionManager(), 1, 0));
+    writer.setNpmMigrationCaches(metadataCache, packumentCache, memberCache);
+    String path = "@scope/demo";
+    RepositoryDataMigrationAssetRecord source = new RepositoryDataMigrationAssetRecord(
+        1L, 2L, "source", null, path, PersistenceHashes.pathHash(path),
+        RepositoryFormat.NPM, "@scope", "demo", null, "PACKAGE_ROOT", "application/json", 1L,
+        "source-blob-ref", Instant.EPOCH, null, Instant.EPOCH, Instant.EPOCH, "nexus", null,
+        "PENDING", 0, null, null, null, null, null, null, Map.of(), Instant.EPOCH);
+    assertThrows(IllegalArgumentException.class, () -> writer.write(repository.id(), source,
+        new ByteArrayInputStream(SAMPLE), "application/json", false));
+    assertNull(assets.asset, "npm writes without a pre-download snapshot must be rejected");
+    for (int versions = 1; versions <= 2; versions++) {
+      byte[] body = ("{\"name\":\"@scope/demo\",\"revision\":" + versions + "}")
+          .getBytes(StandardCharsets.UTF_8);
+      writer.write(repository.id(), source, new ByteArrayInputStream(body), "application/json", false,
+          writer.captureNpmPackument(repository.id(), path));
+      assertEquals(sha256Unchecked(body), assets.blob.sha256());
+      assertEquals("package-root", assets.asset.kind());
+    }
+    assertEquals(1, assets.lockedReads);
+    String winnerDigest = assets.blob.sha256();
+    assertThrows(RepositoryDataMigrationWriter.StaleNpmPackumentException.class, () ->
+        writer.write(repository.id(), source, new ByteArrayInputStream(SAMPLE), "application/json", false,
+            new RepositoryDataMigrationWriter.NpmPackumentSnapshot(200L, 100L)));
+    assertEquals(winnerDigest, assets.blob.sha256(), "an older download must not replace the winner");
+    assertThrows(RepositoryDataMigrationWriter.StaleNpmPackumentException.class, () ->
+        writer.write(repository.id(), source, new ByteArrayInputStream(SAMPLE), "application/json", false,
+            new RepositoryDataMigrationWriter.NpmPackumentSnapshot(null, null)));
+    assertEquals(List.of(100L), assets.retiredBlobs, "stale writers must not retire the winning blob");
+    // Another replica inserts the first root after our absent-row check but before our insert.
+    assets.asset = null;
+    assets.loseNextInsert = true;
+    assertThrows(RepositoryDataMigrationWriter.StaleNpmPackumentException.class, () ->
+        writer.write(repository.id(), source, new ByteArrayInputStream(SAMPLE), "application/json", false,
+            writer.captureNpmPackument(repository.id(), path)));
+    assertEquals(900L, assets.asset.assetBlobId(), "the winning first publication must stay bound");
+    assertEquals(List.of(100L), assets.retiredBlobs, "the winner must not be retired by an insert loser");
+    verify(metadataCache, times(2)).evictAfterCommit(repository.id(), path);
+    verify(packumentCache, times(2)).invalidateMemberPackageAfterCommit(repository.id(), path);
+    verify(memberCache, times(2)).invalidateMemberAfterCommit(repository.id());
+  }
+
+  @ParameterizedTest
+  @CsvSource({
+      "packages/demo-package/1.0/demo_package-1.0-py3-none-any.whl, package, demo-package",
+      "packages/demo-package/1.0/demo_package-1.0-py3-none-any.whl.metadata, package-metadata, demo-package",
+      "packages/demo-package/1.0/demo_package-1.0.tar.gz, package, demo-package",
+      "packages/demo-package/1.0/demo_package-1.0.tar.gz.asc, package-signature, demo-package",
+      "simple/demo-package/, index, demo-package",
+      "simple/, root-index,"
+  })
+  void pypiMigrationPersistsProtocolKindsAndRebuildsIndexesOnEveryRun(
+      String path, String expectedKind, String project) {
+    RepositoryRecord repository = new RepositoryRecord(
+        16L, "pypi-hosted", RepositoryFormat.PYPI, RepositoryType.HOSTED,
+        "pypi-hosted", true, 1L, null, null, null, null, "ALLOW_ONCE", true, Map.of());
+    RepositoryDao repositories = mock(RepositoryDao.class);
+    when(repositories.findById(repository.id())).thenReturn(Optional.of(repository));
+    ComponentDao components = mock(ComponentDao.class);
+    when(components.upsertReturningId(any())).thenReturn(501L);
+    RecordingAssetDao assets = new RecordingAssetDao();
+    RepositoryIndexRebuildDao rebuilds = mock(RepositoryIndexRebuildDao.class);
+    RepositoryDataMigrationWriter writer = new RepositoryDataMigrationWriter(
+        repositories, components, assets, mock(BrowseNodeDao.class),
+        new FixedBlobStorageRegistry(new MemoryBlobStorage()), rebuilds,
+        mock(DockerRegistryDao.class), new DockerManifestParser(new ObjectMapper()), null,
+        new TransientTransactionRetry(new RecordingTransactionManager(), 1, 0));
+    RepositoryDataMigrationAssetRecord source = new RepositoryDataMigrationAssetRecord(
+        1L, 2L, "source", project == null ? null : "component", path, PersistenceHashes.pathHash(path),
+        RepositoryFormat.PYPI, null, project, project == null ? null : "1.0", "PACKAGE",
+        "application/octet-stream", (long) SAMPLE.length, "source-blob-ref",
+        Instant.EPOCH, null, Instant.EPOCH, Instant.EPOCH, "nexus", "127.0.0.1", "PENDING", 0,
+        null, null, null, null, null, null, Map.of(), Instant.EPOCH);
+
+    for (int run = 0; run < 2; run++) {
+      var result = writer.write(repository.id(), source, new ByteArrayInputStream(SAMPLE),
+          "application/octet-stream", true);
+      assertEquals(200L, result.assetId());
+      assertEquals(expectedKind, assets.asset.kind());
+      assertEquals(path, assets.asset.path());
+      assertEquals(sha256Unchecked(SAMPLE), assets.blob.sha256());
+    }
+    verify(rebuilds, times(2)).enqueue(repository.id(), RepositoryIndexRebuildDao.PYPI_ROOT);
+    if (project != null) {
+      verify(rebuilds, times(2)).enqueue(repository.id(), RepositoryIndexRebuildDao.PYPI_PROJECT, project);
+    }
+  }
 
   @Test
   void delegatesRSourcePackagesToTheProtocolMigrationWriter() {
@@ -194,6 +301,29 @@ class RepositoryDataMigrationWriterTest {
 
     assertEquals("team/encoded", target.imageName());
     assertEquals("v1", target.reference());
+  }
+
+  @Test
+  void dockerMigrationTargetsValidateDecodedIdentitiesWithoutDecodingTwice() {
+    String digest = "sha256:" + "a".repeat(64);
+    var blob = RepositoryDataMigrationWriter
+        .dockerBlobMigrationTarget("v2/team%2fencoded/blobs/" + digest.replace(":", "%3A"))
+        .orElseThrow();
+
+    assertEquals("team/encoded", blob.imageName());
+    assertEquals(digest, blob.digest().value());
+    for (String image : List.of("team%252Fencoded", "team%2F..%2Fapp", "team%2F%2Fapp")) {
+      assertThrows(DockerProtocolException.class, () -> RepositoryDataMigrationWriter
+          .dockerManifestMigrationTarget("v2/" + image + "/manifests/v1"), image);
+      assertThrows(DockerProtocolException.class, () -> RepositoryDataMigrationWriter
+          .dockerBlobMigrationTarget("v2/" + image + "/blobs/" + digest), image);
+    }
+    assertThrows(DockerProtocolException.class, () -> RepositoryDataMigrationWriter
+        .dockerManifestMigrationTarget("v2/team%2Fapp/manifests/v1%2Fchild"));
+    for (String image : List.of("team%2", "team%FFapp")) {
+      assertThrows(IllegalArgumentException.class, () -> RepositoryDataMigrationWriter
+          .dockerManifestMigrationTarget("v2/" + image + "/manifests/v1"), image);
+    }
   }
 
   @Test
@@ -944,9 +1074,25 @@ class RepositoryDataMigrationWriterTest {
   private static final class RecordingAssetDao extends AssetDaoAdapter {
     private AssetBlobRecord blob;
     private AssetRecord asset;
+    private int lockedReads;
+    private long nextBlobId = 100L;
+    private boolean loseNextInsert;
+    private final java.util.List<Long> retiredBlobs = new java.util.ArrayList<>();
 
     private RecordingAssetDao() {
       super(null, null);
+    }
+
+    @Override
+    public int markBlobDeletedIfUnreferenced(long id, String reason) {
+      retiredBlobs.add(id);
+      return 1;
+    }
+
+    @Override
+    public Optional<AssetRecord> findAssetByIdForUpdate(long id) {
+      lockedReads++;
+      return Optional.ofNullable(asset);
     }
 
     @Override
@@ -966,7 +1112,7 @@ class RepositoryDataMigrationWriterTest {
 
     @Override
     public AssetBlobRecord insertBlobOrFindExisting(AssetBlobRecord record) {
-      blob = record.withId(100L);
+      blob = record.withId(nextBlobId++);
       return blob;
     }
 
@@ -976,7 +1122,7 @@ class RepositoryDataMigrationWriterTest {
           200L,
           record.repositoryId(),
           record.componentId(),
-          record.assetBlobId(),
+          loseNextInsert ? 900L : record.assetBlobId(),
           record.format(),
           record.path(),
           record.pathHash(),
@@ -987,7 +1133,19 @@ class RepositoryDataMigrationWriterTest {
           record.lastDownloadedAt(),
           record.lastUpdatedAt(),
           record.attributes());
-      return OptionalLong.of(asset.id());
+      return loseNextInsert ? OptionalLong.empty() : OptionalLong.of(asset.id());
+    }
+
+    @Override
+    public int updateAssetBlobBindingAndMetadata(
+        long assetId, Long componentId, long assetBlobId, String kind, String contentType,
+        long size, Instant lastUpdatedAt, Map<String, Object> attributes) {
+      assertEquals(asset.id(), assetId);
+      asset = new AssetRecord(
+          assetId, asset.repositoryId(), componentId, assetBlobId, asset.format(), asset.path(),
+          asset.pathHash(), asset.name(), kind, contentType, size, asset.lastDownloadedAt(),
+          lastUpdatedAt, attributes);
+      return 1;
     }
 
     @Override

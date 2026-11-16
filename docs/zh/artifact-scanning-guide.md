@@ -121,6 +121,11 @@ credential，也不提供 HTTP 服务；scanner 对同一卷只有只读权限�
 5 分钟做一次到期检查，成功更新最短间隔仍为 6 小时；争抢发布锁超过 10 分钟会失败
 退出并由 restart policy 重试。
 
+Compose updater 默认使用 `https://grype.anchore.io/databases`。如需使用内部 HTTPS Grype
+数据库镜像，请设置 `KKREPO_SCANNER_DB_UPDATE_URL`，并在所用 Compose 文件中同时取消 CA
+环境变量和 volume 配置的注释。通过 `KKREPO_SCANNER_DB_CA_CERT_FILE` 设置宿主机证书路径；
+updater 会把它只读挂载到 `/etc/kkrepo-ca/ca.crt`。
+
 检查容器和 scanner readiness：
 
 ```bash
@@ -226,10 +231,46 @@ kubectl logs statefulset/kkrepo-scanner
 
 自定义角色按职责授予：
 
+以下内置 application 权限可在 **Security → Privileges** 查看，并通过 **Security → Roles** 分配：
+
+| 内置权限 | Domain | Actions |
+| --- | --- | --- |
+| `nx-security-scanning-read` | `security-scanning` | `read` |
+| `nx-security-scanning-update` | `security-scanning` | `update,read` |
+| `nx-security-scanning-waivers-create` | `security-scanning-waivers` | `create` |
+| `nx-security-scanning-waivers-delete` | `security-scanning-waivers` | `delete` |
+
+配置只读扫描角色时，添加 `nx-security-scanning-read` 和目标仓库的 browse 权限即可。例如，
+名为 `releases` 的 Maven 仓库可使用 `nx-repository-view-maven2-releases-browse`。将角色分配给用户后，
+用户可通过 **Browse → Admin → Security → Artifact Scanning** 查看其可浏览仓库的扫描结果和 SBOM，
+无需授予 `nexus:*`。仅有扫描读取权限时默认进入 Artifact Scanning；合法的 hash 路由（包括扫描子页签）
+会被保留。同时拥有选择器权限时还可进入 Content Selectors，其余管理页仍隐藏。只读用户可查看结果，
+修改操作会隐藏。仓库和任务的操作能力由后端计算，提交操作时仍会重新鉴权。
+
+列表操作能力仅在单次请求内复用仓库信息。任务列表批量读取相关父 Group 和扫描配置；
+漏洞操作能力只读取制品所属仓库 ID，无需加载所有关联制品的完整元数据；豁免列表复用仓库名称和管理权限判断。
+这里不新增跨请求缓存：后续请求重新读取共享拓扑和配置，提交每个修改操作时仍重新鉴权。
+
+如果需要严格限制到指定仓库，还应检查默认认证角色：`KKREPO_DEFAULT_AUTHENTICATED_ROLE_ID`
+默认附加 `nx-anonymous`，其中包含较宽的仓库 browse/read 权限。仅关闭匿名访问不会去掉该继承权限。
+配置及重新登录要求见[内容选择器](content-selectors.md)。
+
+豁免权限独立授权：`nx-security-scanning-update` 不包含创建或删除豁免的权限。
+豁免操作员使用此页面还需要扫描读取权限，以及受影响仓库的 administration 权限；全局豁免还需
+`nexus:security-scanning:update`。Group 管理员可以 retry/cancel 适用于该 Group 扫描配置的成员任务，
+但 rescan 仍要求源仓库的 administration 权限。
+
+MySQL 和 PostgreSQL 的升级迁移仅添加权限数据并关联到 `nx-admin`（该角色已有 `nx-all`），
+不改表结构或扫描数据，不向普通角色自动授权。已有同 ID 或同名权限的属性及角色绑定均保留。
+如果手工权限使用了内置名称但 actions 不同，分配前应核对 domain/actions，迁移不会覆盖它；
+必要时使用其他名称创建 application 权限。权限变更继续使用现有的共享授权版本失效机制。
+滚动升级时，应完成所有服务副本升级后再使用新的管理页入口；旧副本可能仍拒绝进入，或不返回操作能力，
+此时新页面会将对应操作视为不可用。
+
 | 操作 | 权限 |
 | --- | --- |
 | 查看扫描页面、任务、结果和 SBOM | `nexus:security-scanning:read`，以及目标仓库的 browse 权限 |
-| 新建或修订全局策略 | `nexus:security-scanning:update` |
+| 新建、修订或删除全局策略 | `nexus:security-scanning:update` |
 | 配置仓库、rescan、retry、cancel | `nexus:security-scanning:update`，以及目标仓库的 repository administration 权限 |
 | 创建豁免 | `nexus:security-scanning-waivers:create`，以及目标仓库的 administration 权限 |
 | 删除豁免 | `nexus:security-scanning-waivers:delete`，以及目标仓库的 administration 权限 |
@@ -242,7 +283,7 @@ kubectl logs statefulset/kkrepo-scanner
 2. 搜索目标仓库并点击 **configure**。
 3. 勾选 **Enable scanning for this repository**。
 4. 保持 **Mode = Audit only** 进行首次验证。
-5. 选择结果有效期和适用的内容范围。
+5. 选择 **Scan policy**（或保留明确未绑定策略的内置规则）、结果有效期和适用的内容范围。
 6. 检查 **Advanced exception handling**，首次启用建议全部保持
    **Allow download**。
 7. 保存配置。
@@ -253,9 +294,9 @@ kubectl logs statefulset/kkrepo-scanner
 | --- | --- |
 | Repository | 当前仓库，只读 |
 | Scan profile | scanner 能力绑定，当前内置值为 `syft-grype-v1`，只读 |
-| Vulnerability policy | 当前集中绑定的策略或内置 critical baseline，只读 |
+| Scan policy | 绑定命名策略的修订，或选择未绑定策略的内置规则 |
 | Mode | `AUDIT` 只记录；`ENFORCE` 才真正阻断 |
-| Result validity | 使用策略默认值，或设置 1/7/30 天；过期结果按 pending 处理 |
+| Result validity | 继承已绑定且启用的策略有效期，或设置 1/7/30 天；两者取较短值，过期结果按 pending 处理 |
 | Enable scanning | 当前仓库的实际业务开关 |
 | Scan hosted content | 扫描 hosted 内容 |
 | Scan proxy content | 扫描 proxy 缓存内容 |
@@ -263,9 +304,16 @@ kubectl logs statefulset/kkrepo-scanner
 hosted 仓库只显示 hosted 开关，proxy 仓库只显示 proxy 开关，group 仓库同时显示两者。
 group 配置作用于其可解析的 hosted/proxy 成员内容，不扫描一个额外的“group 文件副本”。
 
-Scan profile 和 Vulnerability policy 不允许仓库管理员手填 ID 或任意切换。创建一个新
-policy 不会自动修改任何仓库；编辑已经被仓库使用的 policy 会创建新 revision，并把
-这些仓库迁移到新 revision，同时保留历史判定所引用的旧 revision。
+Scan profile 保持只读。拥有 security-scanning update 权限的仓库管理员可以在仓库配置
+对话框中选择命名策略。下拉框提供每个策略的最新修订，并保留当前已绑定的旧修订；
+禁用的策略会明确标注。绑定和解绑操作会记录到安全审计日志。创建新策略不会自动绑定仓库；修订已绑定的策略会把使用它的
+仓库迁移到新修订，历史判定仍保留原修订引用。
+
+**Built-in rules (no assigned policy)** 是 Critical 严重级别的回退规则，不是 Policies
+页中的策略记录，也没有结果有效期上限。**Use assigned policy (no repository limit)**
+只继承已绑定且启用的策略有效期；没有这类策略时，除非显式设置仓库有效期，否则结果
+不会因年龄过期。禁用策略的有效期不参与计算。对话框预览实际有效期，保存并刷新后，
+仓库表格显示服务端解析的值。
 
 ### 高级异常处理
 
@@ -388,6 +436,9 @@ Scanner 健康状态以最近一次 adapter 观测为准；界面展示的 Vulne
 ### Tasks
 
 Tasks 展示任务 stage、触发原因、状态、尝试次数、lease 和错误码。
+Asset 列同时展示仓库浏览路径和内部 asset ID。点击路径可在 Repository Browser 中打开资产；
+通过 group 查看时会保留成员来源。资产无法解析时显示“Asset unavailable”。删除资产会清空任务中的
+资产引用，历史任务不会保留原资产 ID 和路径。
 
 - `PENDING` / `RETRY_WAIT` / `RUNNING`：可 cancel。
 - `FAILED` / `CANCELLED`：可 retry。
@@ -412,8 +463,11 @@ Finding 表示 scanner 数据库在某次 run 中的匹配结果。`0 findings` 
 
 ### Repositories
 
-Repositories 展示每个可见仓库的 Enabled/Disabled、format、type、profile、policy
-和 mode。这里是仓库扫描业务开关的唯一 UI 入口。
+Repositories 展示每个可见仓库的 Enabled/Disabled、profile、policy、mode、实际结果有效期，
+以及 pending/failure/partial 处理方式。format 和 type 收入仓库名旁的提示。仓库未设置有效期时
+继承启用中的策略；两者均设置时取较短值，禁用策略不附加有效期限制。提示解释取值来源、
+仅审计或未启用的动作，以及策略禁用时跳过 partial 检查的行为。允许 partial 仍会继续漏洞判定。
+提示支持鼠标悬停和键盘聚焦。这里是仓库扫描业务开关的唯一 UI 入口。
 
 ### Policies
 
@@ -429,6 +483,18 @@ Policies 用于新建和修订集中管理的漏洞策略：
 
 编辑 policy 不会覆盖旧行，而是创建新 revision。历史 run 和判定继续引用原 revision，
 已经绑定该 policy 的仓库迁移到新 revision。
+
+在最新 revision 上点击 **delete**，可以删除未使用的策略及其**全部修订**；确认框会显示策略名称和删除范围。
+使用旧 revision ID 会返回冲突，避免旧页面误删其他副本刚更新的策略。只要任一修订仍被仓库配置
+（包括停用扫描的仓库）、制品扫描/策略状态或 waiver（包括已过期 waiver）引用，删除就会被拒绝，
+不会自动清空引用。预置的 `default-audit` 同样遵守这些规则，它的名称不代表全局默认绑定。
+
+接口为 `DELETE /internal/security/scanning/policies/{latestPolicyId}`，需要与新建、修订策略相同的
+`nexus:security-scanning:update` 权限。成功返回 204，不存在返回 404，旧修订或仍被引用返回 409。
+删除与 `POLICY_DELETE` 审计事件在同一事务提交，审计保留策略名称、最新 ID/修订及 `ALL_REVISIONS`
+删除范围。数据库锁协调多副本下的修订创建、引用写入和删除。若删除先于并发的仓库绑定或 waiver
+创建提交，后者返回 `409`，需要刷新并选择仍然存在的策略。此操作不归档策略，也不删除扫描历史、
+finding 或 waiver。
 
 ### Waivers
 
@@ -485,6 +551,9 @@ Waivers 页签用于查看 Active/Expired、scope、仓库、制品、exception�
 | `KKREPO_SCANNER_DATABASE_UPDATE_ONLY` | `false` | 只执行一次协调更新后退出，不创建需要 credential 的 HTTP controller；供独立 updater 使用 |
 | `KKREPO_SCANNER_DATABASE_UPDATE_LOCK_TIMEOUT` | `10m` | updater 获取跨进程发布锁的总上限；超时进程失败以触发重试 |
 | `KKREPO_SCANNER_DB_DIRECTORY` | `/var/lib/kkrepo-scanner/grype` | 不可变 Grype 数据库代际的共享根目录；服务容器只读挂载 |
+| `KKREPO_SCANNER_DB_UPDATE_URL` | `https://grype.anchore.io/databases` | 可选的数据库列表和压缩包镜像地址 |
+| `KKREPO_SCANNER_DB_CA_CERT` | 空 | updater 容器内可选的 CA 证书路径 |
+| `KKREPO_SCANNER_DB_CA_CERT_FILE` | 不挂载 | Compose 可选 CA 只读挂载对应的宿主机文件路径 |
 | `KKREPO_SCANNER_DB_UPDATE_INTERVAL` | `6h` | 目标更新间隔 |
 | `KKREPO_SCANNER_DB_UPDATE_CHECK_INTERVAL` | `1m` | 更新资格检查间隔 |
 | `KKREPO_SCANNER_MAX_CONCURRENT_SCANS` | `2` | 单 Pod 并发扫描上限 |

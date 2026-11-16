@@ -298,6 +298,9 @@ public class CleanupRunService {
     RepositoryRecord repository = repositoryDao.findById(claim.repositoryId())
         .orElseThrow(() -> new CleanupValidationException(
             "target repository no longer exists: " + claim.repositoryId()));
+    if (!capabilities.supportsExecute(repository.format())) {
+      throw new CleanupValidationException("Automatic cleanup is not supported for this format");
+    }
     if (repository.format() != claim.format()) {
       throw new CleanupValidationException("target repository format changed");
     }
@@ -324,8 +327,8 @@ public class CleanupRunService {
           claim.id(),
           claim.leaseToken(),
           claim.fencingToken(),
-          repository.format() == com.github.klboke.kkrepo.core.RepositoryFormat.DOCKER
-              ? "DOCKER" : "COMPONENT",
+          CleanupCriteria.snapshotMode(run.criteriaSnapshot()) ? MavenSnapshotCleanupService.PHASE
+              : repository.format() == com.github.klboke.kkrepo.core.RepositoryFormat.DOCKER ? "DOCKER" : "COMPONENT",
           databaseNow());
       scan = scanner.scan(
           repository, run.criteriaSnapshot(), scanLimit, cutoff, scanCursor);

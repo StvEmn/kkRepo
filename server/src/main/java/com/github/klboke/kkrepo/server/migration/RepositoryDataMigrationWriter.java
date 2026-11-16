@@ -3,11 +3,13 @@ package com.github.klboke.kkrepo.server.migration;
 import com.github.klboke.kkrepo.core.BlobReference;
 import com.github.klboke.kkrepo.core.BlobStorage;
 import com.github.klboke.kkrepo.core.RepositoryFormat;
+import com.github.klboke.kkrepo.core.http.UriPathDecoder;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AssetDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.BrowseNodeDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.ComponentDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.DockerRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.HuggingFaceRegistryDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.PersistenceHashes;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryIndexRebuildDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.AssetBlobRecord;
@@ -18,31 +20,34 @@ import com.github.klboke.kkrepo.persistence.jdbc.api.model.RepositoryRecord;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.docker.DockerManifestRecord;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.docker.DockerManifestReferenceRecord;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.docker.DockerTagRecord;
-import com.github.klboke.kkrepo.persistence.jdbc.api.PersistenceHashes;
 import com.github.klboke.kkrepo.protocol.composer.ComposerPath;
 import com.github.klboke.kkrepo.protocol.composer.ComposerPathParser;
 import com.github.klboke.kkrepo.protocol.docker.DockerDigest;
 import com.github.klboke.kkrepo.protocol.docker.DockerManifestDescriptor;
 import com.github.klboke.kkrepo.protocol.docker.DockerManifestMetadata;
 import com.github.klboke.kkrepo.protocol.docker.DockerPathParser;
+import com.github.klboke.kkrepo.protocol.huggingface.HuggingFaceFileKind;
+import com.github.klboke.kkrepo.protocol.huggingface.HuggingFacePath;
+import com.github.klboke.kkrepo.protocol.huggingface.HuggingFacePathParser;
 import com.github.klboke.kkrepo.protocol.maven.MavenContentType;
 import com.github.klboke.kkrepo.protocol.maven.path.ChecksumPayload;
 import com.github.klboke.kkrepo.protocol.maven.path.HashType;
 import com.github.klboke.kkrepo.protocol.maven.path.MavenPath;
 import com.github.klboke.kkrepo.protocol.maven.path.MavenPathParser;
-import com.github.klboke.kkrepo.protocol.huggingface.HuggingFaceFileKind;
-import com.github.klboke.kkrepo.protocol.huggingface.HuggingFacePath;
-import com.github.klboke.kkrepo.protocol.huggingface.HuggingFacePathParser;
+import com.github.klboke.kkrepo.protocol.npm.NpmPathParser;
+import com.github.klboke.kkrepo.server.alpine.AlpineRepositoryDataMigrationWriter;
+import com.github.klboke.kkrepo.server.ansible.AnsibleGalaxyRepositoryDataMigrationWriter;
+import com.github.klboke.kkrepo.server.apt.AptRepositoryDataMigrationWriter;
 import com.github.klboke.kkrepo.server.blob.BlobReferenceCodec;
 import com.github.klboke.kkrepo.server.blob.BlobTransactionCleanup;
 import com.github.klboke.kkrepo.server.blob.TempBlobFiles;
-import com.github.klboke.kkrepo.server.ansible.AnsibleGalaxyRepositoryDataMigrationWriter;
-import com.github.klboke.kkrepo.server.alpine.AlpineRepositoryDataMigrationWriter;
-import com.github.klboke.kkrepo.server.apt.AptRepositoryDataMigrationWriter;
-import com.github.klboke.kkrepo.server.conda.CondaRepositoryDataMigrationWriter;
+import com.github.klboke.kkrepo.server.cache.AssetMetadataCache;
+import com.github.klboke.kkrepo.server.cache.GroupMemberAssetCache;
 import com.github.klboke.kkrepo.server.conan.ConanRepositoryDataMigrationWriter;
+import com.github.klboke.kkrepo.server.conda.CondaRepositoryDataMigrationWriter;
 import com.github.klboke.kkrepo.server.docker.DockerManifestParser;
 import com.github.klboke.kkrepo.server.maven.BlobStorageRegistry;
+import com.github.klboke.kkrepo.server.npm.NpmGroupPackumentCache;
 import com.github.klboke.kkrepo.server.pub.PubRepositoryDataMigrationWriter;
 import com.github.klboke.kkrepo.server.r.RRepositoryDataMigrationWriter;
 import com.github.klboke.kkrepo.server.swift.SwiftRepositoryDataMigrationWriter;
@@ -53,8 +58,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
-import java.net.URLDecoder;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
@@ -67,8 +70,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
-import org.springframework.stereotype.Component;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Component;
 
 @Component
 class RepositoryDataMigrationWriter {
@@ -91,10 +94,27 @@ class RepositoryDataMigrationWriter {
   private AptRepositoryDataMigrationWriter aptMigrationWriter;
   private AlpineRepositoryDataMigrationWriter alpineMigrationWriter;
   private RRepositoryDataMigrationWriter rMigrationWriter;
+  private com.github.klboke.kkrepo.server.gitlfs.GitLfsMigrationWriter gitLfsMigrationWriter;
+
+  @Autowired
+  void setGitLfsMigrationWriter(com.github.klboke.kkrepo.server.gitlfs.GitLfsMigrationWriter writer) {
+    this.gitLfsMigrationWriter = writer;
+  }
   private ConanRepositoryDataMigrationWriter conanMigrationWriter;
   private HuggingFaceRegistryDao huggingFaceRegistry;
   private final TransientTransactionRetry transactionRetry;
   private final MavenPathParser mavenPathParser = new MavenPathParser();
+  private AssetMetadataCache assetMetadataCache;
+  private NpmGroupPackumentCache npmGroupPackumentCache;
+  private GroupMemberAssetCache groupMemberAssetCache;
+
+  @Autowired
+  void setNpmMigrationCaches(AssetMetadataCache assetMetadataCache,
+      NpmGroupPackumentCache npmGroupPackumentCache, GroupMemberAssetCache groupMemberAssetCache) {
+    this.assetMetadataCache = assetMetadataCache;
+    this.npmGroupPackumentCache = npmGroupPackumentCache;
+    this.groupMemberAssetCache = groupMemberAssetCache;
+  }
 
   RepositoryDataMigrationWriter(
       RepositoryDao repositoryDao,
@@ -240,14 +260,34 @@ class RepositoryDataMigrationWriter {
     this.huggingFaceRegistry = huggingFaceRegistry;
   }
 
+  NpmPackumentSnapshot captureNpmPackument(long repositoryId, String path) {
+    return NpmPackumentSnapshot.of(assetDao.findAssetByPath(repositoryId, path));
+  }
+
   WriteResult write(long targetRepositoryId, RepositoryDataMigrationAssetRecord source, InputStream body,
       String responseContentType, boolean validateSize) {
+    return write(targetRepositoryId, source, body, responseContentType, validateSize, null);
+  }
+
+  WriteResult write(long targetRepositoryId, RepositoryDataMigrationAssetRecord source, InputStream body,
+      String responseContentType, boolean validateSize, NpmPackumentSnapshot expectedPackument) {
+    if (RepositoryDataMigrationPaths.requiresRefresh(source.format(), source.sourcePath())
+        && expectedPackument == null) {
+      throw new IllegalArgumentException("Capture the npm packument before downloading its replacement");
+    }
     RepositoryRecord repository = repositoryDao.findById(targetRepositoryId)
         .orElseThrow(() -> new IllegalArgumentException("target repository not found: " + targetRepositoryId));
+    if (repository.format() == RepositoryFormat.OHPM) {
+      throw new IllegalArgumentException("OHPM requires its independent import workflow");
+    }
     if (repository.blobStoreId() == null) {
       throw new IllegalArgumentException("target repository has no blob store: " + repository.name());
     }
     BlobStorage storage = blobStorageRegistry.forBlobStoreId(repository.blobStoreId());
+    if (repository.format() == RepositoryFormat.GITLFS) {
+      var migrated = gitLfsMigrationWriter.write(repository, source, body);
+      return new WriteResult(migrated.componentId(), migrated.assetId(), migrated.assetBlobId(), migrated.objectKey());
+    }
     if (repository.format() == RepositoryFormat.PUB) {
       if (pubMigrationWriter == null) {
         throw new IllegalStateException("Pub migration writer is not configured");
@@ -349,14 +389,14 @@ class RepositoryDataMigrationWriter {
       WriteResult result = transactionRetry.execute(
           "Persist migrated asset " + repository.name() + "/" + source.sourcePath(),
           () -> {
-            WriteResult persisted = persist(repository, source, upload, contentType, null);
+            WriteResult persisted = persist(repository, source, upload, contentType, null, expectedPackument);
             indexMigratedDockerAsset(repository, source, upload, contentType, persisted);
             projectMigratedHuggingFace(
                 repository, source, upload, contentType, persisted, huggingFaceIdentity);
             for (Map.Entry<MavenPath, ChecksumUpload> entry : checksumUploads.entrySet()) {
               ChecksumUpload checksum = entry.getValue();
               WriteResult persistedChecksum = persist(
-                  repository, checksum.source(), checksum.upload(), MavenContentType.CHECKSUM, persisted.componentId());
+                  repository, checksum.source(), checksum.upload(), MavenContentType.CHECKSUM, persisted.componentId(), null);
               checksumResults.put(entry.getKey(), persistedChecksum);
             }
             return persisted;
@@ -582,7 +622,8 @@ class RepositoryDataMigrationWriter {
       RepositoryDataMigrationAssetRecord source,
       DigestedUpload upload,
       String contentType,
-      Long componentIdOverride) {
+      Long componentIdOverride,
+      NpmPackumentSnapshot expectedPackument) {
     Instant now = Instant.now();
     Instant lastUpdatedAt = source.sourceLastUpdatedAt() == null ? now : source.sourceLastUpdatedAt();
     BlobReference ref = upload.reference();
@@ -592,7 +633,17 @@ class RepositoryDataMigrationWriter {
         ? migratedCargoMetadata(source, upload)
         : null;
 
+    assetDao.prepareWrite(repository.id(), repository.format(), source.sourcePath());
     Optional<AssetRecord> existing = assetDao.findAssetByPath(repository.id(), source.sourcePath());
+    if (expectedPackument != null) {
+      // Recheck the durable blob binding after the row lock. A competing replica may have
+      // committed newer metadata while this worker downloaded its response. Such a response
+      // must be fetched again, never replayed by the transaction-only retry below.
+      if (existing.isPresent()) existing = assetDao.findAssetByIdForUpdate(existing.get().id());
+      if (!expectedPackument.equals(NpmPackumentSnapshot.of(existing))) {
+        throw new StaleNpmPackumentException();
+      }
+    }
     Long previousBlobId = existing.map(AssetRecord::assetBlobId).orElse(null);
 
     AssetBlobRecord persistedBlob = assetDao.findReusableBlobBySha256(
@@ -658,6 +709,8 @@ class RepositoryDataMigrationWriter {
             record.contentType(), record.size(), record.lastDownloadedAt(), record.lastUpdatedAt(),
             record.attributes());
       } else {
+        // Another first import may have won the unique insert after our absent-row read.
+        if (expectedPackument != null) throw new StaleNpmPackumentException();
         AssetRecord prior = assetDao.findAssetByPath(repository.id(), source.sourcePath())
             .orElseThrow(() -> new IllegalStateException("Concurrent migrated asset insert won but row is not visible for "
                 + repository.name() + "/" + source.sourcePath()));
@@ -676,6 +729,14 @@ class RepositoryDataMigrationWriter {
     browseNodeDao.upsertPathAncestors(
         repository.id(), browsePath, persistedAsset.id(), componentId);
     enqueueDerivedIndex(repository, source);
+    if (repository.format() == RepositoryFormat.NPM && assetMetadataCache != null) {
+      assetMetadataCache.evictAfterCommit(repository.id(), source.sourcePath());
+      var packageId = new NpmPathParser().parse(source.sourcePath()).packageId();
+      if (packageId != null) {
+        npmGroupPackumentCache.invalidateMemberPackageAfterCommit(repository.id(), packageId.id());
+      }
+      groupMemberAssetCache.invalidateMemberAfterCommit(repository.id());
+    }
     return new WriteResult(componentId, persistedAsset.id(), persistedBlob.id(), persistedBlob.objectKey());
   }
 
@@ -1103,7 +1164,7 @@ class RepositoryDataMigrationWriter {
     return switch (format) {
       case MAVEN2 -> mavenAssetKind(source.sourcePath());
       case NPM -> source.sourcePath().endsWith(".tgz") ? "tarball" : "package-root";
-      case PYPI -> "PACKAGE";
+      case PYPI -> pypiAssetKind(source.sourcePath());
       case HELM -> source.sourcePath().endsWith("index.yaml")
           ? "INDEX"
           : source.sourcePath().endsWith(".prov") ? "PROVENANCE" : "PACKAGE";
@@ -1133,9 +1194,25 @@ class RepositoryDataMigrationWriter {
       case R -> source.sourcePath().endsWith(".tar.gz")
           && source.sourcePath().startsWith("src/contrib/")
           ? "r-source-package" : "r-metadata";
+      case GITLFS -> "gitlfs";
+      case OHPM -> throw new IllegalArgumentException("OHPM requires its independent import workflow");
       case HUGGINGFACE -> "huggingface-model-file";
       case RAW -> "asset";
     };
+  }
+
+  private static String pypiAssetKind(String path) {
+    if ("simple/".equals(path)) {
+      return "root-index";
+    }
+    if (path.startsWith("simple/")) {
+      return "index";
+    }
+    // PEP 658 sidecars remain downloadable but are not distribution links in the Simple index.
+    if (path.endsWith(".metadata")) {
+      return "package-metadata";
+    }
+    return path.endsWith(".asc") ? "package-signature" : "package";
   }
 
   private static String componentKind(RepositoryFormat format, RepositoryDataMigrationAssetRecord source) {
@@ -1328,7 +1405,9 @@ class RepositoryDataMigrationWriter {
     List<String> segments = new ArrayList<>();
     for (String segment : normalized.split("/")) {
       if (!segment.isBlank()) {
-        segments.add(URLDecoder.decode(segment, StandardCharsets.UTF_8));
+        // Nexus asset paths may encode an entire image name (team%2Fapp) as one component.
+        // Decode once here; Docker's image, tag and digest validators enforce the resulting identity.
+        segments.add(UriPathDecoder.decodeComponent(segment));
       }
     }
     return List.copyOf(segments);
@@ -1376,6 +1455,20 @@ class RepositoryDataMigrationWriter {
   private static void putIfPresent(Map<String, Object> attributes, String key, Object value) {
     if (value != null) {
       attributes.put(key, value);
+    }
+  }
+
+  record NpmPackumentSnapshot(Long assetId, Long assetBlobId) {
+    static NpmPackumentSnapshot of(Optional<AssetRecord> asset) {
+      return new NpmPackumentSnapshot(asset.map(AssetRecord::id).orElse(null),
+          asset.map(AssetRecord::assetBlobId).orElse(null));
+    }
+  }
+
+  // Deliberately not a TransientDataAccessException: retry must include a fresh source GET.
+  static final class StaleNpmPackumentException extends RuntimeException {
+    StaleNpmPackumentException() {
+      super("npm packument changed during download; fetch source metadata again");
     }
   }
 

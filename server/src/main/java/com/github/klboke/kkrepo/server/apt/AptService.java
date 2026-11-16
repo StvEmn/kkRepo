@@ -10,6 +10,7 @@ import com.github.klboke.kkrepo.protocol.apt.AptPackageControl;
 import com.github.klboke.kkrepo.protocol.apt.AptPath;
 import com.github.klboke.kkrepo.protocol.apt.AptPathParser;
 import com.github.klboke.kkrepo.protocol.maven.policy.WritePolicy;
+import com.github.klboke.kkrepo.server.coordination.FencedLeaseManager;
 import com.github.klboke.kkrepo.server.maven.MavenExceptions;
 import com.github.klboke.kkrepo.server.maven.MavenResponse;
 import com.github.klboke.kkrepo.server.maven.RemoteUrlBuilder;
@@ -168,7 +169,7 @@ public class AptService {
           "APT package must be uploaded at its canonical path: " + poolPath);
     }
     String coordinateLease = coordinateLease(runtime, suite, section, control);
-    try (AptLeaseManager.Lease lease = leases.acquire(coordinateLease)) {
+    try (FencedLeaseManager.Lease lease = leases.acquire(coordinateLease)) {
       lease.assertHeld();
       Optional<AptRegistryDao.PackageRecord> existing = registry.findPackage(
           runtime.id(), suite, section, control.packageName(), control.version(),
@@ -442,7 +443,11 @@ public class AptService {
     if (path.kind() == AptPath.Kind.BY_HASH || path.kind() == AptPath.Kind.PACKAGE) {
       response.withHeader("Cache-Control", "public, max-age=31536000, immutable");
     }
-    proxyProjection.observePassthrough(runtime, settings, path);
+    if (!com.github.klboke.kkrepo.server.proxy.ProgressiveProxyService.onCached(response,
+        file -> proxyProjection.validateDownloadedPackage(runtime, path.normalized(), file),
+        () -> proxyProjection.observePassthrough(runtime, settings, path))) {
+      proxyProjection.observePassthrough(runtime, settings, path);
+    }
     return response;
   }
 
@@ -463,7 +468,11 @@ public class AptService {
           runtime.proxyRemoteUrl(), upstreamPath);
       MavenResponse response = proxy.getPinnedAssetFromUrlUnindexed(
           runtime, path.normalized(), remote, headOnly);
-      proxyProjection.verifyAndBindKnownPackage(runtime, path.normalized());
+      if (!com.github.klboke.kkrepo.server.proxy.ProgressiveProxyService.onCached(response,
+          file -> proxyProjection.validateDownloadedPackage(runtime, path.normalized(), file),
+          () -> proxyProjection.verifyAndBindKnownPackage(runtime, path.normalized()))) {
+        proxyProjection.verifyAndBindKnownPackage(runtime, path.normalized());
+      }
       return response.withHeader("Cache-Control", "public, max-age=31536000, immutable");
     }
     String distribution = path.distribution() == null ? settings.distribution() : path.distribution();
@@ -513,11 +522,11 @@ public class AptService {
         .orElseGet(() -> registry.ensureSuite(runtime.id(), distribution, Instant.now()));
     if (before.desiredRevision() == before.publishedRevision()
         && publishedSnapshots.find(runtime.id(), distribution).isPresent()) return true;
-    Optional<AptLeaseManager.Lease> acquired = waitForLease
+    Optional<FencedLeaseManager.Lease> acquired = waitForLease
         ? Optional.of(leases.acquire("apt:publish:" + runtime.id() + ":" + distribution))
         : leases.tryAcquire("apt:publish:" + runtime.id() + ":" + distribution);
     if (acquired.isEmpty()) return false;
-    try (AptLeaseManager.Lease lease = acquired.orElseThrow()) {
+    try (FencedLeaseManager.Lease lease = acquired.orElseThrow()) {
       for (int attempt = 0; attempt < 4; attempt++) {
         lease.assertHeld();
         AptRegistryDao.SuiteState state = registry.findSuite(runtime.id(), distribution).orElseThrow();
@@ -555,7 +564,7 @@ public class AptService {
   private Optional<AptRegistryDao.PackageRecord> deletePackageRecord(
       RepositoryRuntime runtime, AptRegistryDao.PackageRecord existing, String reason) {
     AptPackageControl control = packageControl(existing);
-    try (AptLeaseManager.Lease lease = leases.acquire(
+    try (FencedLeaseManager.Lease lease = leases.acquire(
         coordinateLease(runtime, existing.distribution(), existing.component(), control))) {
       lease.assertHeld();
       Optional<AptRegistryDao.PackageRecord> removed = registry.deletePackage(

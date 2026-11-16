@@ -11,6 +11,7 @@ import com.github.klboke.kkrepo.persistence.jdbc.api.model.AssetBlobRecord;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.AssetRecord;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.ComponentRecord;
 import com.github.klboke.kkrepo.persistence.jdbc.api.PersistenceHashes;
+import com.github.klboke.kkrepo.server.blob.BufferedUpload;
 import com.github.klboke.kkrepo.server.cache.AssetMetadataCache;
 import com.github.klboke.kkrepo.server.cache.CachedAssetMetadata;
 import com.github.klboke.kkrepo.server.cache.NexusCacheType;
@@ -28,14 +29,8 @@ import com.github.klboke.kkrepo.server.transaction.TransientTransactionRetry;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
-import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -238,33 +233,33 @@ public class MavenAssetWriter {
   }
 
   /** Deletes an asset and soft-deletes its blob; cascades to checksum siblings and browse-node leaf rows. */
-  @Transactional
   public int deleteAsset(RepositoryRuntime runtime, BlobStorage storage, MavenPath path) {
     return deleteAsset(runtime, storage, path, true);
   }
 
-  @Transactional
   int deleteAsset(RepositoryRuntime runtime, BlobStorage storage, MavenPath path, boolean notifyGroupMetadata) {
-    Optional<AssetRecord> existing = assetDao.findAssetByPath(runtime.id(), path.path());
-    if (existing.isEmpty()) {
-      return 0;
-    }
-    AssetRecord asset = existing.get();
-    deleteOne(storage, asset);
-    if (!path.isSubordinate()) {
-      for (HashType ht : HashType.values()) {
-        MavenPath sibling = path.hash(ht);
-        assetDao.findAssetByPath(runtime.id(), sibling.path())
-            .ifPresent(a -> deleteOne(storage, a));
+    return executePersist("maven-delete", () -> {
+      Optional<AssetRecord> existing = assetDao.findAssetByPath(runtime.id(), path.path());
+      if (existing.isEmpty()) {
+        return 0;
       }
-    }
-    if (asset.componentId() != null) {
-      componentDao.deleteIfNoAssets(asset.componentId());
-    }
-    if (notifyGroupMetadata) {
-      notifyAssetDeleted(runtime, path);
-    }
-    return 1;
+      AssetRecord asset = existing.get();
+      deleteOne(storage, asset);
+      if (!path.isSubordinate()) {
+        for (HashType ht : HashType.values()) {
+          MavenPath sibling = path.hash(ht);
+          assetDao.findAssetByPath(runtime.id(), sibling.path())
+              .ifPresent(a -> deleteOne(storage, a));
+        }
+      }
+      if (asset.componentId() != null) {
+        componentDao.deleteIfNoAssets(asset.componentId());
+      }
+      if (notifyGroupMetadata) {
+        notifyAssetDeleted(runtime, path);
+      }
+      return 1;
+    });
   }
 
   @Transactional
@@ -454,20 +449,15 @@ public class MavenAssetWriter {
       Map<String, String> extraBlobAttributes) {
     Path tmp = null;
     try {
-      tmp = Files.createTempFile("kkrepo-maven-", ".tmp");
-      MessageDigest md5 = digest("MD5");
-      MessageDigest sha1 = digest("SHA-1");
-      MessageDigest sha256 = digest("SHA-256");
-      MessageDigest sha512 = digest("SHA-512");
-      long size;
-      try (OutputStream out = Files.newOutputStream(tmp, StandardOpenOption.TRUNCATE_EXISTING)) {
-        size = streamWithDigests(UpstreamBodyReadException.wrap(body), out, md5, sha1, sha256, sha512);
-      }
-      String md5Hex = hex(md5.digest());
-      String sha1Hex = hex(sha1.digest());
-      String sha256Hex = hex(sha256.digest());
-      String sha512Hex = hex(sha512.digest());
-      Digests digests = new Digests(md5Hex, sha1Hex, sha256Hex, sha512Hex, size);
+      BufferedUpload buffered = BufferedUpload.create(
+          UpstreamBodyReadException.wrap(body), null, "kkrepo-maven-",
+          BufferedUpload.Checksums.WITH_SHA512);
+      tmp = buffered.file();
+      BufferedUpload.Digests computed = buffered.digests();
+      Digests digests = new Digests(computed.md5(), computed.sha1(), computed.sha256(),
+          computed.sha512(), computed.size());
+      String sha256Hex = digests.sha256();
+      long size = digests.size();
       Optional<AssetBlobRecord> reusable = precheckedReusableBlob(blobStoreId, sha256Hex, size, extraBlobAttributes);
       if (reusable.isPresent()) {
         AssetBlobRecord blob = reusable.get();
@@ -507,18 +497,6 @@ public class MavenAssetWriter {
     return assetDao.findReusableBlobBySha256(blobStoreId, sha256, size);
   }
 
-  private long streamWithDigests(InputStream in, OutputStream out, MessageDigest... digests) throws IOException {
-    byte[] buf = new byte[TempBlobFiles.responseBufferSize()];
-    long total = 0;
-    int n;
-    while ((n = in.read(buf)) > 0) {
-      for (MessageDigest d : digests) d.update(buf, 0, n);
-      out.write(buf, 0, n);
-      total += n;
-    }
-    return total;
-  }
-
   private Stored persistAsset(
       RepositoryRuntime runtime,
       BlobStorage storage,
@@ -530,6 +508,7 @@ public class MavenAssetWriter {
       String createdByIp,
       Map<String, String> extraBlobAttributes,
       Path responseFile) {
+    com.github.klboke.kkrepo.server.proxy.ProxyCachePublication.check(runtime, path.path());
     Instant now = Instant.now();
     String contentType = contentTypeHint != null
         ? contentTypeHint
@@ -538,6 +517,9 @@ public class MavenAssetWriter {
     Digests digests = upload.digests();
     String blobRef = BlobReferenceCodec.format(ref);
 
+    // Blob streaming is complete. Coordinate inside the retried DB transaction before
+    // reading an existing asset ID that concurrent cleanup could otherwise remove.
+    assetDao.prepareWrite(runtime.id(), RepositoryFormat.MAVEN2, path.path());
     Optional<AssetRecord> existing = assetDao.findAssetByPath(runtime.id(), path.path());
     Long previousBlobId = existing.map(AssetRecord::assetBlobId).orElse(null);
     AssetBlobRecord previousBlob = previousBlobId == null
@@ -780,18 +762,6 @@ public class MavenAssetWriter {
 
   private static NexusCacheType cacheType(MavenPath path) {
     return isMainRepositoryMetadata(path.main()) ? NexusCacheType.METADATA : NexusCacheType.CONTENT;
-  }
-
-  private static MessageDigest digest(String algorithm) {
-    try {
-      return MessageDigest.getInstance(algorithm);
-    } catch (NoSuchAlgorithmException e) {
-      throw new IllegalStateException("Missing digest algorithm: " + algorithm, e);
-    }
-  }
-
-  private static String hex(byte[] bytes) {
-    return HexFormat.of().formatHex(bytes);
   }
 
 }

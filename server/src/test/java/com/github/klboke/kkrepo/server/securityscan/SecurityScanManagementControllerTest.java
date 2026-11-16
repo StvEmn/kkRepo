@@ -15,6 +15,7 @@ import com.github.klboke.kkrepo.security.scan.ScanEnums.TaskStatus;
 import com.github.klboke.kkrepo.server.security.AuthenticatedSubject;
 import com.github.klboke.kkrepo.server.securityscan.SecurityScanManagementService.ConfigCommand;
 import com.github.klboke.kkrepo.server.securityscan.SecurityScanManagementService.CursorPage;
+import com.github.klboke.kkrepo.server.securityscan.SecurityScanManagementService.FindingArtifactPage;
 import com.github.klboke.kkrepo.server.securityscan.SecurityScanManagementService.PolicyCommand;
 import com.github.klboke.kkrepo.server.securityscan.SecurityScanManagementService.SbomDownload;
 import com.github.klboke.kkrepo.server.securityscan.SecurityScanManagementService.WaiverCommand;
@@ -27,6 +28,157 @@ import org.springframework.web.server.ResponseStatusException;
 
 class SecurityScanManagementControllerTest {
   @Test
+  void currentFindingsHttpDefaultsAndExplicitFilterPreserveOtherParameters() throws Exception {
+    var service = mock(SecurityScanManagementService.class);
+    var actor = mock(AuthenticatedSubject.class);
+    var mvc = org.springframework.test.web.servlet.setup.MockMvcBuilders.standaloneSetup(
+        new SecurityScanManagementController(service, mock(SecurityScanMutationService.class))).build();
+    for (String value : List.of("", "false", "true")) {
+      boolean currentOnly = value.equals("true");
+      var request = org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+          .get("/internal/security/scanning/findings")
+          .param("repositoryId", "9").param("runId", "10").param("severity", "HIGH")
+          .param("q", "app").param("after", "11").param("limit", "12")
+          .requestAttr(AuthenticatedSubject.REQUEST_ATTRIBUTE, actor);
+      if (!value.isEmpty()) request.param("currentOnly", value);
+      when(service.findingPage(actor, 9L, 10L, Severity.HIGH, "app", 11L, 12, currentOnly))
+          .thenReturn(new CursorPage<>(List.of(), null));
+      var result = mvc.perform(request)
+          .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isOk())
+          .andReturn();
+      assertEquals(true, new com.fasterxml.jackson.databind.ObjectMapper()
+          .readTree(result.getResponse().getContentAsString()).path("items").isArray());
+      verify(service, org.mockito.Mockito.atLeastOnce())
+          .findingPage(actor, 9L, 10L, Severity.HIGH, "app", 11L, 12, currentOnly);
+      var artifacts = org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+          .get("/internal/security/scanning/findings/41/artifacts")
+          .requestAttr(AuthenticatedSubject.REQUEST_ATTRIBUTE, actor);
+      if (!value.isEmpty()) artifacts.param("currentOnly", value);
+      when(service.findingArtifacts(actor, 41L, 0L, 0L, 25, currentOnly))
+          .thenReturn(new FindingArtifactPage(List.of(), null, null));
+      mvc.perform(artifacts)
+          .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isOk());
+      verify(service, org.mockito.Mockito.atLeastOnce()).findingArtifacts(actor, 41L, 0L, 0L, 25, currentOnly);
+      for (String endpoint : List.of("waivers", "waiver-context")) {
+        var waiverRequest = org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+            .get("/internal/security/scanning/findings/41/" + endpoint)
+            .requestAttr(AuthenticatedSubject.REQUEST_ATTRIBUTE, actor);
+        if (!value.isEmpty()) waiverRequest.param("currentOnly", value);
+        mvc.perform(waiverRequest)
+            .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isOk());
+      }
+      verify(service, org.mockito.Mockito.atLeastOnce()).findingWaivers(actor, 41L, currentOnly);
+      verify(service, org.mockito.Mockito.atLeastOnce()).findingWaiverContext(actor, 41L, currentOnly);
+    }
+    mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+            .get("/internal/security/scanning/findings").param("currentOnly", "invalid")
+            .requestAttr(AuthenticatedSubject.REQUEST_ATTRIBUTE, actor))
+        .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isBadRequest());
+  }
+
+  @Test
+  void deletionConflictsExposeActionableJsonThroughHttp() throws Exception {
+    var mutations = mock(SecurityScanMutationService.class);
+    var actor = mock(AuthenticatedSubject.class);
+    var mvc = org.springframework.test.web.servlet.setup.MockMvcBuilders.standaloneSetup(
+        new SecurityScanManagementController(mock(SecurityScanManagementService.class), mutations)).build();
+    for (var outcome : List.of(
+        com.github.klboke.kkrepo.persistence.jdbc.api.SecurityScanDao.PolicyDeletion.STALE_REVISION,
+        com.github.klboke.kkrepo.persistence.jdbc.api.SecurityScanDao.PolicyDeletion.IN_USE)) {
+      var conflict = new ScanPolicyDeletionConflictException(outcome);
+      when(mutations.deletePolicy(org.mockito.ArgumentMatchers.any(),
+          org.mockito.ArgumentMatchers.eq(actor), org.mockito.ArgumentMatchers.eq(21L)))
+          .thenThrow(conflict);
+      var result = mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+              .delete("/internal/security/scanning/policies/21")
+              .requestAttr(AuthenticatedSubject.REQUEST_ATTRIBUTE, actor))
+          .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isConflict())
+          .andReturn();
+      var body = new com.fasterxml.jackson.databind.ObjectMapper()
+          .readTree(result.getResponse().getContentAsString());
+      assertEquals("POLICY_" + outcome.name(), body.path("code").asText());
+      assertEquals(conflict.getReason(), body.path("message").asText());
+    }
+  }
+
+  @Test
+  void policyPageKeepsExistingJsonFieldsAndAddsRevisionMetadata() throws Exception {
+    var service = mock(SecurityScanManagementService.class);
+    var actor = mock(AuthenticatedSubject.class);
+    var policy = new ScanPolicy(21L, "critical", true, Severity.CRITICAL,
+        false, false, false, 604800L, List.of(), 2, "admin", null, null);
+    when(service.policyPage(actor, null, 0L, 25)).thenReturn(new CursorPage<>(List.of(
+        new SecurityScanManagementService.PolicyView(policy, true)), null));
+    var mvc = org.springframework.test.web.servlet.setup.MockMvcBuilders.standaloneSetup(
+        new SecurityScanManagementController(service, mock(SecurityScanMutationService.class))).build();
+    var result = mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+            .get("/internal/security/scanning/policies")
+            .requestAttr(AuthenticatedSubject.REQUEST_ATTRIBUTE, actor))
+        .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isOk())
+        .andReturn();
+    var item = new com.fasterxml.jackson.databind.ObjectMapper()
+        .readTree(result.getResponse().getContentAsString()).path("items").get(0);
+    assertEquals(21L, item.path("id").asLong());
+    assertEquals("critical", item.path("name").asText());
+    assertEquals(2L, item.path("revision").asLong());
+    assertEquals(true, item.path("latestRevision").asBoolean());
+    assertEquals(false, item.has("policy"));
+  }
+
+  @Test
+  void completionEndpointsReturn400ForOutOfRangeCursorTimestamps() throws Exception {
+    var service = mock(SecurityScanManagementService.class, org.mockito.Mockito.CALLS_REAL_METHODS);
+    var controller = new SecurityScanManagementController(service, mock(SecurityScanMutationService.class));
+    var mvc = org.springframework.test.web.servlet.setup.MockMvcBuilders.standaloneSetup(controller).build();
+    for (String endpoint : List.of("tasks", "runs")) {
+      String field = endpoint.equals("tasks") ? "finished_at" : "completed_at";
+      String cursor = java.util.Base64.getUrlEncoder().encodeToString(
+          ("1|" + field + "|desc|+1000000000-12-31T23:59:59.999999999Z|1")
+              .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+      mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+              .get("/internal/security/scanning/" + endpoint)
+              .param("sort", field).param("cursor", cursor)
+              .requestAttr(AuthenticatedSubject.REQUEST_ATTRIBUTE, mock(AuthenticatedSubject.class)))
+          .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isBadRequest());
+    }
+  }
+
+  @Test
+  void completionEndpointsReturn400ForConnectionTimezoneOverflow() throws Exception {
+    var service = mock(SecurityScanManagementService.class);
+    var actor = mock(AuthenticatedSubject.class);
+    var error = new com.github.klboke.kkrepo.persistence.jdbc.api.InvalidScanCompletionCursorException(null);
+    when(service.taskPage(actor, null, null, null, 0, 25, "finished_at", null, "cursor"))
+        .thenThrow(error);
+    when(service.runPage(actor, null, null, 0, 25, "completed_at", null, "cursor"))
+        .thenThrow(error);
+    var controller = new SecurityScanManagementController(service, mock(SecurityScanMutationService.class));
+    var mvc = org.springframework.test.web.servlet.setup.MockMvcBuilders.standaloneSetup(controller).build();
+    for (String endpoint : List.of("tasks", "runs")) {
+      String field = endpoint.equals("tasks") ? "finished_at" : "completed_at";
+      mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+              .get("/internal/security/scanning/" + endpoint)
+              .param("sort", field).param("cursor", "cursor")
+              .requestAttr(AuthenticatedSubject.REQUEST_ATTRIBUTE, actor))
+          .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isBadRequest());
+    }
+  }
+
+  @Test
+  void forwardsCompletionSortAndCursorParameters() {
+    var service = mock(SecurityScanManagementService.class);
+    var controller = new SecurityScanManagementController(service, mock(SecurityScanMutationService.class));
+    var request = mock(HttpServletRequest.class);
+    var actor = mock(AuthenticatedSubject.class);
+    when(request.getAttribute(AuthenticatedSubject.REQUEST_ATTRIBUTE)).thenReturn(actor);
+    controller.tasks(3L, TaskStatus.FAILED, "error", 0, 25, "finished_at", "desc", "task-cursor", request);
+    verify(service).taskPage(actor, 3L, TaskStatus.FAILED, "error", 0, 25,
+        "finished_at", "desc", "task-cursor");
+    controller.runs(3L, "complete", 0, 25, "completed_at", "asc", "run-cursor", request);
+    verify(service).runPage(actor, 3L, "complete", 0, 25, "completed_at", "asc", "run-cursor");
+  }
+
+  @Test
   void delegatesEveryManagementEndpointAndBuildsMutationResponses() {
     SecurityScanManagementService service = mock(SecurityScanManagementService.class);
     SecurityScanMutationService mutations = mock(SecurityScanMutationService.class);
@@ -38,11 +190,15 @@ class SecurityScanManagementControllerTest {
 
     when(service.repositoryPage(actor, "repo", 1L, 2))
         .thenReturn(new CursorPage<>(List.of(), null));
-    when(service.taskPage(actor, 3L, TaskStatus.PENDING, "task", 4L, 5))
+    when(service.taskPage(actor, 3L, TaskStatus.PENDING, "task", 4L, 5, null, null, null))
         .thenReturn(new CursorPage<>(List.of(), null));
-    when(service.runPage(actor, 6L, "run", 7L, 8))
+    when(service.runPage(actor, 6L, "run", 7L, 8, null, null, null))
         .thenReturn(new CursorPage<>(List.of(), null));
-    when(service.findingPage(actor, 9L, 10L, Severity.HIGH, "finding", 11L, 12))
+    when(service.findingPage(actor, 9L, 10L, Severity.HIGH, "finding", 11L, 12, false))
+        .thenReturn(new CursorPage<>(List.of(), null));
+    when(service.findingArtifacts(actor, 24L, 25L, 26L, 27, false))
+        .thenReturn(new FindingArtifactPage(List.of(), null, null));
+    when(service.policyOptionPage(actor, 12L, 13L, 14))
         .thenReturn(new CursorPage<>(List.of(), null));
     when(service.policyPage(actor, "policy", 13L, 14))
         .thenReturn(new CursorPage<>(List.of(), null));
@@ -81,13 +237,15 @@ class SecurityScanManagementControllerTest {
     assertEquals(List.of(), controller.repositories("repo", 1L, 2, request).items());
     assertEquals(
         List.of(),
-        controller.tasks(3L, TaskStatus.PENDING, "task", 4L, 5, request).items());
-    assertEquals(List.of(), controller.runs(6L, "run", 7L, 8, request).items());
+        controller.tasks(3L, TaskStatus.PENDING, "task", 4L, 5, null, null, null, request).items());
+    assertEquals(List.of(), controller.runs(6L, "run", 7L, 8, null, null, null, request).items());
     assertEquals(
         List.of(),
-        controller.findings(9L, 10L, Severity.HIGH, "finding", 11L, 12, request).items());
-    controller.findingWaiverContext(24L, request);
-    controller.findingWaivers(24L, request);
+        controller.findings(9L, 10L, Severity.HIGH, "finding", 11L, 12, false, request).items());
+    assertEquals(
+        List.of(), controller.findingArtifacts(24L, 25L, 26L, 27, false, request).items());
+    controller.findingWaiverContext(24L, false, request);
+    controller.findingWaivers(24L, false, request);
     controller.asset(25L, request);
     assertEquals(180L, controller.rescan(18L, request).get("taskId"));
     assertEquals("PENDING", controller.retry(26L, request).get("status"));
@@ -95,8 +253,11 @@ class SecurityScanManagementControllerTest {
     controller.repositoryConfig(19L, request);
     assertEquals(config, controller.updateRepositoryConfig(19L, configCommand, request));
     assertEquals(List.of(), controller.policies("policy", 13L, 14, request).items());
+    assertEquals(List.of(), controller.policyOptions(12L, 13L, 14, request).items());
     assertEquals(policy, controller.createPolicy(policyCommand, request));
     assertEquals(policy, controller.revisePolicy(21L, policyCommand, request));
+    assertEquals(HttpStatus.NO_CONTENT, controller.deletePolicy(21L, request).getStatusCode());
+    verify(mutations).deletePolicy(request, actor, 21L);
     assertEquals(List.of(), controller.waivers(15L, "waiver", 16L, 17, request).items());
     assertEquals(waiver, controller.createWaiver(waiverCommand, request));
     assertEquals(HttpStatus.NO_CONTENT, controller.deleteWaiver(22L, request).getStatusCode());
@@ -106,6 +267,34 @@ class SecurityScanManagementControllerTest {
 
     verify(mutations).retry(request, actor, 26L);
     verify(mutations).cancel(request, actor, 27L);
+  }
+
+  @Test
+  void repositoryAndWaiverAssignmentsReturn409WhenPolicyDeletionWins() throws Exception {
+    var mutations = mock(SecurityScanMutationService.class);
+    var conflict = new com.github.klboke.kkrepo.persistence.jdbc.api.ScanPolicyReferenceConflictException(42);
+    when(mutations.updateRepositoryConfig(org.mockito.ArgumentMatchers.any(),
+        org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.eq(3L),
+        org.mockito.ArgumentMatchers.any())).thenThrow(conflict);
+    when(mutations.createWaiver(org.mockito.ArgumentMatchers.any(),
+        org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any())).thenThrow(conflict);
+    var mvc = org.springframework.test.web.servlet.setup.MockMvcBuilders.standaloneSetup(
+        new SecurityScanManagementController(mock(SecurityScanManagementService.class), mutations)).build();
+    var actor = mock(AuthenticatedSubject.class);
+    for (var request : List.of(
+        org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+            .put("/internal/security/scanning/repositories/3/config").content("""
+                {"enabled":true,"profileId":1,"scanHostedContent":true,"scanProxyContent":true,"policyId":42}
+                """),
+        org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+            .post("/internal/security/scanning/waivers").content("{\"policyId\":42}"))) {
+      var result = mvc.perform(request.contentType("application/json")
+              .requestAttr(AuthenticatedSubject.REQUEST_ATTRIBUTE, actor))
+          .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.status().isConflict())
+          .andReturn();
+      assertEquals("{\"message\":\"Scan policy 42 no longer exists; refresh and select an existing policy\"}",
+          result.getResponse().getContentAsString());
+    }
   }
 
   @Test

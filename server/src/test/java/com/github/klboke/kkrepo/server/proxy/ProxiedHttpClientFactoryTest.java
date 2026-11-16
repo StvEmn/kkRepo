@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -21,6 +22,8 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
@@ -30,10 +33,77 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.core5.http.HttpHost;
+import org.apache.hc.core5.http.ConnectionRequestTimeoutException;
 import org.apache.hc.core5.http.message.BasicClassicHttpRequest;
 import org.junit.jupiter.api.Test;
 
 class ProxiedHttpClientFactoryTest {
+
+  @Test
+  void publicHttpsCapabilityDoesNotReuseThePooledClientCookieStore() throws Exception {
+    HttpServer upstream = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    List<String> cookies = new ArrayList<>();
+    upstream.createContext("/", exchange -> {
+      cookies.add(exchange.getRequestHeaders().getFirst("Cookie"));
+      exchange.getResponseHeaders().add("Set-Cookie", "fixture-session=example; Path=/");
+      exchange.sendResponseHeaders(200, 1);
+      exchange.getResponseBody().write('x');
+      exchange.close();
+    });
+    upstream.start();
+    try (var factory = new ProxiedHttpClientFactory(60000, 10000)) {
+      String url = "http://127.0.0.1:" + upstream.getAddress().getPort() + "/";
+      var strict = OutboundRequestPolicy.allowPrivateForTests().resolveHttpTarget(url, "test");
+      // Mock only the issued capability to exercise the cookie transport on a local server.
+      // Production PUBLIC_HTTPS issuance rejects this HTTP/private endpoint.
+      var publicTarget = org.mockito.Mockito.mock(ResolvedHttpTarget.class);
+      org.mockito.Mockito.when(publicTarget.uri()).thenReturn(URI.create(url));
+      org.mockito.Mockito.when(publicTarget.addresses()).thenReturn(strict.addresses());
+      org.mockito.Mockito.when(publicTarget.publicHttpsOnly()).thenReturn(true);
+      for (var target : List.of(strict, publicTarget, strict)) {
+        try (var result = factory.execute("test", null, "GET", target, Map.of(), 10000)) {
+          result.body().readAllBytes();
+        }
+      }
+      assertNull(cookies.get(0));
+      assertNull(cookies.get(1), "PUBLIC_HTTPS must not inherit cookies from the pooled client");
+      assertEquals("fixture-session=example", cookies.get(2));
+    } finally {
+      upstream.stop(0);
+    }
+  }
+
+  @Test
+  void saturatedRouteUsesLeaseTimeoutAndRecoversWhenResponsesClose() throws Exception {
+    HttpServer upstream = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    upstream.createContext("/", exchange -> {
+      byte[] body = "leased".getBytes(StandardCharsets.UTF_8);
+      exchange.sendResponseHeaders(200, body.length);
+      exchange.getResponseBody().write(body);
+      exchange.close();
+    });
+    upstream.start();
+    List<ProxiedHttpClientFactory.ProxiedResponse> held = new ArrayList<>();
+    try (ProxiedHttpClientFactory factory = new ProxiedHttpClientFactory(60000, 5000, 100)) {
+      ResolvedHttpTarget target = target("http://127.0.0.1:" + upstream.getAddress().getPort() + "/");
+      try {
+        for (int i = 0; i < 20; i++) {
+          held.add(factory.execute("pool-test", null, "GET", target, Map.of(), 30000));
+        }
+        assertTimeoutPreemptively(Duration.ofSeconds(3), () -> assertThrows(
+            ConnectionRequestTimeoutException.class,
+            () -> factory.execute("pool-test", null, "GET", target, Map.of(), 30000)));
+      } finally {
+        held.forEach(ProxiedHttpClientFactory.ProxiedResponse::close);
+      }
+      try (var response = factory.execute("pool-test", null, "GET", target, Map.of(), 30000)) {
+        assertEquals(200, response.status());
+        assertEquals("leased", new String(response.body().readAllBytes(), StandardCharsets.UTF_8));
+      }
+    } finally {
+      upstream.stop(0);
+    }
+  }
 
   @Test
   void ipv6LiteralUsesUnbracketedApacheEndpointHost() {
@@ -800,6 +870,25 @@ class ProxiedHttpClientFactoryTest {
       factory.invalidate("repo-a", null);
       factory.invalidate("repo-a",
           new OutboundProxyConfig(OutboundProxyConfig.Type.HTTP, "", 0, null, null));
+    }
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  void shutdownDoesNotDependOnAsynchronousRemovalNotifications() throws Exception {
+    // This cache deliberately never executes removal notifications, as can happen while its
+    // executor is busy or stopping. Explicit shutdown must still close owned resources.
+    var cache = (com.github.klboke.kkrepo.cache.LocalCache<String, CloseableHttpClient>)
+        org.mockito.Mockito.mock(com.github.klboke.kkrepo.cache.LocalCache.class);
+    var clients = new java.util.concurrent.ConcurrentHashMap<String, CloseableHttpClient>();
+    var client = org.mockito.Mockito.mock(CloseableHttpClient.class);
+    clients.put("repository", client);
+    org.mockito.Mockito.when(cache.asMap()).thenReturn(clients);
+    try (var factory = new ProxiedHttpClientFactory(60000, 10000)) {
+      org.springframework.test.util.ReflectionTestUtils.setField(factory, "cache", cache);
+      factory.close();
+      org.mockito.Mockito.verify(client).close();
+      org.mockito.Mockito.verify(cache).invalidateAll();
     }
   }
 

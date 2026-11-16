@@ -2,6 +2,7 @@ package com.github.klboke.kkrepo.migration.nexus;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -9,6 +10,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.klboke.kkrepo.migration.nexus.NexusRestClient.NexusInventory;
 import com.github.klboke.kkrepo.migration.nexus.NexusRestClient.HttpTextResponse;
 import com.github.klboke.kkrepo.migration.nexus.NexusRestClient.SourceProbe;
+import com.github.klboke.kkrepo.migration.nexus.security.NexusSecurityExportReader;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpRequest;
@@ -25,6 +27,17 @@ import org.junit.jupiter.api.Test;
 
 class NexusRestClientTest {
   private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+
+  @Test
+  void readsRoutingPoliciesAndDoesNotTreatAnUnavailableApiAsAnEmptyInventory() throws Exception {
+    FakeNexus nexus = new FakeNexus(true);
+    nexus.routingRules = List.of(Map.of("name", "internal", "description", "", "mode", "BLOCK", "matchers", List.of("/private/.*")));
+    assertEquals(nexus.routingRules, client(nexus).readInventory().routingRules());
+    nexus.routingStatus = 403;
+    assertTrue(client(nexus).readInventory().routingRulesError().contains("403"));
+    nexus.routingStatus = 404;
+    assertTrue(client(nexus).readInventory().routingRulesError().contains("404"));
+  }
 
   @Test
   void reportsWarningWhenSourceScriptApiDoesNotExposePasswordHashes() throws Exception {
@@ -57,6 +70,24 @@ class NexusRestClientTest {
     assertTrue(nexus.scriptDeleted);
     assertEquals("/service/rest/v1/security/users?source=default", nexus.usersPath);
     assertEquals("/service/rest/v1/security/roles?source=default", nexus.rolesPath);
+  }
+
+  @Test
+  void readsPrivilegesWithNullValuesReturnedBySourceRestApi() throws Exception {
+    FakeNexus nexus = new FakeNexus(true);
+    nexus.nullValuedPrivilege = true;
+
+    NexusInventory inventory = client(nexus).readInventory();
+    Map<String, Object> privilege = inventory.securityExport().privileges().getFirst();
+
+    assertEquals("nx-pro-example", privilege.get("name"));
+    assertTrue(privilege.containsKey("description"));
+    assertNull(privilege.get("description"));
+    assertNull(new NexusSecurityExportReader()
+        .read(inventory.securityExport())
+        .privileges()
+        .getFirst()
+        .description());
   }
 
   @Test
@@ -261,7 +292,7 @@ class NexusRestClientTest {
   }
 
   @Test
-  void sourceProfileScriptUsesGroovy24CompatibleConanBooleanContinuations() throws Exception {
+  void sourceProfileScriptKeepsLegacyGroovyCompatibleBooleanContinuations() throws Exception {
     var field = NexusRestClient.class.getDeclaredField("SOURCE_PROFILE_PROBE_SCRIPT");
     field.setAccessible(true);
     String script = (String) field.get(null);
@@ -272,6 +303,11 @@ class NexusRestClientTest {
     assertTrue(script.contains("&& parts[11] == 'files')"));
     assertFalse(script.contains("def recipeFile = parts.length >= 9\n"));
     assertFalse(script.contains("def packageFile = parts.length >= 13\n"));
+    assertTrue(script.contains("valid = (valid && oid != null"));
+    assertTrue(script.contains("&& sums instanceof Map && String.valueOf(sums.sha256) == oid)"));
+    // Older Nexus Groovy/ASM versions cannot decompile JDK 25 Exception/Number classes.
+    assertFalse(script.contains("catch (Exception "));
+    assertTrue(script.contains("jdkClass('java.lang.Number').isInstance(size)"));
   }
 
   @Test
@@ -365,6 +401,8 @@ class NexusRestClientTest {
   }
 
   private static final class FakeNexus {
+    private int routingStatus = 200;
+    private List<Map<String, Object>> routingRules = List.of();
     private final boolean scriptApiEnabled;
     private boolean scriptDeleted;
     private String usersPath;
@@ -374,6 +412,7 @@ class NexusRestClientTest {
     private int scriptRuns;
     private String profileRunContentType = "";
     private boolean emptyStatusBody;
+    private boolean nullValuedPrivilege;
 
     private FakeNexus(boolean scriptApiEnabled) {
       this.scriptApiEnabled = scriptApiEnabled;
@@ -390,6 +429,9 @@ class NexusRestClientTest {
           return empty(204);
         }
         return json(200, Map.of("version", "3.77.2-02"));
+      }
+      if ("GET".equals(method) && "/service/rest/v1/routing-rules".equals(path)) {
+        return json(routingStatus, routingRules);
       }
       if ("GET".equals(method) && "/service/rest/v1/repositories".equals(path)) {
         return json(200, List.of());
@@ -426,6 +468,16 @@ class NexusRestClientTest {
                 "roles", List.of())));
       }
       if ("GET".equals(method) && "/service/rest/v1/security/privileges".equals(path)) {
+        if (nullValuedPrivilege) {
+          LinkedHashMap<String, Object> privilege = new LinkedHashMap<>();
+          privilege.put("name", "nx-pro-example");
+          privilege.put("description", null);
+          privilege.put("type", "application");
+          privilege.put("readOnly", true);
+          privilege.put("domain", "pro-example");
+          privilege.put("actions", List.of("read"));
+          return json(200, List.of(privilege));
+        }
         return json(200, List.of());
       }
       if ("GET".equals(method) && "/service/rest/v1/security/content-selectors".equals(path)) {

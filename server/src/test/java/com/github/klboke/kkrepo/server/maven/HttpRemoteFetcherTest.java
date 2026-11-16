@@ -1,6 +1,7 @@
 package com.github.klboke.kkrepo.server.maven;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -12,7 +13,9 @@ import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.nullable;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.io.ByteArrayInputStream;
@@ -43,6 +46,227 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 class HttpRemoteFetcherTest {
+
+  @Test
+  void publicHttpsCanonicalRequestRejectsBodiesAndEnabledOutboundProxies() {
+    byte[] body = "{}".getBytes(StandardCharsets.UTF_8);
+    var error = assertThrows(IllegalArgumentException.class,
+        () -> publicHttpsRequest(null, body, false));
+    assertEquals("PUBLIC_HTTPS supports direct content GET/HEAD only", error.getMessage());
+    for (var type : OutboundProxyConfig.Type.values()) {
+      var proxy = new OutboundProxyConfig(type, "proxy.example", 8080, null, null);
+      assertThrows(IllegalArgumentException.class, () -> publicHttpsRequest(proxy, null, false));
+    }
+    var disabled = new OutboundProxyConfig(null, "", 0, null, null);
+    assertEquals(false, publicHttpsRequest(disabled, null, false).headOnly());
+    assertEquals(true, publicHttpsRequest(null, null, true).headOnly());
+  }
+
+  private static HttpRemoteFetcher.Request publicHttpsRequest(
+      OutboundProxyConfig proxy, byte[] body, boolean headOnly) {
+    return new HttpRemoteFetcher.Request("https://repo.example/file", null, null, null, null,
+        headOnly, "proxy", "maven2", null, null, Set.of(), proxy, null, body,
+        body == null ? null : "application/json", null, null,
+        com.github.klboke.kkrepo.server.security.ProxyRedirectPolicy.PUBLIC_HTTPS);
+  }
+
+  @Test
+  void publicHttpsAllowsNewCdnButStripsCredentialsAndRejectsDowngrade() {
+    var runtime = mock(RepositoryRuntime.class);
+    when(runtime.name()).thenReturn("proxy");
+    when(runtime.proxyRemoteUrl()).thenReturn("https://repo.example.com");
+    when(runtime.proxyRemoteUsername()).thenReturn("robot");
+    when(runtime.proxyRemotePassword()).thenReturn("secret");
+    var ntlm = new com.github.klboke.kkrepo.server.proxy.NtlmCredentials("robot", "secret", "domain", "host");
+    when(runtime.ntlmCredentials()).thenReturn(ntlm);
+    when(runtime.allowedRedirectHosts()).thenReturn(Set.of());
+    when(runtime.contentRedirectPolicy()).thenReturn(
+        com.github.klboke.kkrepo.server.security.ProxyRedirectPolicy.PUBLIC_HTTPS);
+    var request = HttpRemoteFetcher.Request.get("https://repo.example.com/file")
+        .withRepositoryForContent(runtime).withAccept("application/octet-stream")
+        .withConditional("etag", null).withTimeoutProfile(HttpRemoteFetcher.TimeoutProfile.METADATA);
+    URI origin = URI.create(request.url());
+    URI cdn = URI.create("https://rotating.example.org/file");
+    assertSame(ntlm, request.ntlmCredentialsForRedirect(origin, origin));
+    assertEquals("rotating.example.org", request.trustedHostForRedirect(origin, cdn));
+    assertNull(request.authorizationHeaderForRedirect(origin, cdn));
+    assertNull(request.ntlmCredentialsForRedirect(origin, cdn));
+    assertThrows(SecurityValidationException.class, () ->
+        request.trustedHostForRedirect(origin, URI.create("http://rotating.example.org/file")));
+    var metadata = HttpRemoteFetcher.Request.get(cdn.toString()).withRepositoryRedirectBoundary(runtime);
+    assertNull(metadata.authorizationHeader());
+    assertEquals(request.redirectPolicy(), metadata.redirectPolicy());
+    assertEquals(com.github.klboke.kkrepo.server.security.ProxyRedirectPolicy.ALLOWLIST,
+        request.withBody("application/json", "{}".getBytes(StandardCharsets.UTF_8)).redirectPolicy());
+    assertThrows(SecurityValidationException.class,
+        () -> metadata.withBody("application/json", "{}".getBytes(StandardCharsets.UTF_8)));
+    assertEquals(com.github.klboke.kkrepo.server.security.ProxyRedirectPolicy.ALLOWLIST,
+        HttpRemoteFetcher.Request.get("https://repo.example.com/file")
+            .withBody("application/json", "{}".getBytes(StandardCharsets.UTF_8))
+            .withRepositoryForContent(runtime).redirectPolicy());
+  }
+
+  @Test
+  void repositoryConfigurationAloneDoesNotGrantContentAuthorityToUnknownGetPurpose() {
+    var runtime = mock(RepositoryRuntime.class);
+    when(runtime.proxyRemoteUrl()).thenReturn("https://repo.example");
+    when(runtime.contentRedirectPolicy()).thenReturn(com.github.klboke.kkrepo.server.security.ProxyRedirectPolicy.PUBLIC_HTTPS);
+    when(runtime.strictRedirectHosts()).thenReturn(Set.of("cdn.example"));
+    var unknown = HttpRemoteFetcher.Request.get("https://repo.example/authenticate").withRepository(runtime);
+    assertEquals(com.github.klboke.kkrepo.server.security.ProxyRedirectPolicy.ALLOWLIST, unknown.redirectPolicy());
+    assertEquals(Set.of("cdn.example"), unknown.allowedUnsignedRedirectHosts());
+    assertThrows(SecurityValidationException.class, () -> unknown.trustedHostForRedirect(
+        URI.create(unknown.url()), URI.create("https://unlisted.example/token")));
+  }
+
+  @Test
+  void publicHttpsRequestUsesIndependentPublicAddressPolicy() {
+    var policy = mock(OutboundRequestPolicy.class);
+    var target = mock(OutboundRequestPolicy.ResolvedHttpTarget.class);
+    when(target.uri()).thenReturn(URI.create("https://cdn.example.org/file"));
+    when(policy.resolvePublicHttpsTarget("https://cdn.example.org/file", "content")).thenReturn(target);
+    var runtime = mock(RepositoryRuntime.class);
+    when(runtime.allowedRedirectHosts()).thenReturn(Set.of());
+    when(runtime.contentRedirectPolicy()).thenReturn(
+        com.github.klboke.kkrepo.server.security.ProxyRedirectPolicy.PUBLIC_HTTPS);
+    var request = HttpRemoteFetcher.Request.get("https://cdn.example.org/file")
+        .withRepositoryForContent(runtime, false);
+    assertSame(target, request.resolvedTarget(policy, "content"));
+    verify(policy).resolvePublicHttpsTarget("https://cdn.example.org/file", "content");
+  }
+
+  @Test
+  void publicHttpsTransportFollowsRedirectsWithoutCredentialsAndBoundsCycles() throws Exception {
+    var policy = mock(OutboundRequestPolicy.class);
+    when(policy.resolvePublicHttpsTarget(anyString(), anyString())).thenAnswer(invocation -> {
+      var target = mock(OutboundRequestPolicy.ResolvedHttpTarget.class);
+      when(target.uri()).thenReturn(URI.create(invocation.getArgument(0, String.class)));
+      return target;
+    });
+    var transport = mock(ProxiedHttpClientFactory.class);
+    var headers = org.mockito.ArgumentCaptor.forClass(Map.class);
+    var redirectResponse = response(307, Map.of("Location", "https://cdn.example.org/file"), "");
+    var contentResponse = response(200, Map.of(), "artifact");
+    when(transport.execute(nullable(String.class), nullable(OutboundProxyConfig.class), eq("GET"),
+        any(OutboundRequestPolicy.ResolvedHttpTarget.class), headers.capture(), nullable(byte[].class), anyLong()))
+        .thenReturn(redirectResponse, contentResponse);
+    var runtime = mock(RepositoryRuntime.class);
+    when(runtime.proxyRemoteUrl()).thenReturn("https://repo.example.com");
+    when(runtime.proxyRemoteBearerToken()).thenReturn("test-token");
+    when(runtime.allowedRedirectHosts()).thenReturn(Set.of());
+    when(runtime.contentRedirectPolicy()).thenReturn(
+        com.github.klboke.kkrepo.server.security.ProxyRedirectPolicy.PUBLIC_HTTPS);
+    var request = HttpRemoteFetcher.Request.get("https://repo.example.com/file").withRepositoryForContent(runtime).withByteRange("bytes=100-", "\"v1\"");
+    var fetcher = new HttpRemoteFetcher(policy, null, transport, "HTTP_1_1", 30, 60, 300, 5, 0, 0);
+    try (var result = fetcher.fetch(request)) {
+      assertEquals("artifact", new String(result.body().readAllBytes(), StandardCharsets.UTF_8));
+    }
+    assertEquals("Bearer test-token", headers.getAllValues().get(0).get("Authorization"));
+    assertNull(headers.getAllValues().get(1).get("Authorization"));
+    for (var sent : headers.getAllValues()) {
+      assertEquals("bytes=100-", sent.get("Range"));
+      assertEquals("\"v1\"", sent.get("If-Range"));
+      assertEquals("identity", sent.get("Accept-Encoding"));
+    }
+    when(transport.execute(nullable(String.class), nullable(OutboundProxyConfig.class), eq("GET"),
+        any(OutboundRequestPolicy.ResolvedHttpTarget.class), anyMap(), nullable(byte[].class), anyLong()))
+        .thenAnswer(invocation -> response(307,
+            Map.of("Location", "https://cdn.example.org/loop?signature=private-fixture"), ""));
+    var error = assertThrows(IOException.class, () -> fetcher.fetch(request));
+    org.junit.jupiter.api.Assertions.assertFalse(error.getMessage().contains("private-fixture"));
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"/maven/^4.2.0.pom", "/maven/a b.pom", "/maven/%zz.pom", "http://[invalid/path"})
+  void malformedRedirectIsAnIoFailureAndReleasesResponse(String location) throws Exception {
+    ProxiedHttpClientFactory transport = mock(ProxiedHttpClientFactory.class);
+    var redirect = response(302, Map.of("Location", location), "");
+    when(transport.execute(nullable(String.class), nullable(OutboundProxyConfig.class), eq("GET"),
+        any(OutboundRequestPolicy.ResolvedHttpTarget.class), anyMap(), nullable(byte[].class), anyLong()))
+        .thenReturn(redirect);
+    var fetcher = new HttpRemoteFetcher(OutboundRequestPolicy.allowPrivateForTests(), null, transport,
+        "HTTP_1_1", 30, 60, 300, 5, 2, 1);
+
+    IOException error = assertThrows(IOException.class, () -> fetcher.fetchWithBodyRetry(
+        HttpRemoteFetcher.Request.get("http://127.0.0.1/artifact.pom"), "artifact.pom", result -> result.status()));
+
+    assertEquals("Invalid redirect URI returned by upstream", error.getMessage());
+    assertInstanceOf(IllegalArgumentException.class, error.getCause());
+    verify(redirect, atLeastOnce()).close();
+    verify(transport).execute(nullable(String.class), nullable(OutboundProxyConfig.class), eq("GET"),
+        any(OutboundRequestPolicy.ResolvedHttpTarget.class), anyMap(), nullable(byte[].class), anyLong());
+  }
+
+  @Test
+  void pinnedAlternateHostEnforcesEveryRedirectWithoutCredentials() {
+    var request = HttpRemoteFetcher.Request.get("https://cdn.example.org/demo.tgz")
+        .withRedirectBoundary();
+    URI current = URI.create(request.url());
+    assertEquals("cdn.example.org", request.trustedHostForRedirect(current, current.resolve("/next.tgz")));
+    assertNull(request.authorizationHeaderForRedirect(current, current.resolve("/next.tgz")));
+    assertThrows(SecurityValidationException.class, () -> request.trustedHostForRedirect(
+        current, URI.create("https://unapproved.example/demo.tgz")));
+    assertThrows(SecurityValidationException.class, () -> request.authorizationHeaderForRedirect(
+        current, URI.create("https://unapproved.example/demo.tgz")));
+  }
+
+  @Test
+  void metadataRedirectsTrustOnlyTheConfiguredOriginAndApprovedCdnHosts() {
+    var runtime = runtime("https://repo.example.com/npm", "robot", "secret", null, Set.of("cdn.example.org"));
+    var request = HttpRemoteFetcher.Request.get("https://cdn.example.org/demo.tgz")
+        .withRepositoryRedirectBoundary(runtime);
+    URI cdn = URI.create(request.url());
+    URI origin = URI.create("https://repo.example.com/npm/demo.tgz");
+    assertNull(request.authorizationHeader());
+    assertEquals("Basic cm9ib3Q6c2VjcmV0", request.authorizationHeaderForRedirect(cdn, origin));
+    assertEquals("repo.example.com", request.trustedHostForRedirect(cdn, origin));
+    assertNull(request.authorizationHeaderForRedirect(cdn, cdn.resolve("/next.tgz")));
+    for (String unsafe : List.of("http://repo.example.com/demo.tgz", "https://repo.example.com:8443/demo.tgz",
+        "https://other.example.org/demo.tgz")) {
+      assertThrows(SecurityValidationException.class,
+          () -> request.authorizationHeaderForRedirect(cdn, URI.create(unsafe)));
+      assertThrows(SecurityValidationException.class,
+          () -> request.trustedHostForRedirect(cdn, URI.create(unsafe)));
+    }
+    assertThrows(SecurityValidationException.class,
+        () -> HttpRemoteFetcher.Request.get("https://other.example.org/demo.tgz").withRepositoryRedirectBoundary(runtime));
+    var ntlmRuntime = org.mockito.Mockito.spy(runtime);
+    var ntlm = new com.github.klboke.kkrepo.server.proxy.NtlmCredentials("robot", "secret", "domain", "host");
+    when(ntlmRuntime.ntlmCredentials()).thenReturn(ntlm);
+    var ntlmRequest = HttpRemoteFetcher.Request.get(cdn.toString()).withRepositoryRedirectBoundary(ntlmRuntime);
+    assertNull(ntlmRequest.ntlmCredentials());
+    assertSame(ntlm, ntlmRequest.ntlmCredentialsForRedirect(cdn, origin));
+    assertNull(ntlmRequest.ntlmCredentialsForRedirect(origin, cdn));
+  }
+
+  @Test
+  void fetchRestoresOriginAuthorizationAfterMultipleCdnHops() throws Exception {
+    ProxiedHttpClientFactory transport = mock(ProxiedHttpClientFactory.class);
+    List<String> authorizations = new ArrayList<>();
+    List<String> targets = List.of("http://127.0.0.1:8082/start", "http://localhost:8081/first",
+        "http://127.0.0.1:8082/again", "http://localhost:8081/final");
+    when(transport.execute(anyString(), nullable(OutboundProxyConfig.class), eq("GET"),
+        any(OutboundRequestPolicy.ResolvedHttpTarget.class), anyMap(), nullable(byte[].class), anyLong()))
+        .thenAnswer(invocation -> {
+          OutboundRequestPolicy.ResolvedHttpTarget target = invocation.getArgument(3);
+          Map<String, String> headers = invocation.getArgument(4);
+          int index = authorizations.size();
+          assertEquals(targets.get(index), target.uri().toString());
+          authorizations.add(headers.get("Authorization"));
+          return index + 1 < targets.size()
+              ? response(302, Map.of("Location", targets.get(index + 1)), "")
+              : response(200, Map.of(), "tarball");
+        });
+    var fetcher = new HttpRemoteFetcher(OutboundRequestPolicy.allowPrivateForTests(), null, transport,
+        "HTTP_1_1", 30, 60, 300, 5, 2, 1);
+    var request = HttpRemoteFetcher.Request.get(targets.getFirst())
+        .withRepositoryRedirectBoundary(runtime("http://localhost:8081/npm", null, null, "secret", Set.of("127.0.0.1")))
+        .withAccept("application/octet-stream").withConditional(null, null).withTimeoutProfile(HttpRemoteFetcher.TimeoutProfile.CONTENT);
+    try (var result = fetcher.fetch(request)) {
+      assertEquals("tarball", new String(result.body().readAllBytes(), StandardCharsets.UTF_8));
+    }
+    assertEquals(java.util.Arrays.asList(null, "Bearer secret", null, "Bearer secret"), authorizations);
+  }
 
   @Test
   void resultParsesContentLengthDefensively() {
@@ -439,6 +663,26 @@ class HttpRemoteFetcherTest {
   }
 
   @Test
+  void ohpmUsesRawTokenAndKeepsItWithinTheConfiguredOrigin() {
+    var runtime = mock(RepositoryRuntime.class);
+    when(runtime.name()).thenReturn("ohpm-proxy");
+    when(runtime.format()).thenReturn(RepositoryFormat.OHPM);
+    when(runtime.proxyRemoteUrl()).thenReturn("https://registry.example/ohpm");
+    when(runtime.proxyRemoteBearerToken()).thenReturn("upstream-token");
+    when(runtime.strictRedirectHosts()).thenReturn(Set.of("cdn.example"));
+    when(runtime.allowsRedirectHost("cdn.example")).thenReturn(true);
+    URI origin = URI.create("https://registry.example/ohpm/@scope/pkg");
+    URI cdn = URI.create("https://cdn.example/pkg.har");
+    var request = HttpRemoteFetcher.Request.get(origin.toString()).withRepositoryRedirectBoundary(runtime);
+    assertEquals("upstream-token", request.authorizationHeader());
+    assertEquals("upstream-token", request.authorizationHeaderForRedirect(origin, origin.resolve("pkg.har")));
+    assertNull(request.authorizationHeaderForRedirect(origin, cdn));
+    var download = HttpRemoteFetcher.Request.get(cdn.toString()).withRepositoryRedirectBoundary(runtime);
+    assertNull(download.authorizationHeader());
+    assertEquals("upstream-token", download.authorizationHeaderForRedirect(cdn, origin));
+  }
+
+  @Test
   void requestWithRepositoryOnlyAddsAuthorizationForPinnedRemoteHost() {
     RepositoryRuntime runtime = runtime("robot", "secret", null);
 
@@ -502,6 +746,23 @@ class HttpRemoteFetcherTest {
     assertEquals(
         "plugins-artifacts.gradle.org",
         request.trustedHostForRedirect(current, redirected));
+  }
+
+  @Test
+  void wildcardRedirectsMatchOnlySubdomainsAndDropCredentials() {
+    var runtime = runtime("https://quay.io/", "robot", "secret", null, Set.of("*.QUAY.IO."));
+    var request = HttpRemoteFetcher.Request.get("https://quay.io/image").withRepository(runtime);
+    URI origin = URI.create("https://quay.io/image");
+    for (String host : List.of("cdn01.quay.io", "cdn02.quay.io", "nested.cdn.quay.io.")) {
+      URI target = URI.create("https://" + host + "/layer");
+      assertNull(request.authorizationHeaderForRedirect(origin, target));
+      assertEquals(host.replaceAll("\\.$", ""), request.trustedHostForRedirect(origin, target));
+    }
+    for (String host : List.of("evilquay.io", "quay.io.evil.test", "quay.io")) {
+      URI current = URI.create("https://cdn01.quay.io/layer");
+      assertThrows(SecurityValidationException.class,
+          () -> request.trustedHostForRedirect(current, URI.create("https://" + host + "/layer")));
+    }
   }
 
   @Test

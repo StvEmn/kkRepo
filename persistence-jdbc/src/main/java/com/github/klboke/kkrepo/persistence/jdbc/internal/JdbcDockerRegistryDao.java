@@ -4,6 +4,10 @@ import static com.github.klboke.kkrepo.persistence.jdbc.internal.support.JdbcRow
 import static com.github.klboke.kkrepo.persistence.jdbc.internal.support.JdbcRows.nullableLong;
 import static com.github.klboke.kkrepo.persistence.jdbc.internal.support.JdbcRows.nullableTimestamp;
 
+import com.github.klboke.kkrepo.core.RepositoryFormat;
+import com.github.klboke.kkrepo.persistence.jdbc.api.AssetPathFilter;
+import com.github.klboke.kkrepo.persistence.jdbc.api.ComponentDao.ComponentSearchCursor;
+import com.github.klboke.kkrepo.persistence.jdbc.api.ComponentDao.ComponentSearchRow;
 import com.github.klboke.kkrepo.persistence.jdbc.api.DockerRegistryDao.BrowseImageRow;
 import com.github.klboke.kkrepo.persistence.jdbc.api.DockerRegistryDao.BrowseReferenceRow;
 import com.github.klboke.kkrepo.persistence.jdbc.api.DockerRegistryDao.CleanupManifestCandidate;
@@ -620,6 +624,57 @@ public class JdbcDockerRegistryDao implements com.github.klboke.kkrepo.persisten
         .orElseGet(OptionalLong::empty);
   }
 
+  @Override
+  @Transactional(propagation = Propagation.MANDATORY)
+  public boolean lockEmptyRepositoryForMigrationCleanup(long repositoryId) {
+    // Avoid taking an exclusive repository lock on the common populated-registry path.
+    if (!jdbcTemplate.queryForList(
+        "SELECT id FROM docker_manifest WHERE repository_id = ? LIMIT 1",
+        Long.class, repositoryId).isEmpty()) return false;
+    // The parent row lock conflicts with the FK locks taken by manifest inserts, including on
+    // other replicas. Skip a busy repository rather than interfering with an upload/migration.
+    if (jdbcTemplate.queryForList("""
+        SELECT id FROM repository WHERE id = ? AND format = 'docker'
+        FOR UPDATE SKIP LOCKED
+        """, Long.class, repositoryId).isEmpty()) return false;
+    // Locking reads also see current committed state under MySQL's REPEATABLE READ.
+    if (!jdbcTemplate.queryForList("""
+        SELECT id FROM docker_manifest WHERE repository_id = ? LIMIT 1 FOR UPDATE
+        """, Long.class, repositoryId).isEmpty()) return false;
+    return jdbcTemplate.queryForList("""
+        SELECT id FROM repository_data_migration_repository
+        WHERE target_repository_id = ? AND status <> 'finished'
+        LIMIT 1 FOR UPDATE
+        """, Long.class, repositoryId).isEmpty();
+  }
+
+  @Override
+  @Transactional(propagation = Propagation.MANDATORY)
+  public List<Long> lockMigratedManifestAssetsForCleanup(long repositoryId, int limit) {
+    return jdbcTemplate.queryForList("""
+        SELECT a.id FROM asset a
+        WHERE a.repository_id = ? AND a.format = 'docker' AND a.kind = 'MANIFEST'
+          AND %s = 'nexus-repository-data-migration'
+          AND %s IS NOT NULL
+        ORDER BY a.id LIMIT ? FOR UPDATE SKIP LOCKED
+        """.formatted(jsonColumns.extractText("a.attributes_json", "source"),
+            jsonColumns.extractText("a.attributes_json", "docker", "imageName")),
+        Long.class, repositoryId, Math.max(1, limit));
+  }
+
+  @Override
+  @Transactional(propagation = Propagation.MANDATORY)
+  public List<Long> lockEmptyMigratedComponentsForCleanup(long repositoryId, int limit) {
+    return jdbcTemplate.queryForList("""
+        SELECT c.id FROM component c
+        WHERE c.repository_id = ? AND c.format = 'docker'
+          AND %s = 'nexus-repository-data-migration'
+          AND NOT EXISTS (SELECT 1 FROM asset a WHERE a.component_id = c.id)
+        ORDER BY c.id LIMIT ? FOR UPDATE SKIP LOCKED
+        """.formatted(jsonColumns.extractText("c.attributes_json", "source")),
+        Long.class, repositoryId, Math.max(1, limit));
+  }
+
   public List<CleanupPolicyRecord> listCleanupPolicies(long repositoryId) {
     return jdbcTemplate.query("""
         SELECT p.id, p.name, p.criteria_json
@@ -727,7 +782,7 @@ public class JdbcDockerRegistryDao implements com.github.klboke.kkrepo.persisten
     args.add(repositoryId);
     String after = "";
     if (last != null && !last.isBlank()) {
-      after = " AND image_name > ?";
+      after = " AND image_name > ?\n";
       args.add(last);
     }
     args.add(Math.max(1, limit));
@@ -740,6 +795,48 @@ public class JdbcDockerRegistryDao implements com.github.klboke.kkrepo.persisten
         ORDER BY image_name
         LIMIT ?
         """, String.class, args.toArray());
+  }
+
+  @Override
+  public List<ComponentSearchRow> searchTagsByRepositoryIds(
+      List<Long> repositoryIds, String keyword,
+      ComponentSearchCursor after, int limit, Map<Long, AssetPathFilter> imageFilters) {
+    if (repositoryIds == null || repositoryIds.isEmpty()) return List.of();
+    List<Object> args = new ArrayList<>(repositoryIds);
+    String placeholders = String.join(",", java.util.Collections.nCopies(repositoryIds.size(), "?"));
+    StringBuilder sql = new StringBuilder("""
+        SELECT t.id, t.repository_id, r.name AS repository_name, t.image_name, t.tag, t.updated_at
+        FROM docker_tag t
+        JOIN docker_manifest m ON m.id = t.manifest_id AND m.repository_id = t.repository_id
+        JOIN repository r ON r.id = t.repository_id
+        WHERE m.deleted_at IS NULL AND t.repository_id IN (
+        """).append(placeholders).append(")");
+    if (!imageFilters.isEmpty()) {
+      sql.append(" AND ").append(SelectorCandidateSql.repositories("t", "image_name", imageFilters, args));
+    }
+    if (keyword != null && !keyword.isBlank()) {
+      String pattern = "%" + keyword.trim().toLowerCase(Locale.ROOT)
+          .replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%";
+      sql.append(" AND (LOWER(t.image_name) LIKE ? ESCAPE '!' OR LOWER(t.tag) LIKE ? ESCAPE '!'"
+          + " OR LOWER(m.digest) LIKE ? ESCAPE '!')");
+      args.add(pattern);
+      args.add(pattern);
+      args.add(pattern);
+    }
+    if (after != null) {
+      sql.append(" AND (t.updated_at < ? OR (t.updated_at = ? AND t.id < ?))");
+      args.add(java.sql.Timestamp.from(after.lastUpdatedAt()));
+      args.add(java.sql.Timestamp.from(after.lastUpdatedAt()));
+      args.add(after.id());
+    }
+    sql.append(" ORDER BY t.updated_at DESC, t.id DESC LIMIT ?");
+    args.add(Math.max(1, Math.min(limit, 1000)));
+    return jdbcTemplate.query(sql.toString(), (rs, rowNum) ->
+        new ComponentSearchRow(
+            rs.getLong("id"), rs.getLong("repository_id"), rs.getString("repository_name"),
+            RepositoryFormat.DOCKER, "", rs.getString("image_name"),
+            rs.getString("tag"), "docker-tag", nullableInstant(rs, "updated_at"),
+            "v2/" + rs.getString("image_name") + "/manifests/" + rs.getString("tag")), args.toArray());
   }
 
   public List<BrowseImageRow> listBrowseImages(long repositoryId, String parentPath) {

@@ -1,12 +1,16 @@
 package com.github.klboke.kkrepo.server.repositories;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -20,7 +24,10 @@ import com.github.klboke.kkrepo.persistence.jdbc.api.ConanRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.CondaRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.CleanupPolicyDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.RoutingRuleDao;
+import com.github.klboke.kkrepo.server.routingrules.RoutingRuleService;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RRegistryDao;
+import java.time.Instant;
 import com.github.klboke.kkrepo.persistence.jdbc.api.SecurityDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.BlobStoreRecord;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.RepositoryRecord;
@@ -39,6 +46,8 @@ import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.HostedSet
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.GroupSettings;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.ProxySettings;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.PypiSettings;
+import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.YumSettings;
+import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryIndexRebuildDao;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.UpdateCommand;
 import com.github.klboke.kkrepo.server.support.InMemoryVersionWatermark;
 import com.github.klboke.kkrepo.server.support.dao.BlobStoreDaoAdapter;
@@ -53,6 +62,183 @@ import java.util.Set;
 import org.junit.jupiter.api.Test;
 
 class RepositoryServiceTest {
+  @Test
+  void streamingSettingDefaultsOffAndSurvivesUpdatesAndReplicaReload() throws Exception {
+    var repositories = new StubRepositoryDao(repository(1L));
+    var service = service(repositories);
+    var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+    var settings = mapper.readValue("""
+        {"remoteUrl":"https://registry.npmjs.org", "streamingEnabled":true}
+        """, ProxySettings.class);
+    var created = service.create(new CreateCommand("streaming", "npm-proxy", true,
+        "default", true, null, settings, null, null, null, null));
+    assertTrue(created.proxy().streamingEnabled());
+    var registry = new RepositoryRuntimeRegistry(repositories, 0);
+    assertTrue(registry.resolve("streaming").orElseThrow().streamingEnabled());
+    var kept = service.update("streaming", new UpdateCommand(true, null, null, null,
+        new ProxySettings(null, null, null, null), null, null, null, null));
+    assertTrue(kept.proxy().streamingEnabled());
+    var disabled = service.update("streaming", new UpdateCommand(true, null, null, null,
+        mapper.readValue("{\"streamingEnabled\":false}", ProxySettings.class), null, null, null, null));
+    assertFalse(disabled.proxy().streamingEnabled());
+    assertFalse(new RepositoryRuntimeRegistry(repositories, 0).resolve("streaming").orElseThrow().streamingEnabled());
+    var legacy = service.create(new CreateCommand("legacy-streaming", "raw-proxy", true,
+        "default", true, null, new ProxySettings("https://example.org", null, null, null),
+        null, null, null, null));
+    assertFalse(legacy.proxy().streamingEnabled());
+  }
+
+  @Test
+  void partialUpdatesPreserveTheBindingFromTheLockedRepositoryVersion() {
+    for (boolean concurrentAssignment : List.of(true, false)) {
+      RepositoryRecord base = mavenProxyWithOutboundProxy("old-pass");
+      RepositoryRecord observed = withRoutingRule(base, concurrentAssignment ? null : 19L);
+      RepositoryRecord committed = withRoutingRule(base, concurrentAssignment ? 19L : null);
+      StubRepositoryDao repositories = spy(new StubRepositoryDao(observed));
+      doReturn(Optional.of(committed)).when(repositories).lockByName(base.name());
+      RepositoryService service = service(repositories);
+      service.setRoutingRules(new RoutingRuleService(
+          mock(RoutingRuleDao.class)));
+      service.update(base.name(), new UpdateCommand(false, null, null, null, null, null, null, null, null));
+      assertEquals(committed.routingRuleId(), repositories.updated.routingRuleId());
+      assertFalse(repositories.updated.online());
+    }
+  }
+
+  private static RepositoryRecord withRoutingRule(RepositoryRecord row, Long ruleId) {
+    return new RepositoryRecord(row.id(), row.name(), row.format(), row.type(), row.recipeName(),
+        row.online(), row.blobStoreId(), ruleId, row.proxyRemoteUrl(), row.versionPolicy(),
+        row.layoutPolicy(), row.writePolicy(), row.strictContentTypeValidation(), row.attributes());
+  }
+
+  @Test
+  void explicitRoutingAssignmentsLockTheRuleBeforeTheRepository() {
+    RepositoryRecord base = mavenProxyWithOutboundProxy("old-pass");
+    StubRepositoryDao repositories = spy(new StubRepositoryDao(base));
+    var rules = mock(RoutingRuleDao.class);
+    var rule = new RoutingRuleDao.Rule(
+        19, "private", "", "BLOCK", List.of("/private/.*"));
+    when(rules.lockByName("private")).thenReturn(Optional.of(rule));
+    RepositoryService service = service(repositories);
+    service.setRoutingRules(new RoutingRuleService(rules));
+    service.update(base.name(), new UpdateCommand(null, null, null, null, null, null, null,
+        null, null, null, null, null, null, null, "private"));
+    var locks = inOrder(rules, repositories);
+    locks.verify(rules).lockByName("private");
+    locks.verify(repositories).lockByName(base.name());
+    assertEquals(19L, repositories.updated.routingRuleId());
+  }
+
+
+  @Test
+  void standaloneStarRoundTripsAcrossReplicasAndPartialUpdatesAndCanBeRemoved() throws Exception {
+    var repositories = new StubRepositoryDao(repository(1L));
+    var service = service(repositories);
+    var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+    var settings = mapper.readValue("""
+        {"remoteUrl":"https://registry.npmjs.org","allowedRedirectHosts":["*","cdn.example.org","*.example.net"]}
+        """, ProxySettings.class);
+    var created = service.create(new CreateCommand("public-https", "npm-proxy", true,
+        "default", true, null, settings, null, null, null, null));
+    assertEquals(List.of("*", "cdn.example.org", "*.example.net"), created.proxy().allowedRedirectHosts());
+    assertFalse(mapper.writeValueAsString(created.proxy()).contains("redirectPolicy"));
+    var runtime = new RepositoryRuntimeRegistry(repositories, 0).resolve("public-https").orElseThrow();
+    assertEquals(com.github.klboke.kkrepo.server.security.ProxyRedirectPolicy.PUBLIC_HTTPS, runtime.contentRedirectPolicy());
+    var runtimeMapper = new com.fasterxml.jackson.databind.ObjectMapper()
+        .configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+    String snapshot = runtimeMapper.writeValueAsString(runtime);
+    assertFalse(snapshot.contains("redirectPolicy"));
+    assertEquals(runtime.contentRedirectPolicy(), runtimeMapper.readValue(snapshot,
+        com.github.klboke.kkrepo.server.maven.RepositoryRuntime.class).contentRedirectPolicy());
+    var anotherReplica = new RepositoryRuntimeRegistry(repositories, 0);
+    assertEquals(runtime.contentRedirectPolicy(), anotherReplica.resolve("public-https").orElseThrow().contentRedirectPolicy());
+    var preserved = service.update("public-https", new UpdateCommand(true, null, null, null,
+        new ProxySettings(null, null, null, null), null, null, null, null));
+    assertEquals(created.proxy().allowedRedirectHosts(), preserved.proxy().allowedRedirectHosts());
+    var disabled = service.update("public-https", new UpdateCommand(true, null, null, null,
+        mapper.readValue("{\"allowedRedirectHosts\":[\"cdn.example.org\"]}", ProxySettings.class), null, null, null, null));
+    assertEquals(List.of("cdn.example.org"), disabled.proxy().allowedRedirectHosts());
+    assertEquals(com.github.klboke.kkrepo.server.security.ProxyRedirectPolicy.ALLOWLIST,
+        anotherReplica.resolve("public-https").orElseThrow().contentRedirectPolicy());
+  }
+
+  @Test
+  void standaloneStarRejectsHttpAndDnsResolvingProxies() throws Exception {
+    var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+    for (String settings : List.of(
+        "{\"remoteUrl\":\"http://127.0.0.1\",\"allowedRedirectHosts\":[\"*\"]}",
+        "{\"remoteUrl\":\"https://registry.npmjs.org\",\"allowedRedirectHosts\":[\"*\"],"
+            + "\"outboundProxyType\":\"HTTP\",\"outboundProxyHost\":\"proxy.example\",\"outboundProxyPort\":3128}")) {
+      var service = service(new StubRepositoryDao(repository(1L)));
+      var proxy = mapper.readValue(settings, ProxySettings.class);
+      assertThrows(RepositoryValidationException.class, () -> service.create(new CreateCommand(
+          "invalid", "npm-proxy", true, "default", true, null, proxy, null, null, null, null)));
+    }
+  }
+
+  @Test
+  void nugetNtlmSettingsRoundTripPreservePasswordAndReachRuntime() throws Exception {
+    StubRepositoryDao repositories = new StubRepositoryDao(repository(1L));
+    ProxiedHttpClientFactory factory = mock(ProxiedHttpClientFactory.class);
+    RepositoryService service = service(repositories, factory);
+    var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+    ProxySettings settings = mapper.readValue("""
+        {"remoteUrl":"https://api.nuget.org/v3/index.json", "remoteAuthenticationType":"ntlm",
+         "remoteUsername":"User", "remotePassword":"Password", "remoteNtlmDomain":"Domain",
+         "remoteNtlmHost":"KKREPO"}
+        """, ProxySettings.class);
+    RepositoryView created = service.create(new CreateCommand("ntlm-feed", "nuget-proxy", true,
+        "default", false, null, settings, null, null, null, null));
+    assertEquals("ntlm", created.proxy().remoteAuthenticationType());
+    assertEquals("Domain", created.proxy().remoteNtlmDomain());
+    assertEquals("KKREPO", created.proxy().remoteNtlmHost());
+    assertNull(created.proxy().remotePassword());
+    assertEquals(true, created.proxy().remotePasswordConfigured());
+    var runtime = new RepositoryRuntimeRegistry(repositories, 0).resolve("ntlm-feed").orElseThrow();
+    assertEquals("Password", runtime.ntlmCredentials().password());
+    var request = com.github.klboke.kkrepo.server.maven.HttpRemoteFetcher.Request
+        .get("https://api.nuget.org/v3-flatcontainer/test/index.json").withRepository(runtime);
+    assertEquals(runtime.ntlmCredentials(), request.ntlmCredentials());
+    assertNull(request.authorizationHeader(), "NTLM must not preemptively transmit a Basic password");
+    assertEquals(runtime.ntlmCredentials(), request.withAccept("application/json")
+        .withConditional("etag", null).withTimeoutProfile(
+            com.github.klboke.kkrepo.server.maven.HttpRemoteFetcher.TimeoutProfile.METADATA).ntlmCredentials());
+    assertNull(com.github.klboke.kkrepo.server.maven.HttpRemoteFetcher.Request
+        .get("https://other.example/index.json").withRepository(runtime).ntlmCredentials());
+    assertNull(com.github.klboke.kkrepo.server.maven.HttpRemoteFetcher.Request
+        .get(runtime.proxyRemoteUrl()).withRepository(runtime, false).ntlmCredentials());
+    RepositoryView updated = service.update("ntlm-feed", new UpdateCommand(true, null, null,
+        null, new ProxySettings(null, null, null, null), null, null, null, null));
+    assertEquals("ntlm", updated.proxy().remoteAuthenticationType());
+    assertEquals("Domain", updated.proxy().remoteNtlmDomain());
+    assertEquals(true, updated.proxy().remotePasswordConfigured());
+    ProxySettings clear = mapper.readValue("""
+        {"remoteAuthenticationType":"auto", "remoteNtlmDomain":"", "remoteNtlmHost":"",
+         "remotePasswordConfigured":false}
+        """, ProxySettings.class);
+    RepositoryView cleared = service.update("ntlm-feed", new UpdateCommand(true, null, null,
+        null, clear, null, null, null, null));
+    assertEquals("auto", cleared.proxy().remoteAuthenticationType());
+    assertNull(cleared.proxy().remoteNtlmDomain());
+    assertEquals(false, cleared.proxy().remotePasswordConfigured());
+    verify(factory).invalidateNtlm("ntlm-feed");
+  }
+
+  @Test
+  void rejectsUnsupportedOrIncompleteNtlmAuthentication() throws Exception {
+    var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+    for (String extra : List.of(
+        "\"remoteAuthenticationType\":\"kerberos\"",
+        "\"remoteAuthenticationType\":\"ntlm\"",
+        "\"remoteAuthenticationType\":\"ntlm\",\"remoteUsername\":\"User\"",
+        "\"remoteAuthenticationType\":\"ntlm\",\"remoteUsername\":\"User\",\"remotePassword\":\"secret\",\"remoteBearerToken\":\"token\"")) {
+      ProxySettings settings = mapper.readValue("{\"remoteUrl\":\"https://api.nuget.org/v3/index.json\"," + extra + "}",
+          ProxySettings.class);
+      RepositoryService service = service(new StubRepositoryDao(repository(1L)));
+      assertThrows(RepositoryValidationException.class, () -> service.create(new CreateCommand(
+          "ntlm-feed", "nuget-proxy", true, "default", false, null, settings, null, null, null, null)));
+    }
+  }
 
   @Test
   void helmGroupAcceptsOrderedHostedAndNestedGroupMembers() {
@@ -91,6 +277,105 @@ class RepositoryServiceTest {
 
     verify(helmGroupIndexCache).invalidateMemberAfterCommit(61L);
     verify(helmGroupIndexCache, org.mockito.Mockito.times(2)).invalidateGroupAfterCommit(62L);
+  }
+
+  @Test
+  void conanManifestOverridesPersistRoundTripPreserveAndResetWithoutRestart() throws Exception {
+    StubRepositoryDao repositories = new StubRepositoryDao(repository(1L));
+    RepositoryService service = service(repositories);
+    var json = new com.fasterxml.jackson.databind.ObjectMapper();
+    RepositoryView created = service.create(json.readValue("""
+        {"name":"conan-sdk","recipe":"conan-hosted","blobStoreName":"default",
+         "hosted":{"writePolicy":"ALLOW"},
+         "conan":{"manifestMaxEntries":7922,"manifestMaxBytes":16777216}}
+        """, CreateCommand.class));
+    assertEquals(7922, created.conan().manifestMaxEntries());
+    assertEquals(16777216, created.conan().manifestMaxBytes());
+    assertEquals(created.conan(), service.update("conan-sdk",
+        json.readValue("{\"online\":false}", UpdateCommand.class)).conan());
+    RepositoryView inheritedBytes = service.update("conan-sdk", json.readValue("""
+        {"conan":{"manifestMaxEntries":9000,"manifestMaxBytes":null}}
+        """, UpdateCommand.class));
+    assertEquals(9000, inheritedBytes.conan().manifestMaxEntries());
+    assertNull(inheritedBytes.conan().manifestMaxBytes());
+    RepositoryView cleared = service.update("conan-sdk",
+        json.readValue("{\"conan\":{}}", UpdateCommand.class));
+    assertNull(cleared.conan().manifestMaxEntries());
+    assertNull(cleared.conan().manifestMaxBytes());
+    // Another service sees the persisted reset, rather than a process-local settings map.
+    assertEquals(cleared.conan(), service(repositories).get("conan-sdk").conan());
+    for (String invalid : List.of(
+        "{\"conan\":{\"manifestMaxEntries\":0}}",
+        "{\"conan\":{\"manifestMaxEntries\":-1}}",
+        "{\"conan\":{\"manifestMaxBytes\":0}}",
+        "{\"conan\":{\"manifestMaxBytes\":2147483647}}")) {
+      UpdateCommand command = json.readValue(invalid, UpdateCommand.class);
+      assertThrows(RepositoryValidationException.class, () -> service.update("conan-sdk", command));
+    }
+    assertThrows(RepositoryValidationException.class, () -> service.create(json.readValue("""
+        {"name":"conan-all","recipe":"conan-group","blobStoreName":"default",
+         "conan":{"manifestMaxEntries":9000}}
+        """, CreateCommand.class)));
+  }
+
+  @Test
+  void yumDepthChangesEnqueueRebuildButOrdinarySavesDoNot() {
+    StubRepositoryDao repositories = new StubRepositoryDao(repository(1L));
+    RepositoryService service = service(repositories);
+    RepositoryIndexRebuildDao queue = mock(RepositoryIndexRebuildDao.class);
+    service.setIndexRebuildDao(queue);
+    RepositoryView defaulted = service.create(new CreateCommand(
+        "yum-default", "yum-hosted", true, "default", true,
+        new HostedSettings("ALLOW", null, null), null, null, null, null, null));
+    assertEquals(0, defaulted.yum().repodataDepth());
+    RepositoryView nested = service.create(new CreateCommand(
+        "yum-nested", "yum-hosted", true, "default", true,
+        new HostedSettings("ALLOW", null, null), null, null, null, null, null, null, null, null,
+        new YumSettings(1)));
+    assertEquals(1, nested.yum().repodataDepth());
+    service.update("yum-default", new UpdateCommand(
+        false, null, null, new HostedSettings("ALLOW_ONCE", null, null), null, null, null, null, null));
+    org.mockito.Mockito.verifyNoInteractions(queue);
+    RepositoryView updated = service.update("yum-nested", new UpdateCommand(
+        null, null, null, null, null, null, null, null, null, null, null, null, new YumSettings(2)));
+    assertEquals(2, updated.yum().repodataDepth());
+    RepositoryView preserved = service.update("yum-nested", new UpdateCommand(
+        null, null, null, null, null, null, null, null, null));
+    assertEquals(2, preserved.yum().repodataDepth());
+    service.update("yum-nested", new UpdateCommand(
+        false, null, null, new HostedSettings("ALLOW_ONCE", null, null), null, null, null, null,
+        null, null, null, null, new YumSettings(2)));
+    assertThrows(RepositoryValidationException.class, () -> service.update("yum-nested", new UpdateCommand(
+        null, null, null, null, null, null, null, null, null, null, null, null, new YumSettings(-1))));
+    verify(queue).enqueue(nested.id(), RepositoryIndexRebuildDao.YUM_METADATA);
+    org.mockito.Mockito.verifyNoMoreInteractions(queue);
+  }
+
+  @Test
+  void legacyYumSettingsAreInitializedAndRebuiltOnlyOnFirstSave() {
+    for (Map<String, Object> attributes : List.<Map<String, Object>>of(
+        Map.of(), Map.of("sourceRepository", Map.of("yum", Map.of("repodataDepth", 1))))) {
+      var legacy = new RepositoryRecord(71L, "yum-legacy", RepositoryFormat.YUM,
+          RepositoryType.HOSTED, "yum-hosted", true, 1L, null, null, null, null, "ALLOW", true,
+          attributes);
+      var repositories = new StubRepositoryDao(legacy);
+      RepositoryService service = service(repositories);
+      RepositoryIndexRebuildDao queue = mock(RepositoryIndexRebuildDao.class);
+      service.setIndexRebuildDao(queue);
+      var unchanged = new UpdateCommand(null, null, null, null, null, null, null, null, null);
+
+      int expectedDepth = attributes.isEmpty() ? 0 : 1;
+      assertEquals(expectedDepth, service.update("yum-legacy", unchanged).yum().repodataDepth());
+      assertEquals(Map.of("repodataDepth", expectedDepth),
+          repositories.findByName("yum-legacy").orElseThrow().attributes().get("yum"));
+      // A second service represents another replica reading the persisted initialization.
+      RepositoryService sibling = service(repositories);
+      sibling.setIndexRebuildDao(queue);
+      assertEquals(expectedDepth, sibling.update("yum-legacy", unchanged).yum().repodataDepth());
+      service.update("yum-legacy", unchanged);
+      verify(queue).enqueue(legacy.id(), RepositoryIndexRebuildDao.YUM_METADATA);
+      org.mockito.Mockito.verifyNoMoreInteractions(queue);
+    }
   }
 
   @Test
@@ -170,14 +455,23 @@ class RepositoryServiceTest {
         org.mockito.ArgumentMatchers.anyString(),
         org.mockito.ArgumentMatchers.any());
 
+    List<String> namespaces = List.of("src/contrib", "bin/windows/contrib/4.5",
+        "bin/macosx/big-sur-arm64/contrib/4.5",
+        "bin/linux/noble-x86_64/4.5/src/contrib");
+    when(registry.listSuites(100L)).thenReturn(namespaces.stream()
+        .map(namespace -> new RRegistryDao.SuiteState(
+            100L, namespace, 1L, Instant.EPOCH, 1L, 1, Instant.EPOCH, null, null, Instant.EPOCH))
+        .toList());
     RepositoryView updated = service.replaceMembers(
         "cran-root", List.of("cran-second", "cran-first"));
     assertEquals(List.of("cran-second", "cran-first"), updated.group().memberNames());
     assertEquals(List.of(72L, 71L), repositories.membersByGroupId.get(100L));
-    verify(registry).markSuiteDirty(
-        org.mockito.ArgumentMatchers.eq(100L),
-        org.mockito.ArgumentMatchers.eq("src/contrib"),
-        org.mockito.ArgumentMatchers.any());
+    for (String namespace : namespaces) {
+      verify(registry).markSuiteDirty(
+          org.mockito.ArgumentMatchers.eq(100L),
+          org.mockito.ArgumentMatchers.eq(namespace),
+          org.mockito.ArgumentMatchers.any());
+    }
   }
 
   @Test
@@ -189,11 +483,24 @@ class RepositoryServiceTest {
     repositories.replaceMembers(82L, List.of(81L));
     repositories.replaceMembers(83L, List.of(82L));
     RRegistryDao registry = mock(RRegistryDao.class);
+    String binaryNamespace = "bin/windows/contrib/4.5";
+    for (long repositoryId : List.of(81L, 82L, 83L)) {
+      when(registry.listSuites(repositoryId)).thenReturn(List.of(new RRegistryDao.SuiteState(
+          repositoryId, binaryNamespace, 1L, Instant.EPOCH, 1L, 1,
+          Instant.EPOCH, null, null, Instant.EPOCH)));
+    }
     RepositoryService service = service(repositories);
     service.setRRegistry(registry);
 
     service.update("cran-hosted",
         new UpdateCommand(false, null, null, null, null, null, null, null, null));
+
+    for (long repositoryId : List.of(81L, 82L, 83L)) {
+      verify(registry, org.mockito.Mockito.atLeastOnce()).markSuiteDirty(
+          org.mockito.ArgumentMatchers.eq(repositoryId),
+          org.mockito.ArgumentMatchers.eq(binaryNamespace),
+          org.mockito.ArgumentMatchers.any());
+    }
 
     verify(registry, org.mockito.Mockito.atLeastOnce()).markSuiteDirty(
         org.mockito.ArgumentMatchers.eq(81L),
@@ -844,6 +1151,7 @@ class RepositoryServiceTest {
             List.of(
                 " Plugins-Artifacts.Gradle.org. ",
                 "cdn.example.org",
+                " *.Quay.IO. ",
                 "plugins-artifacts.gradle.org")),
         null,
         null,
@@ -851,12 +1159,12 @@ class RepositoryServiceTest {
         null));
 
     assertEquals(
-        List.of("plugins-artifacts.gradle.org", "cdn.example.org"),
+        List.of("plugins-artifacts.gradle.org", "cdn.example.org", "*.quay.io"),
         created.proxy().allowedRedirectHosts());
     Map<?, ?> storedProxy = (Map<?, ?>) repositories.repository.attributes().get("proxy");
     assertEquals(created.proxy().allowedRedirectHosts(), storedProxy.get("allowedRedirectHosts"));
     assertEquals(
-        Set.of("plugins-artifacts.gradle.org", "cdn.example.org"),
+        Set.of("plugins-artifacts.gradle.org", "cdn.example.org", "*.quay.io"),
         new RepositoryRuntimeRegistry(repositories, 0)
             .resolve("gradle-plugins")
             .orElseThrow()
@@ -894,14 +1202,14 @@ class RepositoryServiceTest {
   }
 
   @Test
-  void proxyRedirectHostsRejectUrlsPortsPathsAndWildcards() {
+  void proxyRedirectHostsRejectUrlsPortsPathsAndUnboundedWildcards() {
     RepositoryService service = service(new StubRepositoryDao(repository(1L)));
 
     for (String invalid : List.of(
         "https://plugins-artifacts.gradle.org",
         "plugins-artifacts.gradle.org:443",
         "plugins-artifacts.gradle.org/files",
-        "*.gradle.org")) {
+        "cdn*.quay.io", "*.*.quay.io", "*.io", "*.127.0.0.1")) {
       RepositoryValidationException error = assertThrows(
           RepositoryValidationException.class,
           () -> service.create(new CreateCommand(
@@ -917,7 +1225,7 @@ class RepositoryServiceTest {
               null,
               null)));
       assertEquals(
-          "proxy.allowedRedirectHosts entries must be exact host names without a scheme, port, path, or wildcard",
+          "proxy.allowedRedirectHosts entries must be standalone *, exact host names or *.example.com patterns without a scheme, port, or path",
           error.getMessage());
     }
   }
@@ -944,7 +1252,7 @@ class RepositoryServiceTest {
               null,
               null)));
       assertEquals(
-          "proxy.allowedRedirectHosts entries must be exact host names without a scheme, port, path, or wildcard",
+          "proxy.allowedRedirectHosts entries must be standalone *, exact host names or *.example.com patterns without a scheme, port, or path",
           error.getMessage());
     }
 
@@ -984,11 +1292,11 @@ class RepositoryServiceTest {
     RepositoryValidationException wrongFormat = assertThrows(
         RepositoryValidationException.class,
         () -> service.create(new CreateCommand(
-            "maven-proxy", "maven2-proxy", true, "default", true, null,
-            new ProxySettings("https://repo.maven.apache.org/maven2/", 1440, 1440, true, 60),
+            "nuget-feed", "nuget-proxy", true, "default", true, null,
+            new ProxySettings("https://api.nuget.org/v3/index.json", 1440, 1440, true, 60),
             null, null, null, null)));
     assertEquals(
-        "proxy.minimumReleaseAgeMinutes is only supported for npm proxy repositories",
+        "proxy.minimumReleaseAgeMinutes is only supported for npm, Go, Maven and PyPI proxy repositories",
         wrongFormat.getMessage());
   }
 

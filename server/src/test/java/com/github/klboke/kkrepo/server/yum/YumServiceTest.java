@@ -1,7 +1,14 @@
 package com.github.klboke.kkrepo.server.yum;
 
+import static com.github.klboke.kkrepo.server.yum.YumTestFixtures.rpmFixture;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.eq;
@@ -28,15 +35,11 @@ import com.github.klboke.kkrepo.server.raw.RawProxyService;
 import com.github.klboke.kkrepo.server.support.dao.AssetDaoAdapter;
 import com.github.klboke.kkrepo.server.support.dao.RepositoryIndexRebuildDaoAdapter;
 import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -105,7 +108,7 @@ class YumServiceTest {
     assertEquals(200, response.status());
     verify(hosted).putWithAttributes(eq(runtime), eq(path), any(InputStream.class),
         eq("application/x-rpm"), anyMap(), eq("tester"), eq("127.0.0.1"));
-    assertEquals(List.of("1:" + RepositoryIndexRebuildDao.YUM_METADATA + ":"),
+    assertEquals(List.of("1:" + RepositoryIndexRebuildDao.YUM_METADATA + ":d0:"),
         indexRebuildDao.enqueues);
   }
 
@@ -264,6 +267,194 @@ class YumServiceTest {
     assertTrue(primary.contains("<rpm:header-range start=\"0\" end=\"0\"/>"));
   }
 
+  @Test
+  void scopedRebuildReadsOnlyAffectedDirectoryAndRetainsAnEmptyIndexAfterLastDeletion() throws Exception {
+    RawHostedService writer = mock(RawHostedService.class);
+    Map<String, byte[]> written = new LinkedHashMap<>();
+    doAnswer(call -> {
+      written.put(call.getArgument(1), ((InputStream) call.getArgument(2)).readAllBytes());
+      return MavenResponse.created();
+    }).when(writer).putGenerated(any(), any(), any(), any(), any(), any());
+    var dao = org.mockito.Mockito.spy(new FakeAssetDao(new ArrayList<>(List.of(
+        asset(11, 101, "fedora-44/untouched-1.0-1.noarch.rpm"),
+        asset(11, 102, "fedora-45/Packages/demo-1.0-1.noarch.rpm"),
+        asset(11, 103, "fedora-45/repodata/old-primary.xml.gz")))));
+    // Reproduce the broader candidate set returned by a case/accent-insensitive MySQL LIKE.
+    org.mockito.Mockito.doAnswer(call -> {
+      var records = new ArrayList<>(dao.assets);
+      records.add(asset(11, 104, "Fedora-45/other-1.0-1.noarch.rpm"));
+      records.add(asset(11, 105, "fédora-45/accent-1.0-1.noarch.rpm"));
+      return records;
+    }).when(dao).listAssetsByPrefix(11, "fedora-45/");
+    YumService service = new YumService(writer, null, null, dao, null, null);
+    service.rebuildMetadata(hosted(11, 1), "d1:6665646f72612d34352f", "tester", null);
+    verify(dao).listAssetsByPrefix(11, "fedora-45/");
+    verify(dao, org.mockito.Mockito.never()).listAssetsByPrefix(11, "");
+    verify(dao).findBlobsByIds(List.of(102L));
+    assertTrue(written.keySet().stream().allMatch(path -> path.startsWith("fedora-45/repodata/")));
+    String repomd = new String(written.get("fedora-45/repodata/repomd.xml"), StandardCharsets.UTF_8);
+    String primaryPath = "fedora-45/" + metadataHref(repomd, "primary");
+    try (var input = new GZIPInputStream(new ByteArrayInputStream(written.get(primaryPath)))) {
+      String xml = new String(input.readAllBytes(), StandardCharsets.UTF_8);
+      assertTrue(xml.contains("packages=\"1\""));
+      assertTrue(xml.contains("href=\"Packages/demo-1.0-1.noarch.rpm\""));
+    }
+    dao.assets.removeIf(asset -> asset.path().endsWith("demo-1.0-1.noarch.rpm"));
+    written.clear();
+    service.rebuildMetadata(hosted(11, 1), "d1:6665646f72612d34352f", "tester", null);
+    assertTrue(written.keySet().stream().allMatch(path -> path.startsWith("fedora-45/repodata/")));
+    for (var entry : written.entrySet()) {
+      if (!entry.getKey().endsWith(".gz")) continue;
+      try (var input = new GZIPInputStream(new ByteArrayInputStream(entry.getValue()))) {
+        assertTrue(new String(input.readAllBytes(), StandardCharsets.UTF_8).contains("packages=\"0\""));
+      }
+    }
+  }
+
+  @Test
+  void staleScopedMutationRepairsMetadataUsingTheCurrentDepth() {
+    RawHostedService writer = mock(RawHostedService.class);
+    FakeAssetDao dao = org.mockito.Mockito.spy(new FakeAssetDao(List.of(
+        asset(11, 101, "fedora-45/Packages/demo-1.0-1.noarch.rpm"))));
+    YumService service = new YumService(writer, null, null, dao, null, null);
+    service.rebuildMetadata(hosted(11, 1), "d0:", "tester", null);
+    verify(dao).listAssetsByPrefix(11, "");
+    verify(writer).putGenerated(any(), eq("fedora-45/repodata/repomd.xml"), any(), any(), any(), any());
+  }
+
+  @Test
+  void rebuildsIndependentReleaseRootsWithRelativePackageLocationsAndEmptyDeletedRoots() throws Exception {
+    RawHostedService hosted = mock(RawHostedService.class);
+    Map<String, byte[]> written = new LinkedHashMap<>();
+    doAnswer(call -> {
+      written.put(call.getArgument(1), ((InputStream) call.getArgument(2)).readAllBytes());
+      return MavenResponse.created();
+    }).when(hosted).putGenerated(any(), any(), any(), any(), any(), any());
+    FakeAssetDao dao = new FakeAssetDao(List.of(
+        asset(11, 101, "fedora-44/demo-1.0-1.noarch.rpm"),
+        asset(11, 102, "fedora-45/Packages/tool-2.0-1.noarch.rpm"),
+        asset(11, 103, "fedora-43/repodata/repomd.xml")));
+    YumService service = new YumService(hosted, null, null, dao, null, null);
+    service.rebuildMetadata(hosted(11, 1), "tester", "127.0.0.1");
+
+    assertFalse(written.containsKey("repodata/repomd.xml"));
+    for (String release : List.of("fedora-43", "fedora-44", "fedora-45")) {
+      String repomd = new String(written.get(release + "/repodata/repomd.xml"), StandardCharsets.UTF_8);
+      String href = metadataHref(repomd, "primary");
+      String primary = new String(new GZIPInputStream(new ByteArrayInputStream(
+          written.get(release + "/" + href))).readAllBytes(), StandardCharsets.UTF_8);
+      assertFalse(primary.contains("href=\"fedora-"));
+      if (release.equals("fedora-43")) {
+        assertTrue(primary.contains("packages=\"0\""));
+      } else if (release.equals("fedora-44")) {
+        assertTrue(primary.contains("href=\"demo-1.0-1.noarch.rpm\""));
+        assertFalse(primary.contains("<name>tool</name>"));
+      } else {
+        assertTrue(primary.contains("href=\"Packages/tool-2.0-1.noarch.rpm\""));
+        assertFalse(primary.contains("<name>demo</name>"));
+      }
+    }
+    assertEquals(12, written.size());
+  }
+
+  @Test
+  void rebuildsRootAndSecondLevelIndexesWithTheirOwnRelativePaths() throws Exception {
+    for (int depth : List.of(0, 2)) {
+      RawHostedService hosted = mock(RawHostedService.class);
+      Map<String, byte[]> written = new LinkedHashMap<>();
+      doAnswer(call -> {
+        written.put(call.getArgument(1), ((InputStream) call.getArgument(2)).readAllBytes());
+        return MavenResponse.created();
+      }).when(hosted).putGenerated(any(), any(), any(), any(), any(), any());
+      String path = "fedora-45/x86_64/Packages/demo-1.0-1.noarch.rpm";
+      YumService service = new YumService(hosted, null, null,
+          new FakeAssetDao(List.of(asset(11, 101, path))), null, null);
+      service.rebuildMetadata(hosted(11, depth), "tester", null);
+      String root = depth == 0 ? "" : "fedora-45/x86_64/";
+      String repomd = new String(written.get(root + "repodata/repomd.xml"), StandardCharsets.UTF_8);
+      String primary = new String(new GZIPInputStream(new ByteArrayInputStream(
+          written.get(root + metadataHref(repomd, "primary")))).readAllBytes(), StandardCharsets.UTF_8);
+      assertTrue(primary.contains("href=\"" + path.substring(root.length()) + "\""));
+      assertEquals(4, written.size());
+    }
+  }
+
+  @Test
+  void changingDepthRetiresOldRootIndexesInBothDirections() throws Exception {
+    for (int depth : List.of(0, 1)) {
+      String oldRoot = depth == 0 ? "fedora-45/" : "";
+      String newRoot = depth == 0 ? "" : "fedora-45/";
+      RawHostedService hosted = mock(RawHostedService.class);
+      Map<String, byte[]> written = new LinkedHashMap<>();
+      doAnswer(call -> {
+        written.put(call.getArgument(1), ((InputStream) call.getArgument(2)).readAllBytes());
+        return MavenResponse.created();
+      }).when(hosted).putGenerated(any(), any(), any(), any(), any(), any());
+      YumService service = new YumService(hosted, null, null, new FakeAssetDao(List.of(
+          asset(11, 101, "fedora-45/Packages/demo-1.0-1.noarch.rpm"),
+          asset(11, 102, oldRoot + "repodata/repomd.xml"))), null, null);
+      service.rebuildMetadata(hosted(11, depth), "tester", null);
+
+      assertNotNull(written.get(oldRoot + "repodata/repomd.xml"), "Obsolete root must be retired");
+      for (String root : List.of(oldRoot, newRoot)) {
+        String repomd = new String(written.get(root + "repodata/repomd.xml"), StandardCharsets.UTF_8);
+        for (String kind : List.of("primary", "filelists", "other")) {
+          String xml = new String(new GZIPInputStream(new ByteArrayInputStream(
+              written.get(root + metadataHref(repomd, kind)))).readAllBytes(), StandardCharsets.UTF_8);
+          assertTrue(xml.contains("packages=\"" + (root.equals(oldRoot) ? 0 : 1) + "\""));
+          if (root.equals(oldRoot)) assertFalse(xml.contains("<package "));
+        }
+      }
+    }
+  }
+
+  @Test
+  void deletingNestedMetadataEnqueuesRebuildOnlyAfterSuccessfulDeletion() {
+    RawHostedService hosted = mock(RawHostedService.class);
+    RecordingIndexRebuildDao queue = new RecordingIndexRebuildDao();
+    YumService service = new YumService(hosted, null, null, null, null, queue);
+    RepositoryRuntime runtime = hosted(11, 1);
+    String path = "fedora-45/repodata/repomd.xml";
+    when(hosted.delete(runtime, path)).thenReturn(MavenResponse.noBody(204));
+    assertEquals(204, service.delete(runtime, path).status());
+    when(hosted.delete(runtime, path)).thenReturn(MavenResponse.noBody(404));
+    assertEquals(404, service.delete(runtime, path).status());
+    assertEquals(List.of("11:" + RepositoryIndexRebuildDao.YUM_METADATA + ":d1:6665646f72612d34352f"), queue.enqueues);
+  }
+
+  @Test
+  void nestedGroupMetadataOnlyIncludesMembersAndPackagesAtThatRoot() throws Exception {
+    YumService service = new YumService(null, null, null, new FakeAssetDao(List.of(
+        asset(11, 101, "fedora-45/Packages/demo-1.0-1.noarch.rpm"),
+        asset(12, 102, "fedora-44/tool-2.0-1.noarch.rpm"),
+        asset(13, 103, "fedora-45/root-only-1.0-1.noarch.rpm"))), null, null);
+    RepositoryRuntime group = group(hosted(11, 1), hosted(12, 1), hosted(13));
+    String root = "fedora-45/";
+    String repomd = body(service.get(group, root + "repodata/repomd.xml", false));
+    String primary = gunzip(service.get(group, root + metadataHref(repomd, "primary"), false));
+    assertTrue(primary.contains("packages=\"1\""));
+    assertTrue(primary.contains("href=\"Packages/demo-1.0-1.noarch.rpm\""));
+  }
+
+  @Test
+  void refusesRpmAboveConfiguredDepthBeforeWritingBlobs() {
+    RawHostedService hosted = mock(RawHostedService.class);
+    RecordingIndexRebuildDao queue = new RecordingIndexRebuildDao();
+    YumService service = new YumService(hosted, null, null, null, null, queue);
+    assertThrows(com.github.klboke.kkrepo.server.maven.MavenExceptions.BadRequestException.class,
+        () -> service.put(hosted(11, 2), "fedora-45/demo.rpm", new ByteArrayInputStream(rpmFixture()),
+            null, "tester", null));
+    verifyNoInteractions(hosted);
+    assertTrue(queue.enqueues.isEmpty());
+  }
+
+  private static RepositoryRuntime hosted(long id, int depth) {
+    return new RepositoryRuntime(id, "yum-" + id, RepositoryFormat.YUM, RepositoryType.HOSTED,
+        "yum-hosted", true, 1L, "ALLOW", null, null, true, null, 1440, 1440, true,
+        null, null, null, null, null, null, null, null, List.of(), null, null,
+        java.util.Set.of(), null, depth);
+  }
+
   private static String body(MavenResponse response) throws Exception {
     try (InputStream body = response.body()) {
       return new String(body.readAllBytes(), StandardCharsets.UTF_8);
@@ -367,141 +558,6 @@ class YumServiceTest {
         Instant.parse("2026-06-09T00:00:00Z"));
   }
 
-  private static byte[] rpmFixture() {
-    try {
-      ByteArrayOutputStream rpm = new ByteArrayOutputStream();
-      putInt(rpm, 0xedabeedb);
-      rpm.write(new byte[92]);
-      rpm.write(header(List.of()));
-      while (rpm.size() % 8 != 0) {
-        rpm.write(0);
-      }
-      rpm.write(header(List.of(
-          Entry.string(1000, "demo"),
-          Entry.string(1001, "1.2.3"),
-          Entry.string(1002, "4"),
-          Entry.int32(1003, 7),
-          Entry.i18n(1004, "Demo package"),
-          Entry.i18n(1005, "Demo package description"),
-          Entry.int32(1006, 1710000000),
-          Entry.string(1007, "builder"),
-          Entry.int32(1009, 4096),
-          Entry.string(1011, "Example"),
-          Entry.string(1014, "MIT"),
-          Entry.string(1015, "packager"),
-          Entry.i18n(1016, "Development/Tools"),
-          Entry.string(1020, "https://example.invalid/demo"),
-          Entry.string(1022, "x86_64"),
-          Entry.int16Array(1030, List.of(0100755, 0040755)),
-          Entry.stringArray(1035, List.of("digest-bin", "digest-etc")),
-          Entry.int32Array(1037, List.of(0, 0)),
-          Entry.string(1044, "demo-1.2.3-4.src.rpm"),
-          Entry.int32(1046, 1024),
-          Entry.stringArray(1047, List.of("demo")),
-          Entry.int32Array(1112, List.of(8)),
-          Entry.stringArray(1113, List.of("7:1.2.3-4")),
-          Entry.stringArray(1049, List.of("rpmlib(CompressedFileNames)", "/usr/bin/demo", "/bin/sh",
-              "pre-required")),
-          Entry.int32Array(1048, List.of(8, 0, 0, 520)),
-          Entry.stringArray(1050, List.of("0:0-0", "", "", "1:2.0-3")),
-          Entry.stringArray(1054, List.of("old-demo")),
-          Entry.int32Array(1053, List.of(10)),
-          Entry.stringArray(1055, List.of("1:1.0-1")),
-          Entry.stringArray(1090, List.of("older-demo")),
-          Entry.int32Array(1114, List.of(10)),
-          Entry.stringArray(1115, List.of("1:0.9-1")),
-          Entry.int32Array(1116, List.of(0, 1)),
-          Entry.stringArray(1117, List.of("demo", "demo")),
-          Entry.stringArray(1118, List.of("/usr/bin/", "/etc/")),
-          Entry.int64(271, 2048),
-          Entry.int64(5009, 4096),
-          Entry.int32(5011, 8))));
-      return rpm.toByteArray();
-    } catch (IOException e) {
-      throw new IllegalStateException(e);
-    }
-  }
-
-  private static byte[] header(List<Entry> entries) throws IOException {
-    List<Entry> sorted = entries.stream().sorted(Comparator.comparingInt(Entry::tag)).toList();
-    ByteArrayOutputStream data = new ByteArrayOutputStream();
-    List<Index> indexes = new ArrayList<>();
-    for (Entry entry : sorted) {
-      indexes.add(new Index(entry.tag(), entry.type(), data.size(), entry.count()));
-      data.write(entry.value());
-    }
-    ByteArrayOutputStream header = new ByteArrayOutputStream();
-    putInt(header, 0x8eade801);
-    putInt(header, 0);
-    putInt(header, sorted.size());
-    putInt(header, data.size());
-    for (Index index : indexes) {
-      putInt(header, index.tag());
-      putInt(header, index.type());
-      putInt(header, index.offset());
-      putInt(header, index.count());
-    }
-    header.write(data.toByteArray());
-    return header.toByteArray();
-  }
-
-  private static void putInt(ByteArrayOutputStream out, int value) throws IOException {
-    out.write(ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(value).array());
-  }
-
-  private record Index(int tag, int type, int offset, int count) {
-  }
-
-  private record Entry(int tag, int type, byte[] value, int count) {
-    static Entry string(int tag, String value) {
-      return new Entry(tag, 6, stringBytes(value), 1);
-    }
-
-    static Entry i18n(int tag, String value) {
-      return new Entry(tag, 9, stringBytes(value), 1);
-    }
-
-    static Entry stringArray(int tag, List<String> values) {
-      try {
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        for (String value : values) {
-          out.write(stringBytes(value));
-        }
-        return new Entry(tag, 8, out.toByteArray(), values.size());
-      } catch (IOException e) {
-        throw new IllegalStateException(e);
-      }
-    }
-
-    static Entry int16Array(int tag, List<Integer> values) {
-      ByteBuffer buffer = ByteBuffer.allocate(values.size() * 2).order(ByteOrder.BIG_ENDIAN);
-      values.forEach(value -> buffer.putShort((short) value.intValue()));
-      return new Entry(tag, 3, buffer.array(), values.size());
-    }
-
-    static Entry int32(int tag, int value) {
-      return int32Array(tag, List.of(value));
-    }
-
-    static Entry int32Array(int tag, List<Integer> values) {
-      ByteBuffer buffer = ByteBuffer.allocate(values.size() * 4).order(ByteOrder.BIG_ENDIAN);
-      values.forEach(buffer::putInt);
-      return new Entry(tag, 4, buffer.array(), values.size());
-    }
-
-    static Entry int64(int tag, long value) {
-      ByteBuffer buffer = ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN).putLong(value);
-      return new Entry(tag, 5, buffer.array(), 1);
-    }
-
-    private static byte[] stringBytes(String value) {
-      byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
-      byte[] result = new byte[bytes.length + 1];
-      System.arraycopy(bytes, 0, result, 0, bytes.length);
-      return result;
-    }
-  }
-
   private static final class FakeAssetDao extends AssetDaoAdapter {
     private final List<AssetRecord> assets;
     private final Map<Long, AssetBlobRecord> blobs;
@@ -521,6 +577,7 @@ class YumServiceTest {
     public List<AssetRecord> listAssetsByPrefix(long repositoryId, String pathPrefix) {
       return assets.stream()
           .filter(asset -> asset.repositoryId() == repositoryId)
+          .filter(asset -> asset.path().startsWith(pathPrefix))
           .toList();
     }
 
@@ -584,6 +641,11 @@ class YumServiceTest {
     @Override
     public void enqueue(long repositoryId, String indexKind) {
       enqueues.add(repositoryId + ":" + indexKind + ":");
+    }
+
+    @Override
+    public void enqueue(long repositoryId, String indexKind, String scopeKey) {
+      enqueues.add(repositoryId + ":" + indexKind + ":" + scopeKey);
     }
   }
 

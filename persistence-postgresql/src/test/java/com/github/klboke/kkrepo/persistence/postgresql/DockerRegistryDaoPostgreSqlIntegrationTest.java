@@ -30,6 +30,20 @@ class DockerRegistryDaoPostgreSqlIntegrationTest extends PostgreSqlIntegrationTe
   private static final String REFERENCE_DIGEST = "sha256:" + "b".repeat(64);
 
   @Test
+  void catalogSupportsCursorPagination() {
+    long repositoryId = insertRepository("docker-catalog", "docker");
+    long assetId = new JdbcAssetDao(jdbc(), jsonColumns()).insertAsset(asset(repositoryId));
+    DockerRegistryDao dao = new JdbcDockerRegistryDao(jdbc(), jsonColumns());
+    for (String image : List.of("acme/alpha", "acme/beta", "acme/gamma")) {
+      dao.upsertManifest(manifest(repositoryId, assetId, 0, image));
+    }
+
+    assertEquals(List.of("acme/alpha", "acme/beta"), dao.listCatalog(repositoryId, null, 2));
+    assertEquals(List.of("acme/gamma"), dao.listCatalog(repositoryId, "acme/beta", 2));
+    assertEquals(List.of(), dao.listCatalog(repositoryId, "acme/gamma", 2));
+  }
+
+  @Test
   void concurrentManifestUpsertsKeepTransactionTagAndReferencesConsistent() throws Exception {
     long repositoryId = insertRepository("docker-proxy", "docker");
     AssetDao assetDao = new JdbcAssetDao(jdbc(), jsonColumns());
@@ -49,7 +63,22 @@ class DockerRegistryDaoPostgreSqlIntegrationTest extends PostgreSqlIntegrationTe
 
     assertEquals(CONCURRENT_WRITERS, manifestIds.size());
     assertEquals(1, manifestIds.stream().distinct().count());
-    assertEquals(1, jdbc().queryForObject("SELECT COUNT(*) FROM docker_manifest", Integer.class));
+    assertEquals(1, jdbc().queryForObject(
+        "SELECT COUNT(*) FROM docker_manifest WHERE repository_id = ?", Integer.class, repositoryId));
+    var search = new JdbcDockerRegistryDao(jdbc(), jsonColumns());
+    var rows = search.searchTagsByRepositoryIds(List.of(repositoryId), "ACME", null, 10);
+    assertEquals(1, rows.size());
+    assertEquals("latest", rows.getFirst().version());
+    assertEquals(1, search.searchTagsByRepositoryIds(List.of(repositoryId), null, null, 1,
+        Map.of(repositoryId, com.github.klboke.kkrepo.persistence.jdbc.api.AssetPathFilter.prefix("acme/"))).size());
+    assertTrue(search.searchTagsByRepositoryIds(List.of(repositoryId), null, null, 1,
+        Map.of(repositoryId, com.github.klboke.kkrepo.persistence.jdbc.api.AssetPathFilter.prefix("v2/acme/"))).isEmpty());
+    assertEquals("v2/acme/app/manifests/latest", rows.getFirst().storagePath());
+    assertTrue(search.searchTagsByRepositoryIds(List.of(repositoryId), "%", null, 10).isEmpty());
+    assertTrue(search.searchTagsByRepositoryIds(List.of(repositoryId), "_", null, 10).isEmpty());
+    assertTrue(search.searchTagsByRepositoryIds(List.of(repositoryId + 999), null, null, 10).isEmpty());
+    assertTrue(search.searchTagsByRepositoryIds(List.of(repositoryId), null,
+        com.github.klboke.kkrepo.persistence.jdbc.api.ComponentDao.ComponentSearchCursor.after(rows.getFirst()), 10).isEmpty());
 
     DockerRegistryDao dao = new JdbcDockerRegistryDao(jdbc(), jsonColumns());
     DockerManifestRecord manifest = dao.findManifestByDigest(
@@ -122,11 +151,16 @@ class DockerRegistryDaoPostgreSqlIntegrationTest extends PostgreSqlIntegrationTe
 
   private static DockerManifestRecord manifest(
       long repositoryId, long assetId, int writerIndex) {
+    return manifest(repositoryId, assetId, writerIndex, IMAGE_NAME);
+  }
+
+  private static DockerManifestRecord manifest(
+      long repositoryId, long assetId, int writerIndex, String imageName) {
     return new DockerManifestRecord(
         null,
         repositoryId,
-        IMAGE_NAME,
-        JdbcDockerRegistryDao.hash(IMAGE_NAME),
+        imageName,
+        JdbcDockerRegistryDao.hash(imageName),
         "sha256",
         MANIFEST_DIGEST,
         JdbcDockerRegistryDao.hash(MANIFEST_DIGEST),

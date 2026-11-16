@@ -48,6 +48,19 @@ public final class MySqlDatabaseDialect implements DatabaseDialect {
   }
 
   @Override
+  public boolean isInvalidDatetime(java.sql.SQLException exception) {
+    // MySQL reports an out-of-range DATETIME comparison as HY000 / ER_WRONG_VALUE (1525).
+    return DatabaseDialect.super.isInvalidDatetime(exception)
+        || ("HY000".equals(exception.getSQLState()) && exception.getErrorCode() == 1525);
+  }
+
+  @Override
+  public boolean orderByNullEqualityColumns() {
+    // MySQL filesorts ORDER BY nullable_column, id even when nullable_column IS NULL.
+    return false;
+  }
+
+  @Override
   public String tableReferenceWithPreferredIndex(String tableName, String indexName) {
     return tableName + " FORCE INDEX (" + indexName + ")";
   }
@@ -352,6 +365,16 @@ public final class MySqlDatabaseDialect implements DatabaseDialect {
     private static final Pattern COLUMN = Pattern.compile("[A-Za-z0-9_.]+");
 
     @Override
+    public void ensureMavenSnapshotFamily(JdbcOperations jdbc, long repositoryId, byte[] pathHash,
+        String path, String groupId, String artifactId, String baseVersion) {
+      jdbc.update("""
+          INSERT INTO maven_snapshot_family (repository_id, path_hash, path, group_id, artifact_id, base_version)
+          VALUES (?, ?, ?, ?, ?, ?)
+          ON DUPLICATE KEY UPDATE id = id
+          """, repositoryId, pathHash, path, groupId, artifactId, baseVersion);
+    }
+
+    @Override
     public long bumpCacheVersion(JdbcOperations jdbc, String name) {
       Long version = jdbc.execute((ConnectionCallback<Long>) connection -> {
         try (PreparedStatement statement = connection.prepareStatement("""
@@ -459,6 +482,12 @@ public final class MySqlDatabaseDialect implements DatabaseDialect {
     @Override
     public String extractText(String column, String... path) {
       return "JSON_UNQUOTE(JSON_EXTRACT(" + column(column) + ", '" + path(path) + "'))";
+    }
+
+    @Override
+    public String extractTextAtKey(String column, String... parentPath) {
+      return "JSON_UNQUOTE(JSON_EXTRACT(" + column(column) + ", CONCAT('" + path(parentPath)
+          + ".', JSON_QUOTE(?))))";
     }
 
     @Override

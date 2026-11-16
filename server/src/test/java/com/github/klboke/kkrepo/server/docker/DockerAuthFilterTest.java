@@ -32,6 +32,8 @@ import java.util.Optional;
 import java.util.Set;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.ArgumentCaptor;
 import org.springframework.http.HttpHeaders;
 import org.springframework.mock.web.MockFilterChain;
@@ -84,7 +86,7 @@ class DockerAuthFilterTest {
 
     filter.doFilter(request, response, new MockFilterChain());
 
-    assertEquals(401, response.getStatus());
+    assertUnauthorizedJson(response);
     assertEquals(DockerConstants.API_VERSION, response.getHeader(DockerConstants.API_VERSION_HEADER));
     assertEquals(
         "Bearer realm=\"http://127.0.0.1:18090/service/rest/v1/docker/token\","
@@ -93,24 +95,30 @@ class DockerAuthFilterTest {
     verify(authenticationService).authenticate(request);
   }
 
-  @Test
-  void trustedForwardedHeadersDefinePublicBearerChallenge() throws Exception {
+  @ParameterizedTest
+  @CsvSource({
+      "10.0.0.1, 10.0.0.1",
+      "10.0.0.0/16, 10.0.12.34",
+      "10.0.0.0/16, 10.0.200.99",
+      "2001:db8::/32, 2001:db8:1234::1"
+  })
+  void trustedForwardedHeadersDefinePublicBearerChallenge(String trustedProxies, String remote) throws Exception {
     when(authService.challenge(
         "https://registry.example.com/service/rest/v1/docker/token",
         "registry.example.com"))
-        .thenReturn("public-challenge");
+        .thenCallRealMethod();
     SecurityAuthenticationService authenticationService = mock(SecurityAuthenticationService.class);
     DockerAuthFilter filter = new DockerAuthFilter(
         registry,
         authService,
         authenticationService,
         accessDecisionService,
-        new ForwardedHeaderPolicy("10.0.0.1"));
+        new ForwardedHeaderPolicy(trustedProxies));
     MockHttpServletRequest request = new MockHttpServletRequest("GET", "/v2/");
     request.setScheme("http");
     request.setServerName("kkrepo.internal");
     request.setServerPort(8080);
-    request.setRemoteAddr("10.0.0.1");
+    request.setRemoteAddr(remote);
     request.addHeader("X-Forwarded-Proto", "https");
     request.addHeader("X-Forwarded-Host", "registry.example.com");
     request.addHeader("X-Forwarded-Port", "443");
@@ -119,11 +127,51 @@ class DockerAuthFilterTest {
     filter.doFilter(request, response, new MockFilterChain());
 
     assertEquals(401, response.getStatus());
-    assertEquals("public-challenge", response.getHeader(HttpHeaders.WWW_AUTHENTICATE));
+    assertEquals(
+        "Bearer realm=\"https://registry.example.com/service/rest/v1/docker/token\","
+            + "service=\"registry.example.com\"",
+        response.getHeader(HttpHeaders.WWW_AUTHENTICATE));
   }
 
-  @Test
-  void untrustedForwardedHeadersCannotOverrideBearerChallenge() throws Exception {
+  @ParameterizedTest
+  @CsvSource({
+      "80, false, , registry.example.com",
+      "8082, false, , registry.example.com",
+      "80, true, , registry.example.com",
+      "8082, true, , registry.example.com",
+      "8443, false, registry.example.com:8443, registry.example.com:8443"
+  })
+  void httpsConnectorChallengeDoesNotRequireForwardedPort(
+      int backendPort, boolean forwardedHost, String originalHost, String expectedAuthority)
+      throws Exception {
+    when(authService.challenge(
+        "https://" + expectedAuthority + "/service/rest/v1/docker/token", expectedAuthority))
+        .thenCallRealMethod();
+    var filter = new DockerAuthFilter(registry, authService,
+        mock(SecurityAuthenticationService.class), accessDecisionService,
+        new ForwardedHeaderPolicy("10.0.0.1"));
+    var request = new MockHttpServletRequest("GET", "/v2/");
+    request.setAttribute(DockerConnectorConfiguration.CONNECTOR_REPOSITORY_ATTRIBUTE, "docker-hosted");
+    request.setScheme("http");
+    request.setServerName("registry.example.com");
+    request.setServerPort(backendPort);
+    request.setRemoteAddr("10.0.0.1");
+    if (originalHost != null) request.addHeader("Host", originalHost);
+    request.addHeader("X-Forwarded-Proto", "https");
+    if (forwardedHost) request.addHeader("X-Forwarded-Host", "registry.example.com");
+    var response = new MockHttpServletResponse();
+
+    filter.doFilter(request, response, new MockFilterChain());
+
+    assertEquals(401, response.getStatus());
+    assertEquals("Bearer realm=\"https://" + expectedAuthority + "/service/rest/v1/docker/token\","
+        + "service=\"" + expectedAuthority + "\"", response.getHeader(HttpHeaders.WWW_AUTHENTICATE));
+    assertEquals(DockerConstants.API_VERSION, response.getHeader(DockerConstants.API_VERSION_HEADER));
+  }
+
+  @ParameterizedTest
+  @CsvSource({"10.0.0.1", "10.0.0.0/16", "2001:db8::/32"})
+  void untrustedForwardedHeadersCannotOverrideBearerChallenge(String trustedProxies) throws Exception {
     when(authService.challenge(
         "http://kkrepo.internal:8080/service/rest/v1/docker/token",
         "kkrepo.internal:8080"))
@@ -134,12 +182,13 @@ class DockerAuthFilterTest {
         authService,
         authenticationService,
         accessDecisionService,
-        new ForwardedHeaderPolicy("10.0.0.1"));
+        new ForwardedHeaderPolicy(trustedProxies));
     MockHttpServletRequest request = new MockHttpServletRequest("GET", "/v2/");
     request.setScheme("http");
     request.setServerName("kkrepo.internal");
     request.setServerPort(8080);
     request.setRemoteAddr("203.0.113.10");
+    request.addHeader("X-Forwarded-For", "10.0.12.34");
     request.addHeader("X-Forwarded-Proto", "https");
     request.addHeader("X-Forwarded-Host", "attacker.example.com");
     request.addHeader("X-Forwarded-Port", "443");
@@ -199,7 +248,7 @@ class DockerAuthFilterTest {
 
     filter.doFilter(request, response, new MockFilterChain());
 
-    assertEquals(401, response.getStatus());
+    assertUnauthorizedJson(response);
     assertEquals(DockerConstants.API_VERSION, response.getHeader(DockerConstants.API_VERSION_HEADER));
     assertEquals(
         "Bearer realm=\"http://127.0.0.1:18090/service/rest/v1/docker/token\","
@@ -436,7 +485,7 @@ class DockerAuthFilterTest {
   }
 
   @Test
-  void catalogRequiresRepositoryAdminPermission() throws Exception {
+  void catalogRequiresRepositoryReadPermission() throws Exception {
     RepositoryRuntime runtime = dockerProxy("docker-live-proxy");
     when(registry.resolve("docker-live-proxy")).thenReturn(Optional.of(runtime));
     when(authService.authenticateBearer(
@@ -460,8 +509,96 @@ class DockerAuthFilterTest {
     filter.doFilter(request, response, new MockFilterChain());
 
     RepositoryPermission permission = capturedPermission();
-    assertEquals(PermissionAction.ADMIN, permission.action());
+    assertEquals(PermissionAction.READ, permission.action());
     assertEquals(null, permission.pathPattern());
+  }
+
+  @ParameterizedTest
+  @CsvSource({"false, basic", "true, basic", "false, anonymous", "true, anonymous",
+      "false, bearer", "true, bearer"})
+  void catalogReadIsCheckedAgainstTheTargetRepository(boolean connector, String credential) throws Exception {
+    RepositoryRuntime runtime = dockerProxy("docker-live-proxy");
+    when(registry.resolve("docker-live-proxy")).thenReturn(Optional.of(runtime));
+    SecurityAuthenticationService authentication = mock(SecurityAuthenticationService.class);
+    when(accessDecisionService.decide(eq(permissionSubject), any())).thenAnswer(invocation -> {
+      RepositoryPermission permission = invocation.getArgument(1);
+      return permission.repository().equals("docker-live-proxy") && permission.action() == PermissionAction.READ
+          ? AccessDecision.allow() : AccessDecision.deny("missing read");
+    });
+    MockHttpServletRequest request = new MockHttpServletRequest("GET",
+        connector ? "/v2/_catalog" : "/v2/docker-live-proxy/_catalog");
+    if (connector) {
+      request.setAttribute(DockerConnectorConfiguration.CONNECTOR_REPOSITORY_ATTRIBUTE, "docker-live-proxy");
+    }
+    if (credential.equals("anonymous")) {
+      when(authentication.authenticateAnonymous()).thenReturn(Optional.of(subject));
+    } else if (credential.equals("basic")) {
+      request.addHeader(HttpHeaders.AUTHORIZATION, "Basic credentials");
+      when(authentication.authenticate(request)).thenReturn(Optional.of(subject));
+    } else {
+      request.addHeader(HttpHeaders.AUTHORIZATION, "Bearer catalog-token");
+      when(authService.authenticateBearer(eq("catalog-token"), eq(runtime.id()),
+          eq("docker-live-proxy"), eq(null), eq("catalog"), any())).thenReturn(userBearer(subject));
+    }
+    DockerAuthFilter filter = new DockerAuthFilter(
+        registry, authService, authentication, accessDecisionService, forwardedHeaderPolicy);
+    MockHttpServletResponse response = new MockHttpServletResponse();
+    MockFilterChain chain = new MockFilterChain();
+
+    filter.doFilter(request, response, chain);
+
+    assertEquals(200, response.getStatus());
+    assertEquals(request, chain.getRequest());
+    assertEquals(new RepositoryPermission("docker-live-proxy", RepositoryFormat.DOCKER, null,
+        PermissionAction.READ), capturedPermission());
+    assertEquals(subject, request.getAttribute(AuthenticatedSubject.REQUEST_ATTRIBUTE));
+  }
+
+  @ParameterizedTest
+  @CsvSource({"Basic invalid", "Bearer invalid"})
+  void invalidCatalogCredentialsCannotFallBackToAnonymous(String credential) throws Exception {
+    when(registry.resolve("docker-live-proxy")).thenReturn(Optional.of(dockerProxy("docker-live-proxy")));
+    SecurityAuthenticationService authentication = mock(SecurityAuthenticationService.class);
+    MockHttpServletRequest request = new MockHttpServletRequest("GET", "/v2/docker-live-proxy/_catalog");
+    request.addHeader(HttpHeaders.AUTHORIZATION, credential);
+    when(authentication.hasPresentedCredentials(request)).thenReturn(true);
+    DockerAuthFilter filter = new DockerAuthFilter(
+        registry, authService, authentication, accessDecisionService, forwardedHeaderPolicy);
+    MockHttpServletResponse response = new MockHttpServletResponse();
+    MockFilterChain chain = new MockFilterChain();
+
+    filter.doFilter(request, response, chain);
+
+    assertEquals(401, response.getStatus());
+    assertEquals(null, chain.getRequest());
+    verify(authentication, never()).authenticateAnonymous();
+    assertUnauthorizedJson(response);
+  }
+
+  @Test
+  void catalogBearerStillRequiresCurrentReadPermission() throws Exception {
+    RepositoryRuntime runtime = dockerProxy("docker-live-proxy");
+    when(registry.resolve("docker-live-proxy")).thenReturn(Optional.of(runtime));
+    when(authService.authenticateBearer(eq("catalog-token"), eq(runtime.id()), eq("docker-live-proxy"),
+        eq(null), eq("catalog"), any())).thenReturn(userBearer(subject));
+    when(accessDecisionService.decide(eq(permissionSubject), any())).thenReturn(AccessDecision.deny("no read"));
+    MockHttpServletRequest request = new MockHttpServletRequest("GET", "/v2/docker-live-proxy/_catalog");
+    request.addHeader(HttpHeaders.AUTHORIZATION, "Bearer catalog-token");
+    MockHttpServletResponse response = new MockHttpServletResponse();
+    MockFilterChain chain = new MockFilterChain();
+    new DockerAuthFilter(registry, authService, mock(SecurityAuthenticationService.class),
+        accessDecisionService, forwardedHeaderPolicy).doFilter(request, response, chain);
+
+    assertEquals(null, chain.getRequest());
+    assertUnauthorizedJson(response);
+  }
+
+  private static void assertUnauthorizedJson(MockHttpServletResponse response) throws Exception {
+    assertEquals(401, response.getStatus());
+    assertEquals("application/json", response.getContentType());
+    assertEquals(null, response.getErrorMessage());
+    var error = new com.fasterxml.jackson.databind.ObjectMapper().readTree(response.getContentAsByteArray());
+    assertEquals("UNAUTHORIZED", error.path("errors").get(0).path("code").asText());
   }
 
   @Test
@@ -485,7 +622,7 @@ class DockerAuthFilterTest {
 
     filter.doFilter(request, response, new MockFilterChain());
 
-    assertEquals(401, response.getStatus());
+    assertUnauthorizedJson(response);
     assertEquals(DockerConstants.API_VERSION, response.getHeader(DockerConstants.API_VERSION_HEADER));
     assertEquals(
         "Bearer realm=\"http://127.0.0.1:18090/service/rest/v1/docker/token\","

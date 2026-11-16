@@ -89,6 +89,9 @@ class CleanupExecutionServiceTest {
 
     assertEquals("SKIPPED_STALE", result.decision());
     assertEquals("usage revision changed", result.reason().get("staleReason"));
+    var order = org.mockito.Mockito.inOrder(scanner);
+    order.verify(scanner).lockPackageRoots(repository(), List.of("file.zip"));
+    order.verify(scanner).resolveLocked(repository(), "ASSET", 9, "file.zip");
     verify(deletion, never()).deleteForCleanup(any(), any(), anyLong(), any(), any());
   }
 
@@ -118,6 +121,29 @@ class CleanupExecutionServiceTest {
     assertEquals("KEEP_PROTECTED", result.decision());
     assertEquals(55L, result.protectionId());
     verify(deletion, never()).deleteForCleanup(any(), any(), anyLong(), any(), any());
+  }
+
+  @Test
+  void aSnapshotThatBecomesRetainedAfterScanningIsSkippedBeforeDeletion() {
+    when(scanner.resolveLocked(repository(), "ASSET", 9, "file.zip")).thenReturn(Optional.of(expected));
+    when(scanner.revalidateSnapshot(repository(), run.criteriaSnapshot(), expected, run.createdAt()))
+        .thenReturn("newest build retained");
+    var result = service.apply(claim, run, new Candidate(expected, Map.of()), "cleanup");
+    assertEquals("SKIPPED_STALE", result.decision());
+    assertEquals("newest build retained", result.reason().get("staleReason"));
+    verify(deletion).deleteBatchForCleanup("raw-releases", List.of(), "cleanup");
+  }
+
+  @Test
+  void inheritedSnapshotComponentProtectionIsRecheckedInsideTheTransaction() {
+    when(scanner.resolveLocked(repository(), "ASSET", 9, "file.zip")).thenReturn(Optional.of(expected));
+    when(scanner.inheritedSnapshotProtection(1, expected, now)).thenReturn(new CleanupProtection(
+        56L, "SUBJECT", 1L, "COMPONENT", "component:77", new byte[32],
+        "MANUAL", null, "snapshot base hold", true, null, null, "admin", now, now));
+    var result = service.apply(claim, run, new Candidate(expected, Map.of()), "cleanup");
+    assertEquals("KEEP_PROTECTED", result.decision());
+    assertEquals(56L, result.protectionId());
+    verify(deletion).deleteBatchForCleanup("raw-releases", List.of(), "cleanup");
   }
 
   @Test

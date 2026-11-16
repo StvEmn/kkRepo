@@ -1,5 +1,6 @@
 package com.github.klboke.kkrepo.server.repositories;
 
+import com.github.klboke.kkrepo.server.routingrules.RoutingRuleService;
 import com.github.klboke.kkrepo.core.RepositoryFormat;
 import com.github.klboke.kkrepo.core.RepositoryRecipe;
 import com.github.klboke.kkrepo.core.RepositoryRecipes;
@@ -20,8 +21,10 @@ import com.github.klboke.kkrepo.persistence.jdbc.api.TerraformRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.BlobStoreRecord;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.RepositoryRecord;
 import com.github.klboke.kkrepo.server.docker.DockerConnectorRuntime;
+import com.github.klboke.kkrepo.server.docker.DockerMigrationMetadataCleanup;
 import com.github.klboke.kkrepo.server.helm.HelmGroupIndexCache;
 import com.github.klboke.kkrepo.server.maven.ProxyNegativeCache;
+import com.github.klboke.kkrepo.server.maven.RepositoryRuntime;
 import com.github.klboke.kkrepo.server.maven.RepositoryRuntimeRegistry;
 import com.github.klboke.kkrepo.server.npm.NpmGroupPackumentCache;
 import com.github.klboke.kkrepo.server.pypi.PypiGroupSimpleIndexCache;
@@ -39,6 +42,12 @@ import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.GroupSett
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.HostedSettings;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.ProxySettings;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.PypiSettings;
+import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.YumSettings;
+import com.github.klboke.kkrepo.server.yum.YumMetadataDepth;
+import com.github.klboke.kkrepo.server.yum.YumMetadataCleanup;
+import com.github.klboke.kkrepo.server.conan.ConanManifestPolicy;
+import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.ConanSettings;
+import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryIndexRebuildDao;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.RawSettings;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.UpdateCommand;
 import com.github.klboke.kkrepo.server.security.OutboundRequestPolicy;
@@ -47,7 +56,7 @@ import com.github.klboke.kkrepo.server.security.SecurityCatalogCache;
 import com.github.klboke.kkrepo.server.security.SecurityValidationException;
 import com.github.klboke.kkrepo.protocol.alpine.AlpinePathParser;
 import com.github.klboke.kkrepo.protocol.alpine.AlpineSignature;
-import java.net.IDN;
+import com.github.klboke.kkrepo.server.security.RedirectHosts;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.ArrayList;
@@ -63,6 +72,7 @@ import java.util.regex.Pattern;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -75,8 +85,13 @@ public class RepositoryService {
   private static final Set<String> MAVEN_LAYOUT_POLICIES = Set.of("STRICT", "PERMISSIVE");
   private static final Set<String> RAW_CONTENT_DISPOSITIONS = Set.of("INLINE", "ATTACHMENT");
   private static final int MAX_PROXY_REDIRECT_HOSTS = 64;
-  private static final Pattern REDIRECT_HOST_LABEL_PATTERN =
-      Pattern.compile("^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$");
+
+  private RoutingRuleService routingRules;
+
+  @Autowired
+  void setRoutingRules(RoutingRuleService routingRules) {
+    this.routingRules = routingRules;
+  }
 
   private final RepositoryDao repositoryDao;
   private final BlobStoreDao blobStoreDao;
@@ -103,7 +118,26 @@ public class RepositoryService {
   private AlpineRegistryDao alpineRegistry;
   private RRegistryDao rRegistry;
   private HuggingFaceRegistryDao huggingFaceRegistry;
+  private DockerMigrationMetadataCleanup dockerMigrationCleanup;
+  private YumMetadataCleanup yumMetadataCleanup;
   private CleanupPolicyDao cleanupPolicies;
+  private RepositoryIndexRebuildDao indexRebuildDao;
+
+  @Autowired
+  void setDockerMigrationCleanup(
+      DockerMigrationMetadataCleanup dockerMigrationCleanup) {
+    this.dockerMigrationCleanup = dockerMigrationCleanup;
+  }
+
+  @Autowired
+  void setYumMetadataCleanup(YumMetadataCleanup yumMetadataCleanup) {
+    this.yumMetadataCleanup = yumMetadataCleanup;
+  }
+
+  @Autowired
+  void setIndexRebuildDao(RepositoryIndexRebuildDao indexRebuildDao) {
+    this.indexRebuildDao = indexRebuildDao;
+  }
   private final String urlPrefix;
   private final int serverPort;
   private final int managementPort;
@@ -318,6 +352,12 @@ public class RepositoryService {
       attributes.put("pypi", pypiAttributes(pypi));
     }
 
+    if (recipe.format() == RepositoryFormat.YUM && recipe.type() == RepositoryType.HOSTED) {
+      attributes.put("yum", Map.of("repodataDepth", yumDepth(command.yum(), 0)));
+    }
+
+    putConanSettings(attributes, recipe.format(), recipe.type(), command.conan());
+
     String versionPolicy = null;
     String layoutPolicy = null;
     String writePolicy = null;
@@ -340,7 +380,8 @@ public class RepositoryService {
 
     RepositoryRecord toInsert = new RepositoryRecord(
         null, name, recipe.format(), recipe.type(), recipe.name(), online,
-        blobStoreId, null, proxyRemoteUrl, versionPolicy, layoutPolicy, writePolicy,
+        blobStoreId, routingRules == null ? null : routingRules.binding(recipe.type(), command.routingRuleName(), null),
+        proxyRemoteUrl, versionPolicy, layoutPolicy, writePolicy,
         strict, attributes);
     long id = repositoryDao.insert(toInsert);
 
@@ -382,7 +423,15 @@ public class RepositoryService {
 
   @Transactional
   public RepositoryView update(String name, UpdateCommand command) {
-    RepositoryRecord existing = repositoryDao.findByName(name)
+    RepositoryRecord observed = repositoryDao.findByName(name)
+        .orElseThrow(() -> new RepositoryNotFoundException(name));
+    if (routingRules != null) {
+      // Match migration's rule-before-repository lock order. Partial updates lock no rule.
+      routingRules.binding(observed.type(), command.routingRuleName(), null);
+    }
+    // Read the current committed binding under the row lock, including on MySQL RR:
+    // an earlier snapshot must not undo a concurrent assignment or removal.
+    RepositoryRecord existing = repositoryDao.lockByName(name)
         .orElseThrow(() -> new RepositoryNotFoundException(name));
     RepositoryRecipe recipe = RepositoryRecipes.byName(existing.recipeName())
         .orElseThrow(() -> new RepositoryValidationException(
@@ -437,6 +486,18 @@ public class RepositoryService {
       attributes.put("pypi", pypiAttributes(merged));
     }
 
+    putConanSettings(attributes, recipe.format(), recipe.type(), command.conan());
+
+    boolean rebuildYumMetadata = false;
+    if (recipe.format() == RepositoryFormat.YUM && existing.type() == RepositoryType.HOSTED) {
+      int currentDepth = YumMetadataDepth.read(existing.attributes());
+      int depth = yumDepth(command.yum(), currentDepth);
+      boolean initialized = attributes.get("yum") instanceof Map<?, ?> yum
+          && yum.get("repodataDepth") != null;
+      rebuildYumMetadata = !initialized || depth != currentDepth;
+      attributes.put("yum", Map.of("repodataDepth", depth));
+    }
+
     String versionPolicy = existing.versionPolicy();
     String layoutPolicy = existing.layoutPolicy();
     String writePolicy = existing.writePolicy();
@@ -466,9 +527,15 @@ public class RepositoryService {
 
     RepositoryRecord toUpdate = new RepositoryRecord(
         existing.id(), existing.name(), existing.format(), existing.type(), existing.recipeName(),
-        online, blobStoreId, existing.routingRuleId(), proxyRemoteUrl,
+        online, blobStoreId, routingRules == null ? existing.routingRuleId()
+            : routingRules.binding(recipe.type(), command.routingRuleName(), existing.routingRuleId()), proxyRemoteUrl,
         versionPolicy, layoutPolicy, writePolicy, strict, attributes);
     repositoryDao.update(toUpdate);
+    if (rebuildYumMetadata && indexRebuildDao != null) {
+      // First initialization repairs legacy repositories; later saves rebuild only on depth changes.
+      // The durable marker commits with the settings and is claimed by one replica.
+      indexRebuildDao.enqueue(existing.id(), RepositoryIndexRebuildDao.YUM_METADATA);
+    }
     if (recipe.format() == RepositoryFormat.APT && aptRegistry != null) {
       AptSettings settings = readAptAttributes(toUpdate);
       if (settings.distribution() != null && !settings.distribution().isBlank()) {
@@ -531,7 +598,7 @@ public class RepositoryService {
     return get(name);
   }
 
-  @Transactional
+  @Transactional(isolation = Isolation.READ_COMMITTED)
   public void delete(String name) {
     RepositoryRecord existing = repositoryDao.findByName(name)
         .orElseThrow(() -> new RepositoryNotFoundException(name));
@@ -545,6 +612,14 @@ public class RepositoryService {
       throw new RepositoryValidationException(
           "Repository '" + name + "' is referenced by a cleanup policy or active cleanup run. "
               + "Remove it from cleanup policies and wait for active runs to finish.");
+    }
+    if (existing.format() == RepositoryFormat.DOCKER && dockerMigrationCleanup != null
+        && repositoryDao.hasComponents(existing.id())) {
+      dockerMigrationCleanup.cleanupBeforeRepositoryDeletion(existing.id());
+    }
+    if (existing.format() == RepositoryFormat.YUM && existing.type() == RepositoryType.HOSTED
+        && yumMetadataCleanup != null) {
+      yumMetadataCleanup.cleanupBeforeRepositoryDeletion(existing.id());
     }
     if (repositoryDao.hasComponents(existing.id())) {
       throw new RepositoryValidationException(
@@ -641,6 +716,9 @@ public class RepositoryService {
     if (proxiedHttpClientFactory == null) {
       return;
     }
+    if (!java.util.Objects.equals(proxyChildMap(previousAttributes), proxyChildMap(newAttributes))) {
+      proxiedHttpClientFactory.invalidateNtlm(repositoryName);
+    }
     OutboundProxyConfig previous = OutboundProxyConfig.fromAttributes(proxyChildMap(previousAttributes));
     if (previous == null) {
       return;
@@ -656,6 +734,7 @@ public class RepositoryService {
     if (proxiedHttpClientFactory == null) {
       return;
     }
+    proxiedHttpClientFactory.invalidateNtlm(repositoryName);
     proxiedHttpClientFactory.invalidate(
         repositoryName, OutboundProxyConfig.fromAttributes(proxyChildMap(attributes)));
   }
@@ -871,7 +950,10 @@ public class RepositoryService {
     if (rRegistry == null) return;
     java.time.Instant now = java.time.Instant.now();
     rRegistry.ensureSuite(repositoryId, "src/contrib", now);
-    rRegistry.markSuiteDirty(repositoryId, "src/contrib", now);
+    Set<String> namespaces = new LinkedHashSet<>();
+    namespaces.add("src/contrib");
+    rRegistry.listSuites(repositoryId).forEach(state -> namespaces.add(state.distribution()));
+    namespaces.forEach(namespace -> rRegistry.markSuiteDirty(repositoryId, namespace, now));
   }
 
   private void invalidateRGroupSnapshots(
@@ -1173,7 +1255,12 @@ public class RepositoryService {
         record.id(), record.name(), record.recipeName(),
         record.format(), record.type(), record.online(),
         blobStoreName, record.strictContentTypeValidation(), url,
-        hosted, proxy, raw, docker, cargo, group, apt, alpine, pypi);
+        hosted, proxy, raw, docker, cargo, group, apt, alpine, pypi,
+        record.format() == RepositoryFormat.YUM && record.type() == RepositoryType.HOSTED
+            ? new YumSettings(YumMetadataDepth.read(record.attributes())) : null,
+        record.format() == RepositoryFormat.CONAN && record.type() != RepositoryType.GROUP
+            ? ConanManifestPolicy.read(record.attributes()) : null,
+        routingRules == null ? null : routingRules.name(record.routingRuleId()));
   }
 
   private Map<Long, String> blobStoreNameIndex() {
@@ -1184,6 +1271,21 @@ public class RepositoryService {
       }
     }
     return index;
+  }
+
+  private static void putConanSettings(Map<String, Object> attributes, RepositoryFormat format,
+      RepositoryType type, ConanSettings settings) {
+    // Older clients omit this section; preserve any existing overrides on unrelated updates.
+    if (settings == null) return;
+    if (format != RepositoryFormat.CONAN || type == RepositoryType.GROUP) {
+      throw new RepositoryValidationException(
+          "Conan manifest limits require a Conan hosted or proxy repository");
+    }
+    try {
+      attributes.put("conan", ConanManifestPolicy.attributes(settings));
+    } catch (IllegalArgumentException invalid) {
+      throw new RepositoryValidationException(invalid.getMessage());
+    }
   }
 
   // ---- validation -----------------------------------------------------------
@@ -1313,7 +1415,8 @@ public class RepositoryService {
         settings.outboundProxyPassword(),
         settings.outboundProxyPasswordConfigured(),
         settings.minimumReleaseAgeMinutes(),
-        settings.allowedRedirectHosts());
+        settings.allowedRedirectHosts(),
+        settings.remoteAuthenticationType(), settings.remoteNtlmDomain(), settings.remoteNtlmHost(), settings.streamingEnabled());
   }
 
   private static String defaultRemoteUrl(RepositoryFormat format) {
@@ -1351,7 +1454,8 @@ public class RepositoryService {
         settings.outboundProxyPassword(),
         settings.outboundProxyPasswordConfigured(),
         settings.minimumReleaseAgeMinutes(),
-        settings.allowedRedirectHosts());
+        settings.allowedRedirectHosts(),
+        settings.remoteAuthenticationType(), settings.remoteNtlmDomain(), settings.remoteNtlmHost(), settings.streamingEnabled());
   }
 
   private static ProxySettings withAllowedRedirectHosts(
@@ -1373,7 +1477,8 @@ public class RepositoryService {
         settings.outboundProxyPassword(),
         settings.outboundProxyPasswordConfigured(),
         settings.minimumReleaseAgeMinutes(),
-        allowedRedirectHosts);
+        allowedRedirectHosts,
+        settings.remoteAuthenticationType(), settings.remoteNtlmDomain(), settings.remoteNtlmHost(), settings.streamingEnabled());
   }
 
   private void validateProxy(ProxySettings settings, RepositoryFormat format) {
@@ -1384,6 +1489,22 @@ public class RepositoryService {
         && (settings.remoteUsername() == null || settings.remoteUsername().isBlank())) {
       throw new RepositoryValidationException("proxy.remoteUsername is required when proxy.remotePassword is set");
     }
+    String authType = settings.remoteAuthenticationType();
+    if (authType != null && !authType.isBlank() && !"auto".equals(authType) && !"ntlm".equals(authType)) {
+      throw new RepositoryValidationException("proxy.remoteAuthenticationType must be auto or ntlm");
+    }
+    if ("ntlm".equals(authType)) {
+      if (format != RepositoryFormat.NUGET) {
+        throw new RepositoryValidationException("NTLM upstream authentication is currently supported for NuGet proxy repositories");
+      }
+      if (settings.remoteUsername() == null || settings.remoteUsername().isBlank()
+          || settings.remotePassword() == null || settings.remotePassword().isBlank()) {
+        throw new RepositoryValidationException("NTLM requires proxy.remoteUsername and proxy.remotePassword");
+      }
+      if (settings.remoteBearerToken() != null && !settings.remoteBearerToken().isBlank()) {
+        throw new RepositoryValidationException("Clear proxy.remoteBearerToken before selecting NTLM authentication");
+      }
+    }
     OutboundProxyConfig outboundProxy = validateOutboundProxy(settings);
     try {
       outboundPolicy.validateHttpUri(
@@ -1391,15 +1512,23 @@ public class RepositoryService {
     } catch (SecurityValidationException e) {
       throw new RepositoryValidationException(e.getMessage());
     }
+    if (normalizeAllowedRedirectHosts(settings.allowedRedirectHosts()).contains("*")) {
+      if (!"https".equalsIgnoreCase(java.net.URI.create(settings.remoteUrl()).getScheme())) {
+        throw new RepositoryValidationException("Standalone * requires an HTTPS upstream");
+      }
+      if (outboundProxy != null && outboundProxy.enabled()) {
+        throw new RepositoryValidationException("Standalone * requires direct outbound transport");
+      }
+    }
     int minimumReleaseAge = settings.minimumReleaseAgeMinutes() == null
         ? 0
         : settings.minimumReleaseAgeMinutes();
     if (minimumReleaseAge < 0) {
       throw new RepositoryValidationException("proxy.minimumReleaseAgeMinutes must be at least 0");
     }
-    if (minimumReleaseAge > 0 && format != RepositoryFormat.NPM) {
+    if (minimumReleaseAge > 0 && !RepositoryRuntime.supportsMinimumReleaseAge(format)) {
       throw new RepositoryValidationException(
-          "proxy.minimumReleaseAgeMinutes is only supported for npm proxy repositories");
+          "proxy.minimumReleaseAgeMinutes is only supported for npm, Go, Maven and PyPI proxy repositories");
     }
     if (format == RepositoryFormat.SWIFT) {
       normalizeSwiftRemoteUrl(settings.remoteUrl());
@@ -1410,27 +1539,11 @@ public class RepositoryService {
     if (hosts == null || hosts.isEmpty()) return List.of();
     LinkedHashSet<String> normalized = new LinkedHashSet<>();
     for (String host : hosts) {
-      if (host == null || host.isBlank()) {
-        throw invalidRedirectHost();
-      }
-      String candidate = host.trim();
-      while (candidate.endsWith(".")) {
-        candidate = candidate.substring(0, candidate.length() - 1);
-      }
-      final String ascii;
       try {
-        ascii = IDN.toASCII(candidate, IDN.USE_STD3_ASCII_RULES)
-            .toLowerCase(Locale.ROOT);
+        normalized.add(RedirectHosts.normalizeRule(host));
       } catch (IllegalArgumentException e) {
         throw invalidRedirectHost();
       }
-      if (ascii.isBlank() || ascii.length() > 253) throw invalidRedirectHost();
-      for (String label : ascii.split("\\.", -1)) {
-        if (!REDIRECT_HOST_LABEL_PATTERN.matcher(label).matches()) {
-          throw invalidRedirectHost();
-        }
-      }
-      normalized.add(ascii);
       if (normalized.size() > MAX_PROXY_REDIRECT_HOSTS) {
         throw new RepositoryValidationException(
             "proxy.allowedRedirectHosts supports at most " + MAX_PROXY_REDIRECT_HOSTS + " hosts");
@@ -1441,7 +1554,7 @@ public class RepositoryService {
 
   private static RepositoryValidationException invalidRedirectHost() {
     return new RepositoryValidationException(
-        "proxy.allowedRedirectHosts entries must be exact host names without a scheme, port, path, or wildcard");
+        "proxy.allowedRedirectHosts entries must be standalone *, exact host names or *.example.com patterns without a scheme, port, or path");
   }
 
   private OutboundProxyConfig validateOutboundProxy(ProxySettings settings) {
@@ -1562,7 +1675,11 @@ public class RepositoryService {
             : incoming.minimumReleaseAgeMinutes(),
         incoming.allowedRedirectHosts() == null
             ? base.allowedRedirectHosts()
-            : incoming.allowedRedirectHosts());
+            : incoming.allowedRedirectHosts(),
+        incoming.remoteAuthenticationType() == null ? base.remoteAuthenticationType() : incoming.remoteAuthenticationType(),
+        incoming.remoteNtlmDomain() == null ? base.remoteNtlmDomain() : blankToNull(incoming.remoteNtlmDomain()),
+        incoming.remoteNtlmHost() == null ? base.remoteNtlmHost() : blankToNull(incoming.remoteNtlmHost()),
+        incoming.streamingEnabled() == null ? base.streamingEnabled() : incoming.streamingEnabled());
   }
 
   private static String mergedOutboundProxyPassword(ProxySettings base, ProxySettings incoming) {
@@ -1598,6 +1715,7 @@ public class RepositoryService {
   private static Map<String, Object> proxyAttributes(ProxySettings proxy) {
     Map<String, Object> map = new LinkedHashMap<>();
     map.put("remoteUrl", proxy.remoteUrl());
+    map.put("streamingEnabled", Boolean.TRUE.equals(proxy.streamingEnabled()));
     if (proxy.contentMaxAgeMinutes() != null) map.put("contentMaxAgeMinutes", proxy.contentMaxAgeMinutes());
     if (proxy.metadataMaxAgeMinutes() != null) map.put("metadataMaxAgeMinutes", proxy.metadataMaxAgeMinutes());
     if (proxy.minimumReleaseAgeMinutes() != null) {
@@ -1606,6 +1724,9 @@ public class RepositoryService {
     if (proxy.allowedRedirectHosts() != null && !proxy.allowedRedirectHosts().isEmpty()) {
       map.put("allowedRedirectHosts", List.copyOf(proxy.allowedRedirectHosts()));
     }
+    if (proxy.remoteAuthenticationType() != null) map.put("remoteAuthenticationType", proxy.remoteAuthenticationType());
+    if (proxy.remoteNtlmDomain() != null) map.put("remoteNtlmDomain", proxy.remoteNtlmDomain());
+    if (proxy.remoteNtlmHost() != null) map.put("remoteNtlmHost", proxy.remoteNtlmHost());
     if (proxy.autoBlock() != null) map.put("autoBlock", proxy.autoBlock());
     if (proxy.remoteUsername() != null && !proxy.remoteUsername().isBlank()) {
       map.put("remoteUsername", proxy.remoteUsername());
@@ -1638,6 +1759,12 @@ public class RepositoryService {
     RawSettings effective = raw == null ? new RawSettings("ATTACHMENT") : raw;
     String disposition = normalizeRawContentDisposition(effective.contentDisposition());
     return Map.of("contentDisposition", disposition);
+  }
+
+  private static int yumDepth(YumSettings settings, int fallback) {
+    int depth = settings == null || settings.repodataDepth() == null ? fallback : settings.repodataDepth();
+    if (depth < 0) throw new RepositoryValidationException("Yum repodata depth must be non-negative");
+    return depth;
   }
 
   private static PypiSettings normalizePypi(PypiSettings settings) {
@@ -2057,7 +2184,11 @@ public class RepositoryService {
         blankToNull(stringOrNull(proxyMap.get("outboundProxyPassword"))),
         null,
         intValue(proxyMap.get("minimumReleaseAgeMinutes")),
-        stringList(proxyMap.get("allowedRedirectHosts")));
+        stringList(proxyMap.get("allowedRedirectHosts")),
+        stringOrNull(proxyMap.get("remoteAuthenticationType")),
+        stringOrNull(proxyMap.get("remoteNtlmDomain")),
+        stringOrNull(proxyMap.get("remoteNtlmHost")),
+        boolValue(proxyMap.get("streamingEnabled")));
   }
 
   private static ProxySettings readProxyAttributesOrDefaults(RepositoryRecord record) {
@@ -2083,7 +2214,9 @@ public class RepositoryService {
         null,
         outboundPassword != null && !outboundPassword.isBlank(),
         effective.minimumReleaseAgeMinutes() == null ? 0 : effective.minimumReleaseAgeMinutes(),
-        effective.allowedRedirectHosts() == null ? List.of() : effective.allowedRedirectHosts());
+        effective.allowedRedirectHosts() == null ? List.of() : effective.allowedRedirectHosts(),
+        effective.remoteAuthenticationType(), effective.remoteNtlmDomain(), effective.remoteNtlmHost(),
+        Boolean.TRUE.equals(effective.streamingEnabled()));
   }
 
   private static String stringOrNull(Object value) {

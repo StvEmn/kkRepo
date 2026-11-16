@@ -3,6 +3,18 @@ package com.github.klboke.kkrepo.server;
 import com.github.klboke.kkrepo.persistence.jdbc.api.BlobStoreDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.BlobStoreRecord;
 import com.github.klboke.kkrepo.server.maven.BlobStorageRegistry;
+import com.github.klboke.kkrepo.server.statistics.StorageStatisticsService;
+import com.github.klboke.kkrepo.server.statistics.StorageStatisticsService.UsageSnapshot;
+import com.github.klboke.kkrepo.server.statistics.StorageUsageResponse;
+import com.github.klboke.kkrepo.server.statistics.StorageUsageResponse.BlobStoreUsage;
+import com.github.klboke.kkrepo.core.blobstore.BlobStoreDescriptor;
+import com.github.klboke.kkrepo.core.blobstore.BlobStoreTypes;
+import com.github.klboke.kkrepo.storage.azure.AzureBlobStoreConfig;
+import com.github.klboke.kkrepo.storage.azure.AzureBlobStoreProvider;
+import com.github.klboke.kkrepo.storage.azure.AzureCredentialType;
+import com.github.klboke.kkrepo.storage.azure.admin.AzureBlobStoreAdmin;
+import com.github.klboke.kkrepo.storage.azure.admin.AzureContainerSummary;
+import com.github.klboke.kkrepo.storage.azure.admin.AzureProbeResult;
 import com.github.klboke.kkrepo.storage.file.FileBlobStoreConfig;
 import com.github.klboke.kkrepo.storage.file.FileBlobStorePathValidator;
 import com.github.klboke.kkrepo.storage.file.FileBlobStorageFactory;
@@ -20,10 +32,12 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.env.Environment;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -42,9 +56,32 @@ public class BlobStoresController {
   private final FileBlobStorageFactory fileBlobStorageFactory;
   private final FileBlobStorePathValidator filePathValidator;
   private final S3StorageProperties s3Properties;
+  private final AzureBlobStoreAdmin azureBlobStoreAdmin;
+  private final AzureBlobStoreProvider azureBlobStoreProvider;
   private final BlobStorageRegistry blobStorageRegistry;
   private final Environment environment;
+  private StorageStatisticsService statistics;
+  private BlobStoreDeletionService deletionService;
 
+  @Autowired
+  void setStorageStatistics(StorageStatisticsService statistics) {
+    this.statistics = statistics;
+  }
+
+  @Autowired
+  void setBlobStoreDeletionService(BlobStoreDeletionService deletionService) {
+    this.deletionService = deletionService;
+  }
+
+  @GetMapping("/statistics/usage")
+  public UsageSnapshot<BlobStoreUsage> statistics() {
+    // SecurityManagementFilter requires nexus:blobstores:read for this endpoint.
+    // Read only the catalog here: the count request must never probe S3/OSS/File stores.
+    return StorageUsageResponse.blobs(
+        statistics.blobs(blobStoreRecords().stream().map(BlobStoreRecord::id).toList()));
+  }
+
+  /** Pre-Azure signature, retained for callers that configure only the S3 and file backends. */
   public BlobStoresController(
       BlobStoreDao blobStoreDao,
       S3BlobStoreAdmin s3BlobStoreAdmin,
@@ -54,12 +91,30 @@ public class BlobStoresController {
       S3StorageProperties s3Properties,
       BlobStorageRegistry blobStorageRegistry,
       Environment environment) {
+    this(blobStoreDao, s3BlobStoreAdmin, fileBlobStoreAdmin, fileBlobStorageFactory, filePathValidator,
+        s3Properties, null, null, blobStorageRegistry, environment);
+  }
+
+  @Autowired
+  public BlobStoresController(
+      BlobStoreDao blobStoreDao,
+      S3BlobStoreAdmin s3BlobStoreAdmin,
+      FileBlobStoreAdmin fileBlobStoreAdmin,
+      FileBlobStorageFactory fileBlobStorageFactory,
+      FileBlobStorePathValidator filePathValidator,
+      S3StorageProperties s3Properties,
+      AzureBlobStoreAdmin azureBlobStoreAdmin,
+      AzureBlobStoreProvider azureBlobStoreProvider,
+      BlobStorageRegistry blobStorageRegistry,
+      Environment environment) {
     this.blobStoreDao = blobStoreDao;
     this.s3BlobStoreAdmin = s3BlobStoreAdmin;
     this.fileBlobStoreAdmin = fileBlobStoreAdmin;
     this.fileBlobStorageFactory = fileBlobStorageFactory;
     this.filePathValidator = filePathValidator;
     this.s3Properties = s3Properties;
+    this.azureBlobStoreAdmin = azureBlobStoreAdmin;
+    this.azureBlobStoreProvider = azureBlobStoreProvider;
     this.blobStorageRegistry = blobStorageRegistry;
     this.environment = environment;
   }
@@ -87,6 +142,7 @@ public class BlobStoresController {
     }
     BlobStoreRecord record = toCreateRecord(name, request);
     validateFileRecord(record);
+    validateAzureRecord(record);
     BlobStoreRecord stored = blobStoreDao.findById(blobStoreDao.insert(record)).orElseThrow();
     refreshBlobStoreCatalog();
     return toView(stored, summary(stored), isConfigured(stored), "database");
@@ -98,6 +154,7 @@ public class BlobStoresController {
         .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Blob store not found"));
     BlobStoreRecord updated = toUpdateRecord(existing, request);
     validateFileRecord(updated);
+    validateAzureRecord(updated);
     blobStoreDao.updateById(updated);
     refreshBlobStoreCatalog();
     BlobStoreRecord stored = blobStoreDao.findById(id).orElseThrow();
@@ -124,7 +181,16 @@ public class BlobStoresController {
     if (isFileStore(record)) {
       return toProbeResult(fileBlobStoreAdmin.probeReadWrite(toFileConfig(record)));
     }
+    if (isAzureStore(record)) {
+      return toProbeResult(azureBlobStoreAdmin.probeReadWrite(toAzureConfig(record)));
+    }
     return toProbeResult(s3BlobStoreAdmin.probeReadWrite(toS3Config(record)));
+  }
+
+  @DeleteMapping("/{id}")
+  public ResponseEntity<Void> delete(@PathVariable("id") long id) {
+    deletionService.deleteEmpty(id);
+    return ResponseEntity.noContent().build();
   }
 
   @ExceptionHandler(ResponseStatusException.class)
@@ -148,6 +214,19 @@ public class BlobStoresController {
           "",
           fileAttributes(required(request.path(), "path")));
     }
+    if (isAzureRequest(request, null)) {
+      return new BlobStoreRecord(
+          null,
+          name,
+          BlobStoreTypes.AZURE,
+          valueOrDefault(request.endpoint(), null),
+          null,
+          required(azureContainer(request), "bucket"),
+          valueOrDefault(request.prefix(), ""),
+          azureAttributes(request, null, nodeDefaultAzureCredentialType()));
+    }
+    String engine = normalizeS3Engine(valueOrDefault(request.engine(), s3Properties.getEngine()));
+    String source = credentialSource(request.credentialSource(), engine);
     return new BlobStoreRecord(
         null,
         name,
@@ -157,9 +236,9 @@ public class BlobStoresController {
         required(request.bucket(), "bucket"),
         valueOrDefault(request.prefix(), ""),
         s3Attributes(
-            valueOrDefault(request.engine(), s3Properties.getEngine()),
-            required(request.accessKey(), "accessKey"),
-            required(request.secretKey(), "secretKey"),
+            engine,
+            createCredential(request.accessKey(), "accessKey", source),
+            createCredential(request.secretKey(), "secretKey", source),
             request.pathStyleAccess() == null ? s3Properties.isPathStyleAccess() : request.pathStyleAccess(),
             request.multipartThresholdBytes() == null
                 ? s3Properties.getMultipartThresholdBytes()
@@ -186,6 +265,24 @@ public class BlobStoresController {
               request.path(),
               stringAttr(existing.attributes(), FileBlobStoreConfig.ATTR_PATH, ""))));
     }
+    if (isAzureRequest(request, existing)) {
+      return new BlobStoreRecord(
+          existing.id(),
+          existing.name(),
+          BlobStoreTypes.AZURE,
+          // Omitted keeps the stored value; an explicit blank clears it so the endpoint is derived
+          // again and the prefix is removed.
+          request.endpoint() == null ? existing.endpoint() : valueOrDefault(request.endpoint(), null),
+          null,
+          required(valueOrDefault(azureContainer(request), existing.bucket()), "bucket"),
+          request.prefix() == null
+              ? (existing.prefix() == null ? "" : existing.prefix())
+              : request.prefix().trim(),
+          azureAttributes(request, existing, nodeDefaultAzureCredentialType()));
+    }
+    String engine = normalizeS3Engine(valueOrDefault(
+        request.engine(), stringAttr(existing.attributes(), "engine", s3Properties.getEngine())));
+    String source = credentialSource(request.credentialSource(), engine);
     return new BlobStoreRecord(
         existing.id(),
         existing.name(),
@@ -195,15 +292,9 @@ public class BlobStoresController {
         required(request.bucket(), "bucket"),
         valueOrDefault(request.prefix(), ""),
         s3Attributes(
-            valueOrDefault(
-                request.engine(),
-                stringAttr(existing.attributes(), "engine", s3Properties.getEngine())),
-            valueOrDefault(
-                request.accessKey(),
-                stringAttr(existing.attributes(), "accessKey", s3Properties.getAccessKey())),
-            valueOrDefault(
-                request.secretKey(),
-                stringAttr(existing.attributes(), "secretKey", s3Properties.getSecretKey())),
+            engine,
+            updateCredential(request.accessKey(), "accessKey", source, existing, s3Properties.getAccessKey()),
+            updateCredential(request.secretKey(), "secretKey", source, existing, s3Properties.getSecretKey()),
             request.pathStyleAccess() == null
                 ? boolAttr(existing.attributes(), "pathStyleAccess", s3Properties.isPathStyleAccess())
                 : request.pathStyleAccess(),
@@ -268,6 +359,9 @@ public class BlobStoresController {
       if (isFileStore(record)) {
         return toSummary(fileBlobStoreAdmin.summary(toFileConfig(record)));
       }
+      if (isAzureStore(record)) {
+        return toSummary(azureBlobStoreAdmin.summary(toAzureConfig(record)));
+      }
       return toSummary(s3BlobStoreAdmin.summary(toS3Config(record)));
     } catch (RuntimeException e) {
       return new BlobStoreSummary(
@@ -294,8 +388,8 @@ public class BlobStoresController {
         valueOrDefault(record.region(), s3Properties.getRegion()),
         valueOrDefault(record.bucket(), s3Properties.getBucket()),
         valueOrDefault(record.prefix(), ""),
-        stringAttr(record.attributes(), "accessKey", s3Properties.getAccessKey()),
-        stringAttr(record.attributes(), "secretKey", s3Properties.getSecretKey()),
+        S3BlobStoreConfig.credentialAttribute(record.attributes(), "accessKey", s3Properties.getAccessKey()),
+        S3BlobStoreConfig.credentialAttribute(record.attributes(), "secretKey", s3Properties.getSecretKey()),
         boolAttr(record.attributes(), "pathStyleAccess", s3Properties.isPathStyleAccess()),
         intAttr(record.attributes(), "maxConnections", s3Properties.getMaxConnections()),
         intAttr(record.attributes(), "connectionTimeoutMs", s3Properties.getConnectionTimeoutMs()),
@@ -315,7 +409,7 @@ public class BlobStoresController {
   }
 
   private boolean isConfigured(BlobStoreRecord record) {
-    return !isFileStore(record) && record.name().equals(s3Properties.getName());
+    return !isFileStore(record) && !isAzureStore(record) && record.name().equals(s3Properties.getName());
   }
 
   private static Map<String, Object> s3Attributes(
@@ -326,6 +420,11 @@ public class BlobStoresController {
       long multipartThresholdBytes,
       long multipartPartSizeBytes,
       int multipartConcurrency) {
+    try {
+      S3BlobStoreConfig.validateCredentials(engine, accessKey, secretKey);
+    } catch (IllegalArgumentException e) {
+      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage(), e);
+    }
     Map<String, Object> attributes = new LinkedHashMap<>();
     attributes.put("engine", normalizeS3Engine(engine));
     attributes.put("accessKey", accessKey);
@@ -335,6 +434,32 @@ public class BlobStoresController {
     attributes.put("multipartPartSizeBytes", Math.max(5L * 1024 * 1024, multipartPartSizeBytes));
     attributes.put("multipartConcurrency", Math.max(1, multipartConcurrency));
     return attributes;
+  }
+
+  private static String credentialSource(String value, String engine) {
+    String source = normalize(value);
+    if (!source.isEmpty() && !source.equals("static") && !source.equals("default")) {
+      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "credentialSource must be static or default");
+    }
+    if (source.equals("default") && Engine.fromValue(engine) == Engine.OSS_NATIVE) {
+      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "oss-native requires static credentials");
+    }
+    return source;
+  }
+
+  private static String createCredential(String value, String field, String source) {
+    if (source.equals("default")) return "";
+    return source.equals("static") ? required(value, field) : valueOrDefault(value, "");
+  }
+
+  private static String updateCredential(
+      String value, String field, String source, BlobStoreRecord existing, String fallback) {
+    if (source.equals("default")) return "";
+    // Preserve the existing edit contract: blank input keeps the saved secret. An explicit
+    // credentialSource=default clears both attributes, including any legacy global fallback.
+    String resolved = valueOrDefault(value,
+        S3BlobStoreConfig.credentialAttribute(existing.attributes(), field, fallback));
+    return source.equals("static") ? required(resolved, field) : resolved;
   }
 
   private static Map<String, Object> fileAttributes(String path) {
@@ -399,9 +524,19 @@ public class BlobStoresController {
       boolean configured,
       String source) {
     boolean fileStore = isFileStore(record);
+    boolean azureStore = !fileStore && isAzureStore(record);
+    AzureBlobStoreConfig azureConfig = azureStore ? toAzureConfig(record) : null;
+    // S3-only settings stay absent for other backends instead of reporting misleading defaults.
+    boolean s3Store = !fileStore && !azureStore;
     String engine = fileStore
         ? FileBlobStoreConfig.ENGINE
-        : normalizeS3Engine(stringAttr(record.attributes(), "engine", s3Properties.getEngine()));
+        : azureStore
+            ? BlobStoreTypes.AZURE
+            : normalizeS3Engine(stringAttr(record.attributes(), "engine", s3Properties.getEngine()));
+    boolean accessConfigured = s3Store && !S3BlobStoreConfig.credentialAttribute(
+        record.attributes(), "accessKey", s3Properties.getAccessKey()).isBlank();
+    boolean secretConfigured = s3Store && !S3BlobStoreConfig.credentialAttribute(
+        record.attributes(), "secretKey", s3Properties.getSecretKey()).isBlank();
     return new BlobStoreView(
         record.id(),
         record.name(),
@@ -414,19 +549,30 @@ public class BlobStoresController {
         record.prefix(),
         fileStore ? path(record) : "",
         summary == null ? "" : summary.resolvedPath(),
-        fileStore ? false : boolAttr(record.attributes(), "pathStyleAccess", s3Properties.isPathStyleAccess()),
-        fileStore ? 0 : longAttr(record.attributes(), "multipartThresholdBytes", s3Properties.getMultipartThresholdBytes()),
-        fileStore ? 0 : longAttr(record.attributes(), "multipartPartSizeBytes", s3Properties.getMultipartPartSizeBytes()),
-        fileStore ? 0 : intAttr(record.attributes(), "multipartConcurrency", s3Properties.getMultipartConcurrency()),
+        s3Store && boolAttr(record.attributes(), "pathStyleAccess", s3Properties.isPathStyleAccess()),
+        s3Store ? longAttr(record.attributes(), "multipartThresholdBytes", s3Properties.getMultipartThresholdBytes()) : 0,
+        s3Store ? longAttr(record.attributes(), "multipartPartSizeBytes", s3Properties.getMultipartPartSizeBytes()) : 0,
+        s3Store ? intAttr(record.attributes(), "multipartConcurrency", s3Properties.getMultipartConcurrency()) : 0,
         configured,
         source,
         summary != null && summary.bucketExists(),
         summary == null ? 0 : summary.objectCount(),
         summary == null ? 0 : summary.totalSize(),
         "",
-        !fileStore && !stringAttr(record.attributes(), "accessKey", "").isBlank(),
-        !fileStore && !stringAttr(record.attributes(), "secretKey", "").isBlank(),
-        summary == null ? "" : summary.message());
+        accessConfigured,
+        secretConfigured,
+        summary == null ? "" : summary.message(),
+        fileStore
+            ? ""
+            : azureStore
+                ? azureConfig.credentialType().id()
+                : (accessConfigured || secretConfigured ? "static" : "default"),
+        azureConfig == null ? "" : azureConfig.accountName(),
+        azureConfig == null ? "" : azureConfig.clientId(),
+        azureConfig == null ? "" : azureConfig.tenantId(),
+        azureConfig == null ? "" : azureConfig.tokenFilePath(),
+        azureConfig != null && !azureConfig.accountKey().isBlank(),
+        azureConfig != null && !azureConfig.sasToken().isBlank());
   }
 
   private static String lifecycleState(BlobStoreRecord record, boolean configured, BlobStoreSummary summary) {
@@ -496,6 +642,163 @@ public class BlobStoresController {
     return false;
   }
 
+  private boolean isAzureStore(BlobStoreRecord record) {
+    return azureBlobStoreProvider != null && azureBlobStoreProvider.supports(toDescriptor(record));
+  }
+
+  private boolean isAzureRequest(BlobStoreRequest request, BlobStoreRecord existing) {
+    if (isAzureKeyword(normalize(request.type())) || isAzureKeyword(normalize(request.engine()))) {
+      return true;
+    }
+    if (request.type() == null && request.engine() == null && existing != null) {
+      return isAzureStore(existing);
+    }
+    return false;
+  }
+
+  private static boolean isAzureKeyword(String value) {
+    return BlobStoreTypes.AZURE.equals(value) || "azure-blob".equals(value);
+  }
+
+  private AzureBlobStoreConfig toAzureConfig(BlobStoreRecord record) {
+    return azureBlobStoreProvider.configFor(toDescriptor(record));
+  }
+
+  private static BlobStoreDescriptor toDescriptor(BlobStoreRecord record) {
+    return new BlobStoreDescriptor(
+        record.id() == null ? 0 : record.id(),
+        record.name(),
+        record.type(),
+        record.endpoint(),
+        record.region(),
+        record.bucket(),
+        record.prefix(),
+        record.attributes());
+  }
+
+  private void validateAzureRecord(BlobStoreRecord record) {
+    if (!isAzureStore(record)) {
+      return;
+    }
+    try {
+      toAzureConfig(record).validate();
+    } catch (IllegalArgumentException e) {
+      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage(), e);
+    }
+  }
+
+  private static String azureContainer(BlobStoreRequest request) {
+    return valueOrDefault(request.container(), request.bucket());
+  }
+
+  /** {@code kkrepo.storage.azure.credential-type}, used when neither request nor store names a mode. */
+  private AzureCredentialType nodeDefaultAzureCredentialType() {
+    return azureBlobStoreProvider == null
+        ? AzureCredentialType.DEFAULT
+        : azureBlobStoreProvider.defaultCredentialType();
+  }
+
+  private static Map<String, Object> azureAttributes(
+      BlobStoreRequest request, BlobStoreRecord existing, AzureCredentialType nodeDefault) {
+    Map<String, Object> previous =
+        existing == null || existing.attributes() == null ? Map.of() : existing.attributes();
+    AzureCredentialType credentialType = azureCredentialType(request, previous, nodeDefault);
+    Map<String, Object> attributes = new LinkedHashMap<>();
+    attributes.put("engine", BlobStoreTypes.AZURE);
+    attributes.put(AzureBlobStoreProvider.ATTR_CREDENTIAL_TYPE, credentialType.id());
+    attributes.put(AzureBlobStoreProvider.ATTR_ACCOUNT_NAME, azureValue(
+        request.accountName(), previous, AzureBlobStoreProvider.ATTR_ACCOUNT_NAME, true));
+    attributes.put(AzureBlobStoreProvider.ATTR_CLIENT_ID, azureValue(
+        request.clientId(), previous, AzureBlobStoreProvider.ATTR_CLIENT_ID,
+        credentialType.usesClientId()));
+    attributes.put(AzureBlobStoreProvider.ATTR_TENANT_ID, azureValue(
+        request.tenantId(), previous, AzureBlobStoreProvider.ATTR_TENANT_ID,
+        credentialType.usesTenant()));
+    attributes.put(AzureBlobStoreProvider.ATTR_TOKEN_FILE_PATH, azureValue(
+        request.tokenFilePath(), previous, AzureBlobStoreProvider.ATTR_TOKEN_FILE_PATH,
+        credentialType.usesTokenFilePath()));
+    attributes.put(AzureBlobStoreProvider.ATTR_AUTHORITY_HOST, azureValue(
+        request.authorityHost(), previous, AzureBlobStoreProvider.ATTR_AUTHORITY_HOST,
+        credentialType.usesTenant()));
+    putAzureSecret(attributes, AzureBlobStoreProvider.ATTR_ACCOUNT_KEY, request.accountKey(), previous,
+        credentialType == AzureCredentialType.ACCOUNT_KEY);
+    putAzureSecret(attributes, AzureBlobStoreProvider.ATTR_SAS_TOKEN, request.sasToken(), previous,
+        credentialType == AzureCredentialType.SAS);
+    return attributes;
+  }
+
+  /**
+   * An explicit mode is parsed strictly so a typo is rejected instead of silently selecting the
+   * default chain. An omitted mode keeps the stored one, and a new store takes the node default.
+   */
+  private static AzureCredentialType azureCredentialType(
+      BlobStoreRequest request, Map<String, Object> previous, AzureCredentialType nodeDefault) {
+    if (request.credentialType() == null || request.credentialType().isBlank()) {
+      String stored = stringAttr(previous, AzureBlobStoreProvider.ATTR_CREDENTIAL_TYPE, "");
+      return stored.isEmpty() ? nodeDefault : AzureCredentialType.fromValue(stored);
+    }
+    try {
+      return AzureCredentialType.parse(request.credentialType());
+    } catch (IllegalArgumentException e) {
+      throw new ResponseStatusException(HttpStatus.BAD_REQUEST, e.getMessage(), e);
+    }
+  }
+
+  /**
+   * An omitted field keeps the stored value and an explicit blank clears it. Settings the selected
+   * credential mode does not read are dropped so no misleading value is left on the store.
+   */
+  private static String azureValue(
+      String requested, Map<String, Object> previous, String key, boolean used) {
+    if (!used) {
+      return "";
+    }
+    return requested == null ? stringAttr(previous, key, "") : requested.trim();
+  }
+
+  /**
+   * Secrets follow the S3 edit contract: a blank or omitted value keeps the stored secret, so the
+   * admin console can leave the field empty on edit. Without a stored secret the attribute is left
+   * absent, so the provider applies the node default ({@code kkrepo.storage.azure.account-key} or
+   * {@code sas-token}). A mode that cannot use the secret stores an explicit blank instead, which
+   * clears it when switching to a platform identity and keeps a node default from leaking in.
+   */
+  private static void putAzureSecret(
+      Map<String, Object> attributes, String key, String requested, Map<String, Object> previous,
+      boolean used) {
+    if (!used) {
+      attributes.put(key, "");
+      return;
+    }
+    String secret = valueOrDefault(requested, stringAttr(previous, key, ""));
+    if (!secret.isEmpty()) {
+      attributes.put(key, secret);
+    }
+  }
+
+  private static BlobStoreSummary toSummary(AzureContainerSummary summary) {
+    return new BlobStoreSummary(
+        summary.name(),
+        summary.endpoint(),
+        "",
+        summary.container(),
+        "",
+        "",
+        summary.state(),
+        summary.containerExists(),
+        summary.objectCount(),
+        summary.totalSize(),
+        summary.message());
+  }
+
+  private static BlobStoreProbeResult toProbeResult(AzureProbeResult result) {
+    return new BlobStoreProbeResult(
+        result.ok(),
+        result.objectKey(),
+        result.message(),
+        toSummary(result.summary()));
+  }
+
   private static boolean isFileStore(BlobStoreRecord record) {
     return FileBlobStoreConfig.isFileStore(record.type(), record.attributes());
   }
@@ -539,7 +842,14 @@ public class BlobStoresController {
       String accessKey,
       boolean accessKeyConfigured,
       boolean secretConfigured,
-      String message) {
+      String message,
+      String credentialSource,
+      String accountName,
+      String clientId,
+      String tenantId,
+      String tokenFilePath,
+      boolean accountKeyConfigured,
+      boolean sasTokenConfigured) {
   }
 
   public record BlobStoreRequest(
@@ -556,7 +866,35 @@ public class BlobStoresController {
       Boolean pathStyleAccess,
       Long multipartThresholdBytes,
       Long multipartPartSizeBytes,
-      Integer multipartConcurrency) {
+      Integer multipartConcurrency,
+      String credentialSource,
+      String accountName,
+      String container,
+      String credentialType,
+      String accountKey,
+      String sasToken,
+      String clientId,
+      String tenantId,
+      String tokenFilePath,
+      String authorityHost) {
+    public BlobStoreRequest(
+        String name, String type, String engine, String endpoint, String region, String bucket,
+        String prefix, String path, String accessKey, String secretKey, Boolean pathStyleAccess,
+        Long multipartThresholdBytes, Long multipartPartSizeBytes, Integer multipartConcurrency,
+        String credentialSource) {
+      this(name, type, engine, endpoint, region, bucket, prefix, path, accessKey, secretKey, pathStyleAccess,
+          multipartThresholdBytes, multipartPartSizeBytes, multipartConcurrency, credentialSource,
+          null, null, null, null, null, null, null, null, null);
+    }
+
+    public BlobStoreRequest(
+        String name, String type, String engine, String endpoint, String region, String bucket,
+        String prefix, String path, String accessKey, String secretKey, Boolean pathStyleAccess,
+        Long multipartThresholdBytes, Long multipartPartSizeBytes, Integer multipartConcurrency) {
+      this(name, type, engine, endpoint, region, bucket, prefix, path, accessKey, secretKey, pathStyleAccess,
+          multipartThresholdBytes, multipartPartSizeBytes, multipartConcurrency, null);
+    }
+
     public BlobStoreRequest(
         String name,
         String type,
@@ -570,7 +908,7 @@ public class BlobStoresController {
         String secretKey,
         Boolean pathStyleAccess) {
       this(name, type, engine, endpoint, region, bucket, prefix, path, accessKey, secretKey, pathStyleAccess,
-          null, null, null);
+          null, null, null, null);
     }
   }
 

@@ -1,6 +1,7 @@
 package com.github.klboke.kkrepo.server.rubygems;
 
 import com.github.klboke.kkrepo.core.RepositoryType;
+import com.github.klboke.kkrepo.core.http.UriPathDecoder;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AssetDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryIndexRebuildDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.AssetBlobRecord;
@@ -84,6 +85,10 @@ public class RubygemsService {
     String path = pathOnly(fullPath);
     if (runtime.type() == RepositoryType.PROXY) {
       return proxyGet(runtime, fullPath, headOnly);
+    }
+    if (runtime.type() == RepositoryType.GROUP && RubygemsGroupIndex.handles(path)) {
+      return new RubygemsGroupIndex(runtime, (member, memberPath) -> get(member, memberPath, false))
+          .get(path.equals("api/v1/dependencies") ? fullPath : path, headOnly);
     }
     return switch (path) {
       case "", SPECS_PATH -> specs(runtime, SpecMode.ALL, headOnly);
@@ -256,7 +261,7 @@ public class RubygemsService {
   }
 
   private MavenResponse compactInfo(RepositoryRuntime runtime, String name, boolean headOnly) {
-    String decoded = decode(name);
+    String decoded = UriPathDecoder.decodeSegment(name);
     String path = infoPath(decoded);
     if (runtime.isHosted()) {
       Optional<MavenResponse> stored = storedGenerated(runtime, path, headOnly);
@@ -311,15 +316,29 @@ public class RubygemsService {
   }
 
   private MavenResponse quickMarshal(RepositoryRuntime runtime, String path, boolean headOnly) {
+    if (runtime.type() == RepositoryType.GROUP) {
+      // A proxy can serve the quick spec before the gem itself has ever been cached.
+      for (RepositoryRuntime member : runtime.members()) {
+        try {
+          MavenResponse response = get(member, path, headOnly);
+          if (response.status() != 404) return response;
+          response.closeBodyIfOpen();
+        } catch (MavenExceptions.MavenNotFoundException | MavenExceptions.BadUpstreamException
+            | MavenExceptions.MethodNotAllowed ignored) {
+          // Follow the same member fallback policy as raw group reads.
+        }
+      }
+      return MavenResponse.noBody(404);
+    }
+    String filename = path.substring("quick/Marshal.4.8/".length(),
+        path.length() - ".gemspec.rz".length());
+    Optional<GemMetadata> existing = gemForFullName(runtime, filename);
+    if (existing.isEmpty()) return MavenResponse.noBody(404);
     if (runtime.isHosted()) {
       Optional<MavenResponse> stored = storedGenerated(runtime, path, headOnly);
       if (stored.isPresent()) return stored.get();
     }
-    String filename = path.substring("quick/Marshal.4.8/".length(),
-        path.length() - ".gemspec.rz".length());
-    GemMetadata gem = gemForFullName(runtime, filename)
-        .orElseGet(() -> gemFromPath("gems/" + filename + ".gem")
-            .orElse(new GemMetadata(filename, "0", "ruby", List.of())));
+    GemMetadata gem = existing.orElseThrow();
     byte[] response = deflateLikeRuby(rubyMarshalGemSpecification(gem));
     writeGeneratedIfHosted(runtime, path, response, GEM_CONTENT_TYPE);
     return bytes(response, GEM_CONTENT_TYPE, headOnly);
@@ -377,6 +396,12 @@ public class RubygemsService {
       writeQuickSpec(runtime, changed);
     }
     enqueueGeneratedMetadataRebuild(runtime);
+  }
+
+  /** Repairs derived metadata after the management adapter removes an exact package identity. */
+  public void refreshMetadataAfterAdministrativeDelete(RepositoryRuntime runtime, String path) {
+    gemFromPath(path).ifPresent(gem -> refreshGeneratedMetadataAfterDelete(
+        runtime, MavenResponse.noBody(204), new GemIdentity(gem.name(), gem.version(), gem.platform())));
   }
 
   private void refreshGeneratedMetadataAfterDelete(
@@ -621,7 +646,7 @@ public class RubygemsService {
       int eq = pair.indexOf('=');
       String key = eq < 0 ? pair : pair.substring(0, eq);
       String value = eq < 0 ? "" : pair.substring(eq + 1);
-      result.put(decode(key), decode(value));
+      result.put(decodeFormValue(key), decodeFormValue(value));
     }
     return result;
   }
@@ -633,7 +658,7 @@ public class RubygemsService {
     if (raw == null || raw.isBlank()) return Set.of();
     Set<String> names = new LinkedHashSet<>();
     for (String name : raw.split(",")) {
-      String decoded = decode(name).trim();
+      String decoded = name.trim(); // query() already decoded this parameter once.
       if (!decoded.isBlank()) names.add(decoded);
     }
     return names;
@@ -656,7 +681,7 @@ public class RubygemsService {
 
   static GemMetadata parseMetadataYaml(String yaml) {
     String name = null;
-    String version = null;
+    String version = parseNestedVersion(yaml);
     String platform = "ruby";
     String summary = "";
     List<String> authors = new ArrayList<>();
@@ -670,13 +695,27 @@ public class RubygemsService {
     for (String rawLine : yaml.split("\\R")) {
       String line = rawLine.stripTrailing();
       String trimmed = line.trim();
-      if (trimmed.equals("dependencies:")) {
+      if (line.equals("dependencies:")) {
         inDependencies = true;
         inAuthors = false;
         continue;
       }
+      // RubyGems emits more root fields after the dependency sequence, including
+      // required_ruby_version and requirements: []. They must not overwrite the
+      // final dependency's requirements. Finalize before reading that root field.
+      if (inDependencies && !line.isEmpty() && !Character.isWhitespace(line.charAt(0))
+          && !trimmed.startsWith("-") && trimmed.contains(":")) {
+        if (dependencyName != null) {
+          dependencies.add(new GemDependency(dependencyName, dependencyRequirements));
+        }
+        dependencyName = null;
+        dependencyRequirements = List.of();
+        pendingRequirementOperator = null;
+        inDependencies = false;
+        inRequirements = false;
+      }
       if (!inDependencies) {
-        if (trimmed.equals("authors:")) {
+        if (line.equals("authors:")) {
           inAuthors = true;
           continue;
         }
@@ -688,13 +727,13 @@ public class RubygemsService {
         if (!trimmed.startsWith("-") && trimmed.contains(":")) {
           inAuthors = false;
         }
-        if (trimmed.startsWith("name:")) name = cleanYaml(trimmed.substring("name:".length()));
-        if (version == null && trimmed.startsWith("version:")
-            && !trimmed.contains("!ruby/object:Gem::Version")) {
+        if (line.startsWith("name:")) name = cleanYaml(line.substring("name:".length()));
+        if (version == null && line.startsWith("version:")
+            && !line.contains("!ruby/object:Gem::Version")) {
           version = cleanYaml(trimmed.substring("version:".length()));
         }
-        if (trimmed.startsWith("platform:")) platform = cleanYaml(trimmed.substring("platform:".length()));
-        if (trimmed.startsWith("summary:")) summary = cleanYaml(trimmed.substring("summary:".length()));
+        if (line.startsWith("platform:")) platform = cleanYaml(trimmed.substring("platform:".length()));
+        if (line.startsWith("summary:")) summary = cleanYaml(trimmed.substring("summary:".length()));
         continue;
       }
       if (trimmed.startsWith("- !ruby/object:Gem::Dependency")) {
@@ -732,14 +771,8 @@ public class RubygemsService {
         String requirement = cleanYaml(trimmed.substring(1));
         if (!requirement.isBlank()) ((ArrayList<String>) dependencyRequirements).add(requirement);
       }
-      if (version == null && trimmed.startsWith("version:")) {
-        version = cleanYaml(trimmed.substring("version:".length()));
-      }
     }
     if (dependencyName != null) dependencies.add(new GemDependency(dependencyName, dependencyRequirements));
-    if (version == null) {
-      version = parseNestedVersion(yaml);
-    }
     if (name == null || version == null) {
       throw new MavenExceptions.MethodNotAllowed("Invalid RubyGems metadata");
     }
@@ -755,11 +788,11 @@ public class RubygemsService {
     boolean inVersion = false;
     for (String rawLine : yaml.split("\\R")) {
       String trimmed = rawLine.trim();
-      if (trimmed.equals("version: !ruby/object:Gem::Version")) {
+      if (rawLine.equals("version: !ruby/object:Gem::Version")) {
         inVersion = true;
         continue;
       }
-      if (inVersion && trimmed.startsWith("version:")) {
+      if (inVersion && rawLine.startsWith(" ") && trimmed.startsWith("version:")) {
         return cleanYaml(trimmed.substring("version:".length()));
       }
       if (inVersion && !trimmed.isBlank() && !trimmed.startsWith("version:")) {
@@ -1120,8 +1153,8 @@ public class RubygemsService {
     return out.toString();
   }
 
-  private static Map<String, Object> dependencyApiDependencies(List<GemDependency> dependencies) {
-    Map<String, Object> out = new LinkedHashMap<>();
+  private static List<List<String>> dependencyApiDependencies(List<GemDependency> dependencies) {
+    List<List<String>> out = new ArrayList<>();
     if (dependencies == null) {
       return out;
     }
@@ -1129,7 +1162,7 @@ public class RubygemsService {
       if (dep.name() == null || dep.name().isBlank()) {
         continue;
       }
-      out.put(dep.name(), dependencyApiRequirement(dep.requirements()));
+      out.add(List.of(dep.name(), dependencyApiRequirement(dep.requirements())));
     }
     return out;
   }
@@ -1260,7 +1293,7 @@ public class RubygemsService {
     return "?" + pathQuery + "&" + baseQuerySuffix.substring(1);
   }
 
-  private static String decode(String value) {
+  private static String decodeFormValue(String value) {
     return URLDecoder.decode(value == null ? "" : value, StandardCharsets.UTF_8);
   }
 

@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.klboke.kkrepo.core.BlobStorage;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AssetDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.NpmReleaseIndexDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.PersistenceHashes;
 import com.github.klboke.kkrepo.persistence.jdbc.api.ProxyStateDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.AssetRecord;
 import com.github.klboke.kkrepo.protocol.npm.NpmMinimumReleaseAge;
@@ -44,6 +45,9 @@ import org.springframework.stereotype.Service;
 
 @Service
 public class NpmProxyService {
+  @org.springframework.beans.factory.annotation.Autowired
+  private com.github.klboke.kkrepo.server.proxy.ProgressiveProxyService streaming;
+
   private static final long[] BACKOFF_SECONDS = {30, 60, 120, 300, 600, 1800};
   private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {};
   private static final String FULL_METADATA_ATTRIBUTE = "npmFullMetadata";
@@ -181,7 +185,8 @@ public class NpmProxyService {
     }
     return switch (path.kind()) {
       case PACKAGE_ROOT, PACKAGE_VERSION -> getPackage(runtime, path.packageId(), repositoryBaseUrl, headOnly, variant);
-      case TARBALL -> getTarball(runtime, path.packageId(), path.tarballName(), headOnly);
+      // Revision suffixes belong to hosted DELETE routes; in proxy GET/HEAD they are URL data.
+      case TARBALL -> getTarball(runtime, path.packageId(), path.readTarballName(), path.rawPath(), headOnly);
       case DIST_TAGS -> getDistTags(runtime, path.packageId(), headOnly);
       default -> throw new NpmExceptions.NpmNotFoundException(path.rawPath());
     };
@@ -201,7 +206,7 @@ public class NpmProxyService {
     HttpRemoteFetcher.Request req = new HttpRemoteFetcher.Request(
         url, null, null, null, false)
         .withTimeoutProfile(HttpRemoteFetcher.TimeoutProfile.SEARCH)
-        .withRepository(runtime);
+        .withRepositoryForContent(runtime);
     try {
       return fetcher.fetchWithBodyRetry(req, "-/v1/search", result -> {
         int status = result.status();
@@ -250,8 +255,9 @@ public class NpmProxyService {
       if (cached.isPresent()) return hosted.getPackage(runtime, packageId, repositoryBaseUrl, headOnly, variant);
       throw new NpmExceptions.BadUpstreamException("Upstream temporarily blocked: " + runtime.proxyRemoteUrl());
     }
-    MavenResponse response = fetchAndCachePackage(runtime, packageId, repositoryBaseUrl, cached, headOnly, variant, now);
-    return response == null ? hosted.getPackage(runtime, packageId, repositoryBaseUrl, headOnly, variant) : response;
+    PackageFetch fetched = fetchAndCachePackage(runtime, packageId, repositoryBaseUrl, cached, headOnly, variant, now);
+    return fetched.response() == null
+        ? hosted.getPackage(runtime, packageId, repositoryBaseUrl, headOnly, variant) : fetched.response();
   }
 
   public MavenResponse getDistTags(RepositoryRuntime runtime, NpmPackageId packageId, boolean headOnly) {
@@ -284,10 +290,20 @@ public class NpmProxyService {
       NpmPackageId packageId,
       String tarballName,
       boolean headOnly) {
+    return getTarball(runtime, packageId, tarballName, packageId.tarballPath(tarballName), headOnly);
+  }
+
+  private MavenResponse getTarball(
+      RepositoryRuntime runtime,
+      NpmPackageId packageId,
+      String tarballName,
+      String rawPath,
+      boolean headOnly) {
     if (runtime.minimumReleaseAgeEnabled()) {
       enforceTarballReleaseAge(runtime, packageId, tarballName, clock.instant());
     }
     String path = packageId.tarballPath(tarballName);
+    com.github.klboke.kkrepo.server.proxy.ProgressiveProxyService.enableRanges(runtime, path);
     Optional<CachedAssetMetadata> cached = lookupCached(runtime, path);
     Instant now = clock.instant();
     if (cached.isPresent()
@@ -302,10 +318,8 @@ public class NpmProxyService {
       if (cached.isPresent()) return hosted.getTarball(runtime, packageId, tarballName, headOnly);
       throw new NpmExceptions.BadUpstreamException("Upstream temporarily blocked: " + runtime.proxyRemoteUrl());
     }
-    NpmAssetWriter.Stored stored = fetchAndCacheTarball(runtime, packageId, tarballName, cached, headOnly, now);
-    if (stored != null) {
-      return tarballResponseFromStored(stored, headOnly);
-    }
+    MavenResponse response = fetchAndCacheTarball(runtime, packageId, tarballName, rawPath, cached, headOnly, now);
+    if (response != null) return response;
     return hosted.getTarball(runtime, packageId, tarballName, headOnly);
   }
 
@@ -365,7 +379,7 @@ public class NpmProxyService {
         url, conditional.etag(), conditional.lastModified(), null, false)
         .withTimeoutProfile(HttpRemoteFetcher.TimeoutProfile.METADATA)
         .withAccept("application/json")
-        .withRepository(runtime);
+        .withRepositoryForContent(runtime);
     Instant priorVerification = cached.map(CachedAssetMetadata::lastUpdatedAt).orElse(null);
     Instant priorEvaluationTime = safeEvaluationTime(priorVerification, now);
     int minimumAge = runtime.minimumReleaseAgeMinutesOrDefault();
@@ -390,7 +404,7 @@ public class NpmProxyService {
               ? cached.get().withLastUpdatedAt(now)
               : cached.get().withLastUpdatedAtAndAttributes(now, attributes);
           return new PolicyPackage(
-              refreshed, policy.root(), policy.analysis(), now, now);
+              refreshed, policy.root(), policy.analysis(), now, now, true);
         }
         if (status >= 200 && status < 300) {
           negativeCache.invalidate(runtime, packageId.id());
@@ -400,7 +414,7 @@ public class NpmProxyService {
               PackageRootHolder.loaded(stored.packageRoot()),
               stored.analysis(),
               stored.lastModified(),
-              now);
+              now, true);
         }
         if (status == 404 || status == 410) {
           proxyStateDao.recordSuccess(runtime.id(), now);
@@ -576,6 +590,11 @@ public class NpmProxyService {
     if (indexed.get().maturityBoundaryCrossed()) {
       return false;
     }
+    if (indexed.get().releases().isEmpty() && indexed.get().status().releaseCount() > 0) {
+      // A legacy basename lockfile can alias a nested filename only when no other path competes.
+      // Full snapshot analysis retains separate identities and resolves that alias unambiguously.
+      return false;
+    }
     enforceIndexedTarballRows(
         runtime,
         packageId,
@@ -636,7 +655,7 @@ public class NpmProxyService {
             "Cached npm package root blob is missing for " + metadata.path())));
     NpmMinimumReleaseAge.Analysis analysis = releaseAgeCache.analysis(
         metadata, minimumAge, () -> loadIndexedAnalysis(metadata, minimumAge, root));
-    return new PolicyPackage(metadata, root, analysis, metadata.lastUpdatedAt(), evaluatedAt);
+    return new PolicyPackage(metadata, root, analysis, metadata.lastUpdatedAt(), evaluatedAt, false);
   }
 
   private NpmMinimumReleaseAge.Analysis loadIndexedAnalysis(
@@ -711,7 +730,8 @@ public class NpmProxyService {
       PackageRootHolder root,
       NpmMinimumReleaseAge.Analysis analysis,
       Instant lastModified,
-      Instant evaluatedAt) {
+      Instant evaluatedAt,
+      boolean revalidated) {
   }
 
   private static final class PackageRootHolder {
@@ -754,7 +774,10 @@ public class NpmProxyService {
     }
   }
 
-  private MavenResponse fetchAndCachePackage(
+  /** A successful cached response does not imply that upstream metadata was revalidated. */
+  private record PackageFetch(MavenResponse response, boolean revalidated) {}
+
+  private PackageFetch fetchAndCachePackage(
       RepositoryRuntime runtime,
       NpmPackageId packageId,
       String repositoryBaseUrl,
@@ -767,7 +790,7 @@ public class NpmProxyService {
     HttpRemoteFetcher.Request req = new HttpRemoteFetcher.Request(
         url, conditional.etag(), conditional.lastModified(), null, false)
         .withTimeoutProfile(HttpRemoteFetcher.TimeoutProfile.METADATA)
-        .withRepository(runtime);
+        .withRepositoryForContent(runtime);
     try {
       return fetcher.fetchWithBodyRetry(req, packageId.id(), result -> {
         int status = result.status();
@@ -781,27 +804,27 @@ public class NpmProxyService {
           assetMetadataCache.touchVerified(runtime.id(), packageId.id(), now, attributes);
           proxyStateDao.recordSuccess(runtime.id(), now);
           negativeCache.invalidate(runtime, packageId.id());
-          return null;
+          return new PackageFetch(null, true);
         }
         if (status >= 200 && status < 300) {
           negativeCache.invalidate(runtime, packageId.id());
           CachedPackage stored = persistPackage(runtime, packageId, result, now);
-          return packageResponse(packageId, repositoryBaseUrl, stored, headOnly, variant);
+          return new PackageFetch(packageResponse(packageId, repositoryBaseUrl, stored, headOnly, variant), true);
         }
         if (status == 404 || status == 410) {
           proxyStateDao.recordSuccess(runtime.id(), now);
           if (cached.isPresent()) {
-            return hosted.getPackage(runtime, packageId, repositoryBaseUrl, headOnly, variant);
+            return new PackageFetch(hosted.getPackage(runtime, packageId, repositoryBaseUrl, headOnly, variant), false);
           }
           if (status == 404) negativeCache.rememberNotFound(runtime, packageId.id());
           throw new NpmExceptions.NpmNotFoundException("Package '" + packageId.id() + "' not found");
         }
         handleFailure(runtime, cached, "Upstream returned " + status, now);
-        return null;
+        return new PackageFetch(null, false);
       });
     } catch (IOException e) {
       handleFailure(runtime, cached, "Upstream IO error: " + e.getMessage(), now);
-      return null;
+      return new PackageFetch(null, false);
     }
   }
 
@@ -885,22 +908,67 @@ public class NpmProxyService {
     }
   }
 
-  private NpmAssetWriter.Stored fetchAndCacheTarball(
+  /** Load shared metadata for the stateless resolver; stale responses are not URL revalidation. */
+  private Optional<Map<String, Object>> tarballMetadata(RepositoryRuntime runtime, NpmPackageId packageId) {
+    Optional<CachedAssetMetadata> metadata = lookupCached(runtime, packageId.id());
+    Instant now = clock.instant();
+    if (metadata.isPresent() && isFresh(runtime, metadata.get(),
+        runtime.metadataMaxAgeMinutesOrDefault(), now, NexusCacheType.METADATA)) {
+      return hosted.packageRoot(runtime, packageId);
+    }
+    try {
+      if (runtime.minimumReleaseAgeEnabled()) {
+        PolicyPackage resolved = resolvePolicyPackage(runtime, packageId, now);
+        return resolved.revalidated() || isFresh(runtime, resolved.metadata(),
+            runtime.metadataMaxAgeMinutesOrDefault(), now, NexusCacheType.METADATA)
+            ? Optional.of(resolved.root().get()) : Optional.empty();
+      }
+      if (negativeCache.isNotFoundCached(runtime, packageId.id()) || proxyStateDao.isBlocked(runtime.id(), now)) {
+        return Optional.empty();
+      }
+      PackageFetch fetched = fetchAndCachePackage(runtime, packageId, runtime.name(), metadata,
+          true, NpmPackumentVariant.FULL, now);
+      if (!fetched.revalidated()) return Optional.empty();
+    } catch (NpmExceptions.NpmNotFoundException | NpmExceptions.BadUpstreamException unavailableMetadata) {
+      return Optional.empty();
+    }
+    return hosted.packageRoot(runtime, packageId);
+  }
+
+  private MavenResponse fetchAndCacheTarball(
       RepositoryRuntime runtime,
       NpmPackageId packageId,
       String tarballName,
+      String rawPath,
       Optional<CachedAssetMetadata> cached,
       boolean headOnly,
       Instant now) {
-    String url = buildRemoteUrl(runtime.proxyRemoteUrl(), packageId.tarballPath(tarballName));
-    Conditional conditional = conditional(cached);
-    HttpRemoteFetcher.Request req = new HttpRemoteFetcher.Request(
-        url, conditional.etag(), conditional.lastModified(), null, false)
-        .withTimeoutProfile(HttpRemoteFetcher.TimeoutProfile.CONTENT)
-        .withRepository(runtime);
+    NpmTarballResolver.Download download = NpmTarballResolver.resolve(
+        runtime.proxyRemoteUrl(), packageId, tarballName, rawPath,
+        tarballMetadata(runtime, packageId).orElse(null));
+    String url = download.upstreamUrl();
+    String sourceHash = java.util.HexFormat.of().formatHex(PersistenceHashes.sha256(url));
+    boolean sameSource = cached.filter(asset -> asset.blob() != null)
+        .map(asset -> sourceHash.equals(stringAttr(asset.blob().attributes(), "npmTarballSourceUrlHash")))
+        .orElse(false);
+    Conditional conditional = sameSource ? conditional(cached) : new Conditional(null, null);
+    boolean conditionalRequest = conditional.etag() != null || conditional.lastModified() != null;
+    HttpRemoteFetcher.Request req;
     try {
-      return fetcher.fetchWithBodyRetry(req, packageId.tarballPath(tarballName), result -> {
+      req = new HttpRemoteFetcher.Request(url, conditional.etag(), conditional.lastModified(), null, false)
+          .withTimeoutProfile(HttpRemoteFetcher.TimeoutProfile.CONTENT)
+          .withRepositoryRedirectBoundary(runtime);
+    } catch (com.github.klboke.kkrepo.server.security.SecurityValidationException denied) {
+      throw new NpmExceptions.BadUpstreamException(denied.getMessage());
+    }
+    try {
+      return com.github.klboke.kkrepo.server.proxy.ProgressiveProxyService.fetchMaven(
+          streaming, fetcher, req, download.assetPath(), runtime,
+          !headOnly && cached.isEmpty(), null, null, result -> {
         int status = result.status();
+        if (status == 304 && !conditionalRequest) {
+          throw new NpmExceptions.BadUpstreamException("Unsolicited tarball not-modified response");
+        }
         if (status == 304 && cached.isPresent()) {
           Map<String, Object> attributes = refreshedAttributes(runtime, cached.get(), NexusCacheType.CONTENT, now);
           if (attributes == null) {
@@ -915,7 +983,8 @@ public class NpmProxyService {
         }
         if (status >= 200 && status < 300) {
           negativeCache.invalidate(runtime, packageId.tarballPath(tarballName));
-          return persistTarball(runtime, packageId, tarballName, result, !headOnly, now);
+          return tarballResponseFromStored(
+              persistTarball(runtime, packageId, tarballName, result, sourceHash, !headOnly, now), headOnly);
         }
         if (status == 404 || status == 410) {
           proxyStateDao.recordSuccess(runtime.id(), now);
@@ -940,6 +1009,7 @@ public class NpmProxyService {
       NpmPackageId packageId,
       String tarballName,
       HttpRemoteFetcher.Result result,
+      String sourceHash,
       boolean keepResponseFile,
       Instant now) {
     String contentType = result.contentType();
@@ -949,9 +1019,12 @@ public class NpmProxyService {
     }
     long blobStoreId = requireBlobStore(runtime);
     BlobStorage storage = blobStorageRegistry.forBlobStoreId(blobStoreId);
+    Map<String, String> attributes = remoteAttributes(result);
+    // Bind validators without storing signed query tokens or disabling normal blob deduplication.
+    if (!attributes.isEmpty()) attributes.put("npmTarballSourceUrlHash", sourceHash);
     NpmAssetWriter.Stored stored = writer.writeTarball(runtime, storage, blobStoreId, packageId,
         inferVersion(packageId, tarballName), tarballName, result.body(),
-        contentType, "proxy", ProxyRequestAudit.currentClientIp(), remoteAttributes(result), keepResponseFile);
+        contentType, "proxy", ProxyRequestAudit.currentClientIp(), attributes, keepResponseFile);
     updateCacheInfo(runtime, stored.asset(), NexusCacheType.CONTENT, now);
     proxyStateDao.recordSuccess(runtime.id(), now);
     return stored;
@@ -1038,6 +1111,7 @@ public class NpmProxyService {
   }
 
   private String inferVersion(NpmPackageId packageId, String tarballName) {
+    tarballName = NpmMetadata.extractTarballName(tarballName);
     String prefix = packageId.name() + "-";
     if (tarballName.startsWith(prefix) && tarballName.endsWith(".tgz")) {
       return tarballName.substring(prefix.length(), tarballName.length() - ".tgz".length());

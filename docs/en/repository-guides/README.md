@@ -15,6 +15,7 @@ the recipe combinations and protocol boundaries supported by each format.
 | --- | --- | --- | --- |
 | Maven | hosted / proxy / group | [Maven recipe](../client-recipes.md#maven) | [Maven Repository Guide](maven.md) |
 | npm | hosted / proxy / group | [npm recipe](../client-recipes.md#npm) | [npm Repository Guide](npm.md) |
+| OHPM / HarmonyOS | hosted / proxy / group | [OHPM recipe](../client-recipes.md#ohpm--harmonyos) | [OHPM Repository Guide](ohpm.md) |
 | PyPI | hosted / proxy / group | [PyPI recipe](../client-recipes.md#pypi) | [PyPI Repository Guide](pypi.md) |
 | Go | hosted / proxy / group | [Go recipe](../client-recipes.md#go) | [Go Repository Guide](go.md) |
 | Helm | hosted / proxy / group | [Helm recipe](../client-recipes.md#helm) | [Helm Repository Guide](helm.md) |
@@ -33,6 +34,7 @@ the recipe combinations and protocol boundaries supported by each format.
 | NuGet | hosted / proxy / group | [NuGet recipe](../client-recipes.md#nuget) | [NuGet Repository Guide](nuget.md) |
 | RubyGems | hosted / proxy / group | [RubyGems recipe](../client-recipes.md#rubygems) | [RubyGems Repository Guide](rubygems.md) |
 | Yum | hosted / proxy / group | [Yum recipe](../client-recipes.md#yum) | [Yum Repository Guide](yum.md) |
+| Git LFS | hosted | [Git LFS client setup](git-lfs.md#configure-git) | [Git LFS Repository Guide](git-lfs.md) |
 | Raw | hosted / proxy / group | [Raw recipe](../client-recipes.md#raw) | [Raw Repository Guide](raw.md) |
 | Docker / OCI | hosted / proxy / group | [Docker / OCI recipe](../client-recipes.md#docker--oci) | [Docker / OCI Repository Guide](docker-oci.md) |
 

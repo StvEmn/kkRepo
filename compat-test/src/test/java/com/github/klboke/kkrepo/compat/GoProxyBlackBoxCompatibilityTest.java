@@ -44,6 +44,8 @@ class GoProxyBlackBoxCompatibilityTest {
 
     Endpoint reference = config.referenceEndpoint();
     Endpoint candidate = config.candidateEndpoint();
+    ProxyStreamingCompatibility.enable(config.nexusPlusAdminRequest(
+        candidate.request("", "GET").build().uri()));
     for (Probe probe : Probe.defaultProbes()) {
       Exchange referenceExchange = send(reference.request(probe.path(), probe.method()));
       Exchange candidateExchange = send(candidate.request(probe.path(), probe.method()));
@@ -100,7 +102,8 @@ class GoProxyBlackBoxCompatibilityTest {
     ensureCandidateProxyRepository(config, config.groupHitRepository(), config.remoteUrl());
     ensureCandidateGroupRepository(config);
 
-    String module = "example.com/kkrepo/go-compat";
+    String module = "example.com/kkrepo/GoCompat";
+    String escapedModule = "example.com/kkrepo/%21go%21compat";
     String version = "v1.2.3";
     byte[] archive = moduleArchive(module, version);
     Exchange referenceUpload = send(config.nexusAdminRequest(URI.create(
@@ -119,27 +122,27 @@ class GoProxyBlackBoxCompatibilityTest {
     Endpoint referenceHosted = config.referenceHostedEndpoint();
     Endpoint candidateHosted = config.candidateHostedEndpoint();
     assertSameExchange("hosted list",
-        send(referenceHosted.request(module + "/@v/list", "GET")),
-        send(candidateHosted.request(module + "/@v/list", "GET")), true);
+        send(referenceHosted.request(escapedModule + "/@v/list", "GET")),
+        send(candidateHosted.request(escapedModule + "/@v/list", "GET")), true);
     assertSameExchange("hosted mod",
-        send(referenceHosted.request(module + "/@v/" + version + ".mod", "GET")),
-        send(candidateHosted.request(module + "/@v/" + version + ".mod", "GET")), true);
+        send(referenceHosted.request(escapedModule + "/@v/" + version + ".mod", "GET")),
+        send(candidateHosted.request(escapedModule + "/@v/" + version + ".mod", "GET")), true);
     assertSameExchange("hosted zip",
-        send(referenceHosted.request(module + "/@v/" + version + ".zip", "GET")),
-        send(candidateHosted.request(module + "/@v/" + version + ".zip", "GET")), true);
+        send(referenceHosted.request(escapedModule + "/@v/" + version + ".zip", "GET")),
+        send(candidateHosted.request(escapedModule + "/@v/" + version + ".zip", "GET")), true);
     assertSameInfo("hosted info",
-        send(referenceHosted.request(module + "/@v/" + version + ".info", "GET")),
-        send(candidateHosted.request(module + "/@v/" + version + ".info", "GET")));
+        send(referenceHosted.request(escapedModule + "/@v/" + version + ".info", "GET")),
+        send(candidateHosted.request(escapedModule + "/@v/" + version + ".info", "GET")));
     assertSameInfo("hosted latest",
-        send(referenceHosted.request(module + "/@latest", "GET")),
-        send(candidateHosted.request(module + "/@latest", "GET")));
+        send(referenceHosted.request(escapedModule + "/@latest", "GET")),
+        send(candidateHosted.request(escapedModule + "/@latest", "GET")));
 
     assertSameExchange("group hosted mod",
-        send(config.referenceGroupEndpoint().request(module + "/@v/" + version + ".mod", "GET")),
-        send(config.candidateGroupEndpoint().request(module + "/@v/" + version + ".mod", "GET")), true);
+        send(config.referenceGroupEndpoint().request(escapedModule + "/@v/" + version + ".mod", "GET")),
+        send(config.candidateGroupEndpoint().request(escapedModule + "/@v/" + version + ".mod", "GET")), true);
     assertSameExchange("group hosted zip",
-        send(config.referenceGroupEndpoint().request(module + "/@v/" + version + ".zip", "GET")),
-        send(config.candidateGroupEndpoint().request(module + "/@v/" + version + ".zip", "GET")), true);
+        send(config.referenceGroupEndpoint().request(escapedModule + "/@v/" + version + ".zip", "GET")),
+        send(config.candidateGroupEndpoint().request(escapedModule + "/@v/" + version + ".zip", "GET")), true);
   }
 
   private static void ensureReferenceRepository(GoCompatConfig config) throws Exception {
@@ -478,7 +481,12 @@ class GoProxyBlackBoxCompatibilityTest {
           new Probe("GET", "rsc.io/quote/@v/v1.5.2.mod", "mod GET", true),
           new Probe("GET", "rsc.io/quote/@v/v1.5.2.zip", "zip GET", true),
           new Probe("HEAD", "rsc.io/quote/@v/v1.5.2.mod", "mod HEAD", false),
-          new Probe("HEAD", "rsc.io/quote/@v/v1.5.2.zip", "zip HEAD", false));
+          new Probe("HEAD", "rsc.io/quote/@v/v1.5.2.zip", "zip HEAD", false),
+          new Probe("GET", "github.com/%21burnt%21sushi/toml/@v/v1.4.0.info", "encoded uppercase info", true),
+          new Probe("GET", "github.com/!burnt!sushi/toml/@v/v1.4.0.info", "literal uppercase info", true),
+          new Probe("GET", "github.com/%21burnt%21sushi/toml/@v/v1.4.0.mod", "encoded uppercase mod", true),
+          new Probe("GET", "github.com/%21burnt%21sushi/toml/@v/v1.4.0.zip", "encoded uppercase zip", true),
+          new Probe("HEAD", "github.com/%21burnt%21sushi/toml/@v/v1.4.0.zip", "encoded uppercase HEAD", false));
     }
   }
 
@@ -575,9 +583,9 @@ class GoProxyBlackBoxCompatibilityTest {
           setting("compat.go.nexusPlus.blobStorePrefix", "GO_KKREPO_BLOB_PREFIX")
               .orElse(""),
           setting("compat.go.nexusPlus.blobStoreAccessKey", "GO_KKREPO_BLOB_ACCESS_KEY")
-              .orElse("minioadmin"),
+              .orElse("rustfsadmin"),
           setting("compat.go.nexusPlus.blobStoreSecretKey", "GO_KKREPO_BLOB_SECRET_KEY")
-              .orElse("minioadmin"));
+              .orElse("rustfsadmin"));
     }
 
     Endpoint referenceEndpoint() {

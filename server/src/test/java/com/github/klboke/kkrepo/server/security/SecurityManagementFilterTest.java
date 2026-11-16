@@ -19,10 +19,72 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.springframework.core.annotation.Order;
 import org.springframework.session.web.http.SessionRepositoryFilter;
 
 class SecurityManagementFilterTest {
+
+  @ParameterizedTest
+  @CsvSource({
+      "GET, /internal/security/scanning/summary, nexus:security-scanning:read",
+      "GET, /internal/security/scanning/findings, nexus:security-scanning:read",
+      "GET, /internal/security/scanning/sboms/1, nexus:security-scanning:read",
+      "PUT, /internal/security/scanning/repositories/1/config, nexus:security-scanning:update",
+      "POST, /internal/security/scanning/assets/1/rescan, nexus:security-scanning:update",
+      "POST, /internal/security/scanning/tasks/1/retry, nexus:security-scanning:update",
+      "POST, /internal/security/scanning/tasks/1/cancel, nexus:security-scanning:update",
+      "POST, /internal/security/scanning/policies, nexus:security-scanning:update",
+      "DELETE, /internal/security/scanning/policies/1, nexus:security-scanning:update",
+      "POST, /internal/security/scanning/waivers, nexus:security-scanning-waivers:create",
+      "DELETE, /internal/security/scanning/waivers/1, nexus:security-scanning-waivers:delete"
+  })
+  void scanReaderCanReadButCannotInvokeMutationEndpoints(
+      String method, String path, String permission) throws Exception {
+    var authentication = new StubAuthenticationService(Optional.of(subject("scan-reader")));
+    RecordingSecurityService security = new RecordingSecurityService(AccessDecision.deny("read only")) {
+      @Override
+      public AccessDecision decide(PermissionSubject subject, String requested) {
+        super.decide(subject, requested);
+        return requested.equals("nexus:security-scanning:read")
+            ? AccessDecision.allow() : AccessDecision.deny("read only");
+      }
+    };
+    var response = new ResponseState();
+    var chain = new ChainState();
+    filter(authentication, security, true).doFilter(request(method, path), response.proxy(), chain);
+    assertEquals(permission, security.requestedPermission);
+    assertEquals(method.equals("GET") ? 1 : 0, chain.calls);
+    if (!method.equals("GET")) assertEquals(403, response.status);
+  }
+
+  @ParameterizedTest
+  @CsvSource({
+      "/service/rest/v1/%73ecurity/users, nexus:users:read",
+      "/service/rest/v1/routing-rules, nexus:*",
+      "/service/rest/v1/%72outing-rules/rule, nexus:*",
+      "/service/rest/v1/routing-rules;x/rule, nexus:*",
+      "/internal/routing-rules/preview, nexus:*",
+      "/service;x/rest;y/v1;z/security;w/users;q, nexus:users:read",
+      "/internal/%73ecurity/ldap, nexus:ldap:read",
+      "/%69nternal/security/ldap, nexus:ldap:read",
+      "/service/rest/internal/ui/%73ecurity/users, nexus:users:read",
+      "/service/rest/v1/security/api-keys/current%2F123, nexus:apikey:read",
+      "/internal/security/api-keys/current%2F123, nexus:apikey:read"
+  })
+  void alternativePathsRequireTheMappedPermission(String path, String permission) throws Exception {
+    StubAuthenticationService authentication = new StubAuthenticationService(Optional.of(subject("alice")));
+    RecordingSecurityService security = new RecordingSecurityService(AccessDecision.deny("not permitted"));
+    ResponseState response = new ResponseState();
+    ChainState chain = new ChainState();
+
+    filter(authentication, security, true).doFilter(request("GET", path), response.proxy(), chain);
+
+    assertEquals(permission, security.requestedPermission);
+    assertEquals(403, response.status);
+    assertEquals(0, chain.calls);
+  }
 
   @Test
   void managementFilterRunsAfterSpringSessionRepositoryFilter() {
@@ -592,7 +654,7 @@ class SecurityManagementFilterTest {
     ChainState chain = new ChainState();
 
     filter.doFilter(
-        request("GET", "/internal/blob-stores"),
+        request("GET", "/internal/blob-stores/statistics/usage"),
         response.proxy(),
         chain);
 
@@ -639,6 +701,21 @@ class SecurityManagementFilterTest {
     assertEquals(1, authentication.calls);
     assertEquals(1, security.decisions);
     assertEquals("nexus:blobstores:update", security.requestedPermission);
+    assertEquals(0, chain.calls);
+    assertEquals(HttpServletResponse.SC_FORBIDDEN, response.status);
+  }
+
+  @Test
+  void internalBlobStoreDeleteRequiresBlobStoreDeletePermission() throws Exception {
+    StubAuthenticationService authentication = new StubAuthenticationService(Optional.of(subject("admin")));
+    RecordingSecurityService security = new RecordingSecurityService(AccessDecision.deny("missing permission"));
+    SecurityManagementFilter filter = filter(authentication, security, false);
+    ResponseState response = new ResponseState();
+    ChainState chain = new ChainState();
+
+    filter.doFilter(request("DELETE", "/internal/blob-stores/7"), response.proxy(), chain);
+
+    assertEquals("nexus:blobstores:delete", security.requestedPermission);
     assertEquals(0, chain.calls);
     assertEquals(HttpServletResponse.SC_FORBIDDEN, response.status);
   }

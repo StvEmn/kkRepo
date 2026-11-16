@@ -97,6 +97,7 @@ public class SecurityScanMutationService {
         Map.of(
             "enabled", result.enabled(),
             "profileId", result.profileId(),
+            "policyId", result.policyId() == null ? "none" : result.policyId(),
             "enforcementMode", result.enforcementMode().name(),
             "configRevision", result.configRevision()));
     return result;
@@ -131,6 +132,15 @@ public class SecurityScanMutationService {
             "previousPolicyId", policyId,
             "policyId", policy.id(),
             "policyRevision", policy.revision()));
+    return policy;
+  }
+
+  public ScanPolicy deletePolicy(
+      HttpServletRequest request, AuthenticatedSubject actor, long policyId) {
+    ScanPolicy policy = management.deletePolicy(actor, policyId);
+    audit.record(request, actor, "POLICY_DELETE", null,
+        Map.of("policyId", policy.id(), "policyName", policy.name(),
+            "policyRevision", policy.revision(), "scope", "ALL_REVISIONS"));
     return policy;
   }
 

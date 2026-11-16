@@ -997,7 +997,18 @@ public class SecurityManagementService implements AccessDecisionService {
     if (subject == null || permissions == null || permissions.isEmpty()) {
       return Map.of();
     }
-    AuthorizationSnapshot snapshot = authorizationSnapshot(subject);
+    return decideAll(authorizationSnapshot(subject), permissions);
+  }
+
+  @Override
+  public Map<RepositoryPermission, AccessDecision> decideAllFresh(
+      PermissionSubject subject, Collection<RepositoryPermission> permissions) {
+    if (subject == null || permissions == null || permissions.isEmpty()) return Map.of();
+    return decideAll(loadAuthorizationSnapshot(subject), permissions);
+  }
+
+  private Map<RepositoryPermission, AccessDecision> decideAll(
+      AuthorizationSnapshot snapshot, Collection<RepositoryPermission> permissions) {
     Map<RepositoryPermission, AccessDecision> result = new LinkedHashMap<>();
     permissions.stream()
         .filter(java.util.Objects::nonNull)
@@ -1021,6 +1032,16 @@ public class SecurityManagementService implements AccessDecisionService {
     return decide(subject, requestedPermission.trim(), null);
   }
 
+  public AccessDecision decideFresh(PermissionSubject subject, String requestedPermission) {
+    if (subject == null || requestedPermission == null || requestedPermission.isBlank()) {
+      return AccessDecision.deny("missing subject or permission");
+    }
+    AuthorizationSnapshot snapshot = loadAuthorizationSnapshot(subject);
+    return !snapshot.roleIds().isEmpty()
+        && permissionAllowed(snapshot.privileges(), requestedPermission.trim(), null, snapshot.repositoryTargets())
+            ? AccessDecision.allow() : AccessDecision.deny("missing permission " + requestedPermission);
+  }
+
   @Transactional(readOnly = true)
   public List<String> listEffectivePermissions(PermissionSubject subject) {
     if (subject == null) {
@@ -1039,6 +1060,7 @@ public class SecurityManagementService implements AccessDecisionService {
           .map(SecurityManagementService::blankToNull)
           .filter(permission -> permission != null)
           .map(permission -> permission.toLowerCase(Locale.ROOT))
+          .flatMap(permission -> effectivePermissionCandidates(permission).stream())
           .filter(permission -> permissionAllowed(grantedPrivileges, permission, null, repositoryTargets))
           .distinct()
           .sorted()
@@ -1049,10 +1071,29 @@ public class SecurityManagementService implements AccessDecisionService {
         .map(SecurityManagementService::blankToNull)
         .filter(permission -> permission != null)
         .map(permission -> permission.toLowerCase(Locale.ROOT))
+        .flatMap(permission -> effectivePermissionCandidates(permission).stream())
         .filter(permission -> decide(subject, permission).allowed())
         .distinct()
         .sorted()
         .toList();
+  }
+
+  private static List<String> effectivePermissionCandidates(String permission) {
+    // Keep existing catalog entries and expose each action of combined grants to UI consumers.
+    // Every candidate still passes the existing authorization decision before exposure.
+    List<String> candidates = new ArrayList<>();
+    candidates.add(permission);
+    String[] parts = permission.split(":");
+    for (int i = 0; i < parts.length; i++) {
+      if (isActionSegment(parts, parts, i) && parts[i].contains(",")) {
+        for (String action : parts[i].split(",")) {
+          String[] expanded = parts.clone();
+          expanded[i] = action.trim();
+          candidates.add(String.join(":", expanded));
+        }
+      }
+    }
+    return candidates;
   }
 
   private AccessDecision decide(

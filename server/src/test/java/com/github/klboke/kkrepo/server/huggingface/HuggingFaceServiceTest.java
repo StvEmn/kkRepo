@@ -2,6 +2,7 @@ package com.github.klboke.kkrepo.server.huggingface;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -9,9 +10,11 @@ import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -43,7 +46,10 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
 class HuggingFaceServiceTest {
@@ -357,9 +363,10 @@ class HuggingFaceServiceTest {
     verify(stale.registry).upsertApiCache(any());
   }
 
-  @Test
-  void postsPathsInfoAndProjectsTreeEntriesAtThePinnedCommit() throws Exception {
-    Fixture fixture = fixture();
+  @org.junit.jupiter.params.ParameterizedTest
+  @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+  void postsPathsInfoAndProjectsTreeEntriesAtThePinnedCommit(boolean publicContent) throws Exception {
+    Fixture fixture = fixture(1024 * 1024, publicContent);
     String tree = """
         [{"type":"directory","path":"ignored"},
          {"type":"file","path":"config.json","oid":"%s","size":12},
@@ -383,6 +390,11 @@ class HuggingFaceServiceTest {
     verify(fixture.fetcher).fetch(request.capture());
     assertTrue(request.getValue().url().contains("recursive=true"));
     assertTrue(request.getValue().requestBody() != null);
+    assertEquals("POST", request.getValue().method());
+    assertEquals(com.github.klboke.kkrepo.server.security.ProxyRedirectPolicy.ALLOWLIST,
+        request.getValue().redirectPolicy());
+    assertFalse(request.getValue().allowedUnsignedRedirectHosts().contains("*"));
+    if (publicContent) assertTrue(request.getValue().allowedUnsignedRedirectHosts().contains("cdn.example"));
     ArgumentCaptor<ModelFile> files = ArgumentCaptor.forClass(ModelFile.class);
     verify(fixture.registry, org.mockito.Mockito.times(2)).upsertFileMetadata(files.capture());
     assertTrue(files.getAllValues().stream()
@@ -593,6 +605,91 @@ class HuggingFaceServiceTest {
     verify(winner.fetcher, never()).fetch(any());
   }
 
+  @ParameterizedTest
+  @ValueSource(ints = {400, 401, 403, 404, 410, 422})
+  void repeatedClientErrorsKeepTheirStatusAcrossServiceInstances(int status) throws Exception {
+    Fixture fixture = fixture();
+    AtomicReference<ModelFile> state = stubPersistedFailures(fixture);
+    HuggingFaceService otherNode = new HuggingFaceService(
+        fixture.registry, fixture.componentDao, fixture.fetcher, fixture.cache,
+        new HuggingFaceComponentFactory(), fixture.leases, new ObjectMapper(), 1024 * 1024);
+    when(fixture.fetcher.fetch(any())).thenAnswer(invocation -> new HttpRemoteFetcher.Result(
+        status, Map.of(
+            "Content-Type", "application/json", "X-Error-Code", "EntryNotFound",
+            "X-Error-Message", "Entry not found", "X-Repo-Commit", COMMIT,
+            "X-Xet-Hash", "private-routing", "Set-Cookie", "secret=value"),
+        new ByteArrayInputStream("missing".getBytes(StandardCharsets.UTF_8))));
+
+    for (boolean headOnly : new boolean[] {true, false, false, true}) {
+      MavenResponse response = (headOnly ? fixture.service : otherNode).get(
+          fixture.runtime, canonical("processor_config.json"), "",
+          "https://repo.example/repository/hf", headOnly);
+      assertEquals(status, response.status());
+      assertEquals("EntryNotFound", response.headers().get("X-Error-Code"));
+      assertEquals("Entry not found", response.headers().get("X-Error-Message"));
+      assertEquals(COMMIT, response.headers().get("X-Repo-Commit"));
+      assertFalse(response.headers().containsKey("X-Xet-Hash"));
+      assertFalse(response.headers().containsKey("Set-Cookie"));
+      if (headOnly) {
+        assertNull(response.body());
+      } else {
+        assertEquals("missing", new String(response.body().readAllBytes(), StandardCharsets.UTF_8));
+      }
+      assertEquals(HuggingFaceRegistryDao.FILE_FAILED, state.get().state());
+      assertNull(state.get().nextAttemptAt());
+    }
+    verify(fixture.fetcher, times(4)).fetch(any());
+  }
+
+  @ParameterizedTest
+  @ValueSource(ints = {400, 401, 403, 404, 410, 422})
+  void ignoresLegacyDeterministicFailureBackoff(int status) throws Exception {
+    Fixture fixture = fixture();
+    AtomicReference<ModelFile> state = stubPersistedFailures(fixture);
+    state.set(failedFile("UPSTREAM_GET_" + status, Instant.now().plusSeconds(300)));
+    // Re-fetch rather than synthesizing the old error: access or upstream content may have changed.
+    when(fixture.fetcher.fetch(any())).thenReturn(new HttpRemoteFetcher.Result(
+        404, Map.of("X-Error-Code", "EntryNotFound"), new ByteArrayInputStream(new byte[0])));
+    assertEquals(404, fixture.service.get(
+        fixture.runtime, canonical("processor_config.json"), "",
+        "https://repo.example/repository/hf", false).status());
+    verify(fixture.fetcher).fetch(any());
+    assertNull(state.get().nextAttemptAt());
+  }
+
+  @ParameterizedTest
+  @ValueSource(ints = {408, 429, 500, 502, 503, 504})
+  void transientHttpFailuresStillBackOffSubsequentProbes(int status) throws Exception {
+    Fixture fixture = fixture();
+    AtomicReference<ModelFile> state = stubPersistedFailures(fixture);
+    when(fixture.fetcher.fetch(any())).thenReturn(new HttpRemoteFetcher.Result(
+        status, Map.of("Retry-After", "30"), new ByteArrayInputStream(new byte[0])));
+    MavenResponse first = fixture.service.get(
+        fixture.runtime, canonical("processor_config.json"), "",
+        "https://repo.example/repository/hf", false);
+    assertEquals(status, first.status());
+    assertEquals("30", first.headers().get("Retry-After"));
+    assertTrue(state.get().nextAttemptAt().isAfter(Instant.now()));
+    assertThrows(MavenExceptions.BadUpstreamException.class, () -> fixture.service.get(
+        fixture.runtime, canonical("processor_config.json"), "",
+        "https://repo.example/repository/hf", true));
+    verify(fixture.fetcher).fetch(any());
+  }
+
+  @Test
+  void transportFailuresStillBackOffSubsequentProbes() throws Exception {
+    Fixture fixture = fixture();
+    AtomicReference<ModelFile> state = stubPersistedFailures(fixture);
+    when(fixture.fetcher.fetch(any())).thenThrow(new java.net.SocketTimeoutException("timed out"));
+    for (boolean headOnly : new boolean[] {false, true}) {
+      assertThrows(MavenExceptions.BadUpstreamException.class, () -> fixture.service.get(
+          fixture.runtime, canonical("processor_config.json"), "",
+          "https://repo.example/repository/hf", headOnly));
+    }
+    assertTrue(state.get().nextAttemptAt().isAfter(Instant.now()));
+    verify(fixture.fetcher).fetch(any());
+  }
+
   @Test
   void reconcilesAFileThatBecomesReadyWhileClaimingFetchOwnership() {
     Fixture won = fixture();
@@ -639,7 +736,7 @@ class HuggingFaceServiceTest {
         "https://repo.example/repository/hf", false);
     assertEquals(404, notFound.status());
     verify(missing.registry, org.mockito.Mockito.atLeastOnce()).markFileFailed(
-        eq(70L), eq(9L), eq("UPSTREAM_GET_404"), any(), any());
+        eq(70L), eq(9L), eq("UPSTREAM_GET_404"), isNull(), any());
 
     Fixture wrongCommit = fixture();
     stubOwnedCold(wrongCommit, "model.bin", discovered);
@@ -849,6 +946,28 @@ class HuggingFaceServiceTest {
     return lease;
   }
 
+  private static AtomicReference<ModelFile> stubPersistedFailures(Fixture fixture) {
+    ModelFile discovered = file(
+        "processor_config.json", null, null, null, HuggingFaceRegistryDao.FILE_DISCOVERED, 0L);
+    stubOwnedCold(fixture, "processor_config.json", discovered);
+    AtomicReference<ModelFile> state = new AtomicReference<>(discovered);
+    when(fixture.registry.findFile(42L, "org/model", COMMIT, "processor_config.json"))
+        .thenAnswer(invocation -> Optional.of(state.get()));
+    when(fixture.registry.markFileFailed(eq(70L), eq(9L), any(), any(), any()))
+        .thenAnswer(invocation -> {
+          state.set(failedFile(invocation.getArgument(2), invocation.getArgument(3)));
+          return true;
+        });
+    return state;
+  }
+
+  private static ModelFile failedFile(String failureCode, Instant nextAttemptAt) {
+    return new ModelFile(
+        70L, 60L, 42L, "org/model", COMMIT, "processor_config.json", null, 55L,
+        null, null, null, null, null, "application/json", "OTHER",
+        HuggingFaceRegistryDao.FILE_FAILED, 9L, failureCode, nextAttemptAt, Instant.now());
+  }
+
   private static ComponentRecord persistedComponent() {
     ComponentRecord candidate = new HuggingFaceComponentFactory().component(
         new RepositoryRuntime(
@@ -879,6 +998,10 @@ class HuggingFaceServiceTest {
   }
 
   private static Fixture fixture(long maxFileBytes) {
+    return fixture(maxFileBytes, false);
+  }
+
+  private static Fixture fixture(long maxFileBytes, boolean publicContent) {
     HuggingFaceRegistryDao registry = mock(HuggingFaceRegistryDao.class);
     ComponentDao componentDao = mock(ComponentDao.class);
     HttpRemoteFetcher fetcher = mock(HttpRemoteFetcher.class);
@@ -887,7 +1010,8 @@ class HuggingFaceServiceTest {
     RepositoryRuntime runtime = new RepositoryRuntime(
         42L, "hf", RepositoryFormat.HUGGINGFACE, RepositoryType.PROXY, "huggingface-proxy",
         true, 1L, null, null, null, true, "https://hub.example", 1440, 60, true,
-        null, List.of());
+        null, null, null, null, null, null, null, null, List.of(), null, null,
+        publicContent ? java.util.Set.of("*", "cdn.example") : java.util.Set.of(), null);
     HuggingFaceService service = new HuggingFaceService(
         registry, componentDao, fetcher, cache, new HuggingFaceComponentFactory(), leases,
         new ObjectMapper(), maxFileBytes);

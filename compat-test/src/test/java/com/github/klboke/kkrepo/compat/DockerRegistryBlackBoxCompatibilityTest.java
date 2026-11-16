@@ -34,6 +34,47 @@ class DockerRegistryBlackBoxCompatibilityTest {
       .build();
 
   @Test
+  void chunkedUploadsPreserveOffsetsAndSupportCancellation() throws Exception {
+    CompatConfig config = CompatConfig.load();
+    assumeTrue(config.enabled() && config.configured() && config.writeEnabled(),
+        "Docker write compatibility is not configured");
+    String image = config.repositoryPath(config.uploadImage() + "/transactions-" + System.nanoTime());
+    byte[] first = "chunk-one".getBytes(StandardCharsets.UTF_8);
+    byte[] second = "-chunk-two".getBytes(StandardCharsets.UTF_8);
+    byte[] all = "chunk-one-chunk-two".getBytes(StandardCharsets.UTF_8);
+    String digest = "sha256:" + sha256(all);
+    for (Endpoint endpoint : List.of(config.nexus(), config.nexusPlus())) {
+      Exchange started = post(endpoint, endpoint.v2(image + "/blobs/uploads/"), true);
+      assertEquals(202, started.status());
+      Exchange one = patch(endpoint, endpoint.resolve(started.header("Location").orElseThrow()),
+          "application/octet-stream", first, true);
+      assertEquals(202, one.status());
+      Exchange two = patch(endpoint, endpoint.resolve(one.header("Location").orElseThrow()),
+          "application/octet-stream", second, true);
+      assertEquals(202, two.status());
+      assertEquals("0-" + (all.length - 1), two.header("Range").orElseThrow());
+      String location = two.header("Location").orElseThrow();
+      Exchange completed = put(endpoint, endpoint.resolve(location + (location.contains("?") ? "&" : "?")
+          + "digest=" + encode(digest)), "application/octet-stream", new byte[0], true);
+      assertEquals(201, completed.status());
+      assertEquals(digest, completed.header(DockerConstants.CONTENT_DIGEST_HEADER).orElseThrow());
+      Exchange downloaded = get(endpoint, endpoint.v2(image + "/blobs/" + digest), "*/*", true);
+      assertEquals(200, downloaded.status());
+      assertArrayEquals(all, downloaded.body());
+      Exchange cancelled = post(endpoint, endpoint.v2(image + "/blobs/uploads/"), true);
+      URI cancelUri = endpoint.resolve(cancelled.header("Location").orElseThrow());
+      assertEquals(204, delete(endpoint, cancelUri, true).status());
+      Exchange cancelledStatus = get(endpoint, cancelUri, "*/*", true);
+      assertEquals(404, cancelledStatus.status());
+      assertEquals("BLOB_UPLOAD_UNKNOWN", JSON.readTree(cancelledStatus.body()).path("errors").path(0).path("code").asText());
+      // Nexus 3.68 returns UNKNOWN/500 for PATCH after cancellation; keep the protocol-correct kkRepo response.
+      if (endpoint == config.nexusPlus()) {
+        assertEquals(404, patch(endpoint, cancelUri, "application/octet-stream", first, true).status());
+      }
+    }
+  }
+
+  @Test
   void registryV2EndpointsMatchNexusWhenConfigured() throws Exception {
     CompatConfig config = CompatConfig.load();
     assumeTrue(config.enabled(),
@@ -164,6 +205,8 @@ class DockerRegistryBlackBoxCompatibilityTest {
       }
     }
 
+    assertSearchableTags(nexusUi, browse, config.repository(), image, List.of("1.0.0", "latest"));
+
     // Follow Nexus Browse's node -> readAsset -> deleteAsset mapping, not Registry V2 DELETE.
     deleteNexusBrowseAsset(nexusUi, config.repository(), imagePath, "latest", false);
     String browseUrl = "/internal/browse/" + encode(config.repository()) + "?path=";
@@ -183,6 +226,8 @@ class DockerRegistryBlackBoxCompatibilityTest {
       assertEquals(reference.equals("latest") ? 404 : 200, expected.status());
       assertEquals(expected.status(), actual.status(), "reference after tag deletion " + reference);
     }
+
+    assertSearchableTags(nexusUi, browse, config.repository(), image, List.of("1.0.0"));
 
     // Both administrative APIs delete the selected digest entry while preserving tag assets.
     deleteNexusBrowseAsset(nexusUi, config.repository(), imagePath, digest, true);
@@ -250,6 +295,29 @@ class DockerRegistryBlackBoxCompatibilityTest {
         List.of(asset.path("id").asText(), repository), false);
     assertEquals("HTTP 404 Not Found", missing.path("message").asText(),
         "The selected Nexus asset must be absent after administrative deletion");
+  }
+
+  private static void assertSearchableTags(
+      Endpoint nexus, Endpoint candidate, String repository, String image, List<String> tags) throws Exception {
+    List<String> actualNexus = List.of();
+    for (int attempt = 0; attempt < 20; attempt++) {
+      Exchange response = get(nexus, nexus.resolve("/service/rest/v1/search?repository=" + encode(repository)
+          + "&format=docker&docker.imageName=" + encode(image)), "application/json", true);
+      assertEquals(200, response.status());
+      actualNexus = java.util.stream.StreamSupport.stream(JSON.readTree(response.body()).path("items").spliterator(), false)
+          .filter(item -> image.equals(item.path("name").asText()))
+          .map(item -> item.path("version").asText()).sorted().toList();
+      if (tags.equals(actualNexus)) break;
+      Thread.sleep(250);
+    }
+    assertEquals(tags, actualNexus, "Nexus search image tags");
+    Exchange response = get(candidate, candidate.resolve("/internal/search/components?format=docker&q=" + encode(image)),
+        "application/json", true);
+    assertEquals(200, response.status());
+    List<String> actualCandidate = java.util.stream.StreamSupport.stream(JSON.readTree(response.body()).path("items").spliterator(), false)
+        .filter(item -> repository.equals(item.path("repository").asText()) && image.equals(item.path("name").asText()))
+        .map(item -> item.path("version").asText()).sorted().toList();
+    assertEquals(actualNexus, actualCandidate, "kkRepo search must follow live Docker tag state");
   }
 
   private static JsonNode nexusUi(Endpoint endpoint, String action, String method, List<?> data)

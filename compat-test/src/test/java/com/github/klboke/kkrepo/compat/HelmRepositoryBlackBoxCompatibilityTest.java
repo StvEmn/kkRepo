@@ -40,6 +40,7 @@ class HelmRepositoryBlackBoxCompatibilityTest {
       ensureNexusRepositories(config);
       ensureKkRepoRepositories(config);
     }
+    ProxyStreamingCompatibility.enable(config.nexusPlusProxy().request(""));
 
     ChartFixture fixture = ChartFixture.create();
     try {
@@ -398,10 +399,14 @@ class HelmRepositoryBlackBoxCompatibilityTest {
     }
   }
 
-  private record ChartFixture(String chartName, String version, String fileName, byte[] bytes) {
+  record ChartFixture(String chartName, String version, String fileName, byte[] bytes) {
     static ChartFixture create() throws Exception {
       String name = "kkrepo-compat-helm";
       String version = "0.1." + System.currentTimeMillis();
+      return create(name, version);
+    }
+
+    static ChartFixture create(String name, String version) throws Exception {
       String fileName = name + "-" + version + ".tgz";
       ByteArrayOutputStream gzipBytes = new ByteArrayOutputStream();
       try (GZIPOutputStream gzip = new GZIPOutputStream(gzipBytes);

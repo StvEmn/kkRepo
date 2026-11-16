@@ -27,12 +27,15 @@ class AdminProxyRedirectHostsContractTest {
     assertTrue(index.contains("denied by default"));
     assertTrue(index.contains("Source repository credentials are never forwarded"));
     assertTrue(index.contains("DNS and SSRF validation"));
-    assertTrue(index.contains("wildcards are not allowed"));
+    assertTrue(index.contains("*.quay.io (does not include quay.io)"));
+    assertTrue(index.contains("A standalone * opts into any public HTTPS destination"));
+    assertTrue(index.contains("POST and token exchanges retain strict rules"));
     assertTrue(javascript.contains(".split(\",\")"));
     assertTrue(javascript.contains("allowedRedirectHosts,"));
     assertTrue(javascript.contains(
         "document.getElementById(\"repository-allowed-redirect-hosts\").value = \"\";"));
     assertTrue(javascript.contains("repo.proxy.allowedRedirectHosts.join(\", \")"));
+    assertFalse(index.contains("repository-redirect-policy"));
   }
 
   private String resource(String path) throws IOException {

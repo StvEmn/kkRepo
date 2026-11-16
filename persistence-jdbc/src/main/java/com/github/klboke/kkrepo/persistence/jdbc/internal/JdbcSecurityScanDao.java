@@ -8,8 +8,10 @@ import static com.github.klboke.kkrepo.security.scan.ScanEnums.SCANNER_OBSERVATI
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.github.klboke.kkrepo.core.RepositoryFormat;
 import com.github.klboke.kkrepo.persistence.jdbc.api.BlobReferenceDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.InvalidScanCompletionCursorException;
 import com.github.klboke.kkrepo.persistence.jdbc.api.PersistenceHashes;
 import com.github.klboke.kkrepo.persistence.jdbc.api.SecurityScanDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.ScanPolicyReferenceConflictException;
 import com.github.klboke.kkrepo.persistence.jdbc.internal.support.EnumColumns;
 import com.github.klboke.kkrepo.persistence.jdbc.internal.support.JdbcInserts;
 import com.github.klboke.kkrepo.persistence.jdbc.internal.support.JsonColumns;
@@ -40,9 +42,11 @@ import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.UUID;
 import org.springframework.dao.CannotAcquireLockException;
+import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -82,6 +86,11 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
           .thenComparingLong(ClaimCandidate::id);
 
   private final JdbcTemplate jdbc;
+  private final DatabaseDialect databaseDialect;
+  private final String completionTaskTable;
+  private final String repositoryCompletionTaskTable;
+  private final String statusCompletionTaskTable;
+  private final String repositoryStatusCompletionTaskTable;
   private final BlobReferenceDao blobReferences;
   private final JdbcSecurityScanRepositoryScope repositoryScope;
   private final JdbcSecurityScanRetentionDao retention;
@@ -495,6 +504,15 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
   public JdbcSecurityScanDao(
       JdbcTemplate jdbc, JsonColumns json, DatabaseDialect databaseDialect) {
     this.jdbc = jdbc;
+    this.databaseDialect = databaseDialect;
+    this.completionTaskTable = databaseDialect.tableReferenceWithPreferredIndex(
+        "security_scan_task t", "idx_security_scan_task_completion");
+    this.repositoryCompletionTaskTable = databaseDialect.tableReferenceWithPreferredIndex(
+        "security_scan_task t", "idx_security_scan_task_repo_completion");
+    this.statusCompletionTaskTable = databaseDialect.tableReferenceWithPreferredIndex(
+        "security_scan_task t", "idx_security_scan_task_status_completion");
+    this.repositoryStatusCompletionTaskTable = databaseDialect.tableReferenceWithPreferredIndex(
+        "security_scan_task t", "idx_security_scan_task_repo_status_completion");
     this.json = json;
     this.blobReferences = new JdbcBlobReferenceDao(jdbc);
     this.repositoryScope = new JdbcSecurityScanRepositoryScope(json, databaseDialect.json());
@@ -837,6 +855,7 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
   @Override
   @Transactional
   public RepositoryScanConfig upsertRepositoryConfig(RepositoryScanConfig config) {
+    lockPolicyReference(config.policyId());
     Instant now = requiredNow(config.updatedAt());
     if (!insertRepositoryConfig(config, now)) {
       int updated = updateRepositoryConfig(config, now);
@@ -1269,7 +1288,18 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
       String query,
       long afterId,
       int maxItems) {
-    return listTasks(repositoryId, null, status, query, afterId, maxItems);
+    return listTasks(repositoryId, status, query, afterId, maxItems, null);
+  }
+
+  @Override
+  @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+  public List<ScanTask> listTasks(
+      Long repositoryId,
+      TaskStatus status,
+      String query,
+      long afterId,
+      int maxItems, CompletionOrder completion) {
+    return listTasks(repositoryId, null, status, query, afterId, maxItems, completion);
   }
 
   @Override
@@ -1279,9 +1309,20 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
       String query,
       long afterId,
       int maxItems) {
+    return listTasksByRepositories(repositoryIds, status, query, afterId, maxItems, null);
+  }
+
+  @Override
+  @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
+  public List<ScanTask> listTasksByRepositories(
+      List<Long> repositoryIds,
+      TaskStatus status,
+      String query,
+      long afterId,
+      int maxItems, CompletionOrder completion) {
     List<Long> ids = repositoryScope.distinctLongs(repositoryIds);
     if (ids.isEmpty()) return List.of();
-    return listTasks(null, ids, status, query, afterId, maxItems);
+    return listTasks(null, ids, status, query, afterId, maxItems, completion);
   }
 
   private List<ScanTask> listTasks(
@@ -1290,27 +1331,35 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
       TaskStatus status,
       String query,
       long afterId,
-      int maxItems) {
+      int maxItems, CompletionOrder completion) {
     List<Object> args = new ArrayList<>();
     StringBuilder sql = new StringBuilder();
     if (repositoryIds != null) {
       sql.append(repositoryScope.taskRepositoryScopeCte());
       args.add(repositoryScope.parameter(repositoryIds));
     }
-    sql.append("""
-        SELECT t.*
-        FROM security_scan_task t
-        JOIN repository r ON r.id = t.repository_id
-        LEFT JOIN asset a ON a.id = t.asset_id
-        WHERE t.id > ?
-        """);
-    args.add(Math.max(0, afterId));
+    String pattern = searchPattern(query);
+    // MySQL can otherwise prefer the primary key for NULL timestamps and scan completed history.
+    String taskTable = "security_scan_task t";
+    if (completion != null && pattern == null) {
+      taskTable = status == null
+          ? (repositoryId == null ? completionTaskTable : repositoryCompletionTaskTable)
+          : (repositoryId == null ? statusCompletionTaskTable : repositoryStatusCompletionTaskTable);
+    }
+    sql.append("SELECT t.* FROM ").append(taskTable);
+    if (pattern != null) {
+      sql.append(" JOIN repository r ON r.id = t.repository_id")
+          .append(" LEFT JOIN asset a ON a.id = t.asset_id");
+    }
+    sql.append(" WHERE 1 = 1");
     if (repositoryId != null) {
       sql.append(" AND t.repository_id = ?");
       args.add(repositoryId);
     } else if (repositoryIds != null) {
+      // A bounded scalar lookup preserves the completion-index walk. MySQL may flatten
+      // EXISTS into a duplicate-removing semijoin that sorts the entire visible history.
       sql.append("""
-           AND EXISTS (
+           AND (
              SELECT 1
              FROM task_repository_scope scope
              JOIN repository source_repository
@@ -1332,14 +1381,14 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
                    )
                  )
                )
-           )
+             LIMIT 1
+           ) IS NOT NULL
           """);
     }
     if (status != null) {
       sql.append(" AND t.status = ?");
       args.add(status.name());
     }
-    String pattern = searchPattern(query);
     if (pattern != null) {
       sql.append("""
            AND (
@@ -1362,9 +1411,95 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
       }
       sql.append(")");
     }
-    sql.append(" ORDER BY t.id LIMIT ?");
-    args.add(safeLimit(maxItems));
-    return jdbc.query(sql.toString(), taskMapper, args.toArray());
+    int limit = safeLimit(maxItems);
+    if (completion == null) {
+      return queryScanPage(sql, args, "t", "finished_at", afterId, limit, null, false, taskMapper);
+    }
+    // Separate ranges keep NULLs last in both directions without sorting the whole history.
+    // The timestamp/ID indexes can be scanned forwards or backwards for each bounded query.
+    // Spring-managed completion-list entry points use one repeatable-read snapshot for both ranges.
+    if (completion.afterId() > 0 && completion.afterTime() == null) {
+      return queryScanPage(new StringBuilder(sql).append(" AND t.finished_at IS NULL"),
+          args, "t", "finished_at", 0, limit, completion, true, taskMapper);
+    }
+    List<ScanTask> rows = new ArrayList<>(queryScanPage(
+        new StringBuilder(sql).append(" AND t.finished_at IS NOT NULL"),
+        args, "t", "finished_at", 0, limit, completion, false, taskMapper));
+    if (rows.size() < limit) {
+      rows.addAll(queryScanPage(new StringBuilder(sql).append(" AND t.finished_at IS NULL"),
+          args, "t", "finished_at", 0, limit - rows.size(),
+          new CompletionOrder(completion.ascending(), 0, null), true, taskMapper));
+    }
+    return rows;
+  }
+
+  private <T> List<T> queryScanPage(
+      StringBuilder sql, List<Object> baseArgs, String alias, String column,
+      long afterId, int limit, CompletionOrder completion, boolean unfinished, RowMapper<T> mapper) {
+    List<Object> args = new ArrayList<>(baseArgs);
+    appendScanPageBoundary(sql, args, alias, column, afterId, completion);
+    appendScanPageOrder(sql, alias, column, completion, unfinished);
+    sql.append(" LIMIT ?");
+    args.add(limit);
+    try {
+      return jdbc.query(sql.toString(), mapper, args.toArray());
+    } catch (DataAccessException exception) {
+      // JVM-only validation cannot predict the driver's configured connection timezone.
+      // Translate only datetime failures on a timestamp-bearing cursor, not other DB failures.
+      if (completion != null && completion.afterTime() != null) {
+        for (Throwable cause = exception; cause != null; cause = cause.getCause()) {
+          if (cause instanceof SQLException sqlException
+              && databaseDialect.isInvalidDatetime(sqlException)) {
+            throw new InvalidScanCompletionCursorException(exception);
+          }
+        }
+      }
+      throw exception;
+    }
+  }
+
+  // Only internal column names and fixed direction tokens reach SQL. Cursor values are bound.
+  private static void appendScanPageBoundary(
+      StringBuilder sql, List<Object> args, String alias, String column,
+      long afterId, CompletionOrder completion) {
+    if (completion == null) {
+      sql.append(" AND ").append(alias).append(".id > ?");
+      args.add(Math.max(0, afterId));
+      return;
+    }
+    if (completion.afterId() <= 0) return;
+    String time = alias + "." + column;
+    String comparison = completion.ascending() ? " > ?" : " < ?";
+    if (completion.afterTime() == null) {
+      sql.append(" AND ").append(time).append(" IS NULL AND ")
+          .append(alias).append(".id").append(comparison);
+      args.add(completion.afterId());
+    } else {
+      sql.append(" AND ").append(time).append(completion.ascending() ? " >= ?" : " <= ?")
+          .append(" AND (").append(time).append(comparison)
+          .append(" OR (").append(time).append(" = ? AND ")
+          .append(alias).append(".id").append(comparison)
+          .append("))");
+      args.add(nullableTimestamp(completion.afterTime()));
+      args.add(nullableTimestamp(completion.afterTime()));
+      args.add(nullableTimestamp(completion.afterTime()));
+      args.add(completion.afterId());
+    }
+  }
+
+  private void appendScanPageOrder(
+      StringBuilder sql, String alias, String column, CompletionOrder completion, boolean unfinished) {
+    if (completion == null) {
+      sql.append(" ORDER BY ").append(alias).append(".id");
+      return;
+    }
+    String time = alias + "." + column;
+    String direction = completion.ascending() ? " ASC" : " DESC";
+    sql.append(" ORDER BY ");
+    if (!unfinished || databaseDialect.orderByNullEqualityColumns()) {
+      sql.append(time).append(direction).append(", ");
+    }
+    sql.append(alias).append(".id").append(direction);
   }
 
   @Override
@@ -2187,15 +2322,27 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
   @Override
   public List<ScanRun> listRuns(
       Long repositoryId, String query, long afterId, int maxItems) {
-    return listRuns(repositoryId, null, query, afterId, maxItems);
+    return listRuns(repositoryId, query, afterId, maxItems, null);
+  }
+
+  @Override
+  public List<ScanRun> listRuns(
+      Long repositoryId, String query, long afterId, int maxItems, CompletionOrder completion) {
+    return listRuns(repositoryId, null, query, afterId, maxItems, completion);
   }
 
   @Override
   public List<ScanRun> listRunsByRepositories(
       List<Long> repositoryIds, String query, long afterId, int maxItems) {
+    return listRunsByRepositories(repositoryIds, query, afterId, maxItems, null);
+  }
+
+  @Override
+  public List<ScanRun> listRunsByRepositories(
+      List<Long> repositoryIds, String query, long afterId, int maxItems, CompletionOrder completion) {
     List<Long> ids = repositoryScope.distinctLongs(repositoryIds);
     if (ids.isEmpty()) return List.of();
-    return listRuns(null, ids, query, afterId, maxItems);
+    return listRuns(null, ids, query, afterId, maxItems, completion);
   }
 
   private List<ScanRun> listRuns(
@@ -2203,7 +2350,7 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
       List<Long> repositoryIds,
       String query,
       long afterId,
-      int maxItems) {
+      int maxItems, CompletionOrder completion) {
     StringBuilder sql = new StringBuilder();
     List<Object> args = new ArrayList<>();
     if (repositoryIds != null) {
@@ -2213,26 +2360,27 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
     sql.append("""
         SELECT sr.*
         FROM security_scan_run sr
-        WHERE sr.id > ?
+        WHERE 1 = 1
         """);
-    args.add(Math.max(0, afterId));
     if (repositoryId != null) {
       sql.append("""
-           AND EXISTS (
+           AND (
              SELECT 1 FROM security_scan_run_subject s
              WHERE s.scan_run_id = sr.id AND s.repository_id = ?
-           )
+             LIMIT 1
+           ) IS NOT NULL
           """);
       args.add(repositoryId);
     } else if (repositoryIds != null) {
       sql.append("""
-           AND EXISTS (
+           AND (
              SELECT 1
              FROM security_scan_run_subject s
              JOIN visible_repository visible
                ON visible.repository_id = s.repository_id
              WHERE s.scan_run_id = sr.id
-           )
+             LIMIT 1
+           ) IS NOT NULL
           """);
     }
     String pattern = searchPattern(query);
@@ -2276,9 +2424,8 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
       }
       sql.append(")");
     }
-    sql.append(" ORDER BY sr.id LIMIT ?");
-    args.add(safeLimit(maxItems));
-    return jdbc.query(sql.toString(), runMapper, args.toArray());
+    return queryScanPage(sql, args, "sr", "completed_at", afterId, safeLimit(maxItems),
+        completion, false, runMapper);
   }
 
   @Override
@@ -2316,7 +2463,40 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
   @Override
   public List<ScanRunSubject> listRunSubjects(
       long scanRunId, long afterRepositoryId, long afterAssetId, int maxItems) {
+    return listRunSubjects(scanRunId, afterRepositoryId, afterAssetId, maxItems, false);
+  }
+
+  @Override
+  public List<ScanRunSubject> listRunSubjects(
+      long scanRunId, long afterRepositoryId, long afterAssetId, int maxItems, boolean currentOnly) {
+    return jdbc.query(runSubjectsSql(currentOnly), (rs, rowNum) -> runSubject(rs),
+        scanRunId, Math.max(0, afterRepositoryId), Math.max(0, afterRepositoryId),
+        Math.max(0, afterAssetId), safeLimit(maxItems));
+  }
+
+  @Override
+  public List<ScanRunSubjectAsset> listRunSubjectAssets(
+      long scanRunId, long afterRepositoryId, long afterAssetId, int maxItems, boolean currentOnly) {
+    // Paginate the distinct subjects before joining; never hydrate full asset metadata here.
     return jdbc.query("""
+        SELECT subjects.*, live_asset.repository_id AS source_repository_id
+        FROM (%s) subjects
+        LEFT JOIN asset live_asset ON live_asset.id = subjects.asset_id
+        ORDER BY subjects.repository_id, subjects.asset_id
+        """.formatted(runSubjectsSql(currentOnly)),
+        (rs, rowNum) -> new ScanRunSubjectAsset(runSubject(rs), nullableLong(rs, "source_repository_id")),
+        scanRunId, Math.max(0, afterRepositoryId), Math.max(0, afterRepositoryId),
+        Math.max(0, afterAssetId), safeLimit(maxItems));
+  }
+
+  private ScanRunSubject runSubject(ResultSet rs) throws SQLException {
+    return new ScanRunSubject(rs.getLong("scan_run_id"), rs.getLong("repository_id"),
+        rs.getLong("asset_id"), rs.getLong("profile_id"), rs.getLong("content_generation"),
+        nullableInstant(rs, "associated_at"));
+  }
+
+  private String runSubjectsSql(boolean currentOnly) {
+    return """
         SELECT
           scan_run_id,
           repository_id,
@@ -2324,14 +2504,45 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
           MIN(profile_id) AS profile_id,
           MIN(content_generation) AS content_generation,
           MIN(associated_at) AS associated_at
-        FROM security_scan_run_subject
+        FROM security_scan_run_subject subject
         WHERE scan_run_id = ?
+          %s
           AND (
             repository_id > ?
             OR (repository_id = ? AND asset_id > ?)
           )
         GROUP BY scan_run_id, repository_id, asset_id
         ORDER BY repository_id, asset_id
+        LIMIT ?
+        """.formatted(currentOnly
+            ? " AND " + repositoryScope.currentFindingSubjectPredicate("subject") : "");
+  }
+
+  @Override
+  public List<ScanRunSubject> listCurrentRunSubjects(
+      long scanRunId, long afterRepositoryId, long afterAssetId, int maxItems) {
+    return jdbc.query("""
+        SELECT
+          subject.scan_run_id,
+          subject.repository_id,
+          subject.asset_id,
+          MIN(subject.profile_id) AS profile_id,
+          MIN(subject.content_generation) AS content_generation,
+          MIN(subject.associated_at) AS associated_at
+        FROM security_scan_run_subject subject
+        JOIN security_scan_candidate candidate
+          ON candidate.asset_id = subject.asset_id
+         AND candidate.content_generation = subject.content_generation
+        JOIN asset live_asset
+          ON live_asset.id = subject.asset_id
+         AND live_asset.asset_blob_id = candidate.asset_blob_id
+        WHERE subject.scan_run_id = ?
+          AND (
+            subject.repository_id > ?
+            OR (subject.repository_id = ? AND subject.asset_id > ?)
+          )
+        GROUP BY subject.scan_run_id, subject.repository_id, subject.asset_id
+        ORDER BY subject.repository_id, subject.asset_id
         LIMIT ?
         """,
         (rs, rowNum) -> new ScanRunSubject(
@@ -2346,6 +2557,119 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
         Math.max(0, afterRepositoryId),
         Math.max(0, afterAssetId),
         safeLimit(maxItems));
+  }
+
+  @Override
+  public List<ScanRunSubject> listCurrentRunSubjects(
+      long scanRunId,
+      List<Long> repositoryIds,
+      long afterRepositoryId,
+      long afterAssetId,
+      int maxItems) {
+    return listCurrentRunSubjects(
+        scanRunId, repositoryIds, afterRepositoryId, afterAssetId, maxItems, false);
+  }
+
+  @Override
+  public List<ScanRunSubject> listCurrentRunSubjects(
+      long scanRunId,
+      List<Long> repositoryIds,
+      long afterRepositoryId,
+      long afterAssetId,
+      int maxItems,
+      boolean currentOnly) {
+    List<Long> ids = repositoryScope.distinctLongs(repositoryIds);
+    if (ids.isEmpty()) return List.of();
+    return jdbc.query(currentRunSubjectScopeCte() + """
+        SELECT
+          subject.scan_run_id,
+          subject.repository_id,
+          subject.asset_id,
+          MIN(subject.profile_id) AS profile_id,
+          MIN(subject.content_generation) AS content_generation,
+          MIN(subject.associated_at) AS associated_at
+        FROM security_scan_run_subject subject
+        JOIN security_scan_candidate candidate
+          ON candidate.asset_id = subject.asset_id
+         AND candidate.content_generation = subject.content_generation
+        JOIN asset live_asset
+          ON live_asset.id = subject.asset_id
+         AND live_asset.asset_blob_id = candidate.asset_blob_id
+        JOIN visible_context_source scope
+          ON scope.context_repository_id = subject.repository_id
+         AND scope.source_repository_id = live_asset.repository_id
+        WHERE subject.scan_run_id = ?
+          %s
+          AND (
+            subject.repository_id > ?
+            OR (subject.repository_id = ? AND subject.asset_id > ?)
+          )
+        GROUP BY subject.scan_run_id, subject.repository_id, subject.asset_id
+        ORDER BY subject.repository_id, subject.asset_id
+        LIMIT ?
+        """.formatted(currentOnly
+            ? " AND " + repositoryScope.currentFindingSubjectPredicate("subject") : ""),
+        (rs, rowNum) -> new ScanRunSubject(
+            rs.getLong("scan_run_id"),
+            rs.getLong("repository_id"),
+            rs.getLong("asset_id"),
+            rs.getLong("profile_id"),
+            rs.getLong("content_generation"),
+            nullableInstant(rs, "associated_at")),
+        repositoryScope.parameter(ids),
+        scanRunId,
+        Math.max(0, afterRepositoryId),
+        Math.max(0, afterRepositoryId),
+        Math.max(0, afterAssetId),
+        safeLimit(maxItems));
+  }
+
+  @Override
+  public long countCurrentRunSubjects(long scanRunId, List<Long> repositoryIds) {
+    return countCurrentRunSubjects(scanRunId, repositoryIds, false);
+  }
+
+  @Override
+  public long countCurrentRunSubjects(long scanRunId, List<Long> repositoryIds, boolean currentOnly) {
+    List<Long> ids = repositoryScope.distinctLongs(repositoryIds);
+    if (ids.isEmpty()) return 0;
+    Long count = jdbc.queryForObject(currentRunSubjectScopeCte() + """
+        SELECT COUNT(*)
+        FROM (
+          SELECT subject.repository_id, subject.asset_id
+          FROM security_scan_run_subject subject
+          JOIN security_scan_candidate candidate
+            ON candidate.asset_id = subject.asset_id
+           AND candidate.content_generation = subject.content_generation
+          JOIN asset live_asset
+            ON live_asset.id = subject.asset_id
+           AND live_asset.asset_blob_id = candidate.asset_blob_id
+          JOIN visible_context_source scope
+            ON scope.context_repository_id = subject.repository_id
+           AND scope.source_repository_id = live_asset.repository_id
+          WHERE subject.scan_run_id = ?
+            %s
+          GROUP BY subject.repository_id, subject.asset_id
+        ) current_subject
+        """.formatted(currentOnly
+            ? " AND " + repositoryScope.currentFindingSubjectPredicate("subject") : ""),
+        Long.class, repositoryScope.parameter(ids), scanRunId);
+    return count == null ? 0 : count;
+  }
+
+  private String currentRunSubjectScopeCte() {
+    return repositoryScope.recursiveRepositoryScopeCte() + """
+        ,
+        visible_context_source(context_repository_id, source_repository_id) AS (
+          SELECT repository_id, repository_id
+          FROM visible_repository
+          UNION
+          SELECT context.context_repository_id, member.member_repository_id
+          FROM visible_context_source context
+          JOIN repository_member member
+            ON member.repository_id = context.source_repository_id
+        )
+        """;
   }
 
   @Override
@@ -2447,8 +2771,20 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
       String query,
       long afterId,
       int maxItems) {
+    return listFindings(repositoryId, scanRunId, severity, query, afterId, maxItems, false);
+  }
+
+  @Override
+  public List<ScanFinding> listFindings(
+      Long repositoryId,
+      Long scanRunId,
+      Severity severity,
+      String query,
+      long afterId,
+      int maxItems,
+      boolean currentOnly) {
     return listFindings(
-        repositoryId, null, scanRunId, severity, query, afterId, maxItems);
+        repositoryId, null, scanRunId, severity, query, afterId, maxItems, currentOnly);
   }
 
   @Override
@@ -2459,9 +2795,22 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
       String query,
       long afterId,
       int maxItems) {
+    return listFindingsByRepositories(
+        repositoryIds, scanRunId, severity, query, afterId, maxItems, false);
+  }
+
+  @Override
+  public List<ScanFinding> listFindingsByRepositories(
+      List<Long> repositoryIds,
+      Long scanRunId,
+      Severity severity,
+      String query,
+      long afterId,
+      int maxItems,
+      boolean currentOnly) {
     List<Long> ids = repositoryScope.distinctLongs(repositoryIds);
     if (ids.isEmpty()) return List.of();
-    return listFindings(null, ids, scanRunId, severity, query, afterId, maxItems);
+    return listFindings(null, ids, scanRunId, severity, query, afterId, maxItems, currentOnly);
   }
 
   private List<ScanFinding> listFindings(
@@ -2471,7 +2820,8 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
       Severity severity,
       String query,
       long afterId,
-      int maxItems) {
+      int maxItems,
+      boolean currentOnly) {
     StringBuilder sql = new StringBuilder();
     List<Object> args = new ArrayList<>();
     if (repositoryIds != null) {
@@ -2489,8 +2839,10 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
            AND EXISTS (
              SELECT 1 FROM security_scan_run_subject s
              WHERE s.scan_run_id = f.scan_run_id AND s.repository_id = ?
+               %s
            )
-          """);
+          """.formatted(currentOnly
+              ? " AND " + repositoryScope.currentFindingSubjectPredicate("s") : ""));
       args.add(repositoryId);
     } else if (repositoryIds != null) {
       sql.append("""
@@ -2500,8 +2852,14 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
              JOIN visible_repository visible
                ON visible.repository_id = s.repository_id
              WHERE s.scan_run_id = f.scan_run_id
+               %s
            )
-          """);
+          """.formatted(currentOnly
+              ? " AND " + repositoryScope.currentFindingSubjectPredicate("s") : ""));
+    } else if (currentOnly) {
+      sql.append(" AND EXISTS (SELECT 1 FROM security_scan_run_subject s"
+          + " WHERE s.scan_run_id = f.scan_run_id AND "
+          + repositoryScope.currentFindingSubjectPredicate("s") + ")");
     }
     if (scanRunId != null) {
       sql.append(" AND f.scan_run_id = ?");
@@ -2668,6 +3026,7 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
   @Override
   @Transactional
   public AssetSecurityState upsertAssetStateIfCurrent(AssetSecurityState state) {
+    lockPolicyReference(state.policyId());
     lockScanCandidate(state.assetId());
     int updated = updateAssetState(state);
     if (updated == 0 && candidateGenerationMatches(state.assetId(), state.contentGeneration())) {
@@ -2773,6 +3132,7 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
   @Override
   @Transactional
   public AssetPolicyState upsertAssetPolicyStateIfCurrent(AssetPolicyState state) {
+    lockPolicyReference(state.policyId());
     if (!lockWaiverRevision(state.waiverRevision())) {
       throw new IllegalStateException(
           "Waiver revision changed before policy evaluation was materialized");
@@ -3061,6 +3421,53 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
     return jdbc.query(sql.toString(), policyMapper, args.toArray());
   }
 
+  private void lockPolicyReference(Long policyId) {
+    if (policyId == null) return;
+    // Share the parent lock before touching child rows. This permits parallel writers but
+    // fences deletion until their transaction commits. A current read also detects deletion
+    // committed after an earlier MySQL REPEATABLE READ validation snapshot.
+    List<Long> existing = jdbc.query(
+        "SELECT id FROM security_scan_policy WHERE id = ? FOR SHARE",
+        (rs, rowNum) -> rs.getLong("id"), policyId);
+    if (existing.isEmpty()) throw new ScanPolicyReferenceConflictException(policyId);
+  }
+
+  @Override
+  public List<ScanPolicy> listPolicyOptions(Long assignedPolicyId, long afterId, int maxItems) {
+    // Group the indexed policy names/revisions before loading rows. Historical
+    // revisions never consume option pages unless they are currently assigned.
+    return jdbc.query("""
+        SELECT policy.* FROM security_scan_policy policy
+        JOIN (
+          SELECT candidate.id FROM security_scan_policy candidate
+          JOIN (
+            SELECT name_normalized, MAX(revision) AS revision
+            FROM security_scan_policy GROUP BY name_normalized
+          ) heads ON heads.name_normalized = candidate.name_normalized
+                 AND heads.revision = candidate.revision
+          WHERE candidate.id > ?
+          UNION
+          SELECT id FROM security_scan_policy WHERE id = ? AND id > ?
+        ) selected ON selected.id = policy.id
+        ORDER BY policy.id LIMIT ?
+        """, policyMapper, Math.max(0, afterId),
+        assignedPolicyId == null ? 0L : assignedPolicyId, Math.max(0, afterId), safeLimit(maxItems));
+  }
+
+  @Override
+  public List<Long> findLatestPolicyIds(List<Long> policyIds) {
+    if (policyIds.isEmpty()) return List.of();
+    String placeholders = String.join(",", java.util.Collections.nCopies(policyIds.size(), "?"));
+    return jdbc.query("""
+        SELECT policy.id FROM security_scan_policy policy
+        WHERE policy.id IN (%s) AND NOT EXISTS (
+          SELECT 1 FROM security_scan_policy newer
+          WHERE newer.name_normalized = policy.name_normalized
+            AND newer.revision > policy.revision
+        ) ORDER BY policy.id
+        """.formatted(placeholders), (rs, rowNum) -> rs.getLong("id"), policyIds.toArray());
+  }
+
   @Override
   public Optional<ScanPolicy> findPolicy(long policyId) {
     return jdbc.query(
@@ -3122,7 +3529,7 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
   public Optional<ScanPolicy> createNextPolicyRevision(
       long expectedHeadPolicyId, ScanPolicy policy) {
     String normalizedName = normalizedPolicyName(policy.name());
-    jdbc.query("""
+    Optional<Long> root = jdbc.query("""
         SELECT id
         FROM security_scan_policy
         WHERE name_normalized = ?
@@ -3131,9 +3538,8 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
         FOR UPDATE
         """, (rs, rowNum) -> rs.getLong("id"), normalizedName)
         .stream()
-        .findFirst()
-        .orElseThrow(() ->
-            new IllegalStateException("Security scan policy root no longer exists"));
+        .findFirst();
+    if (root.isEmpty()) return Optional.empty();
     PolicyHead head = jdbc.query("""
         SELECT id, revision
         FROM security_scan_policy
@@ -3177,8 +3583,51 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
   private record PolicyHead(long id, long revision) {}
 
   @Override
+  @Transactional
+  public PolicyDeletion deletePolicyIfUnused(long expectedHeadPolicyId) {
+    Optional<ScanPolicy> requested = findPolicy(expectedHeadPolicyId);
+    if (requested.isEmpty()) return PolicyDeletion.NOT_FOUND;
+    String name = normalizedPolicyName(requested.get().name());
+    // Revision creation locks the same durable root first. No JVM-local lock is involved.
+    List<Long> root = jdbc.query("""
+        SELECT id FROM security_scan_policy
+        WHERE name_normalized = ? ORDER BY id LIMIT 1 FOR UPDATE
+        """, (rs, rowNum) -> rs.getLong("id"), name);
+    if (root.isEmpty()) return PolicyDeletion.NOT_FOUND;
+    long[] head = {0, 0};
+    // Lock older revisions too: FK writers referencing any revision must finish before the
+    // reference checks, or wait until deletion commits. Do not materialize the revision history.
+    jdbc.query("""
+        SELECT id, revision FROM security_scan_policy
+        WHERE name_normalized = ? ORDER BY id FOR UPDATE
+        """, (org.springframework.jdbc.core.RowCallbackHandler) rs -> {
+          if (rs.getLong("revision") > head[1]) {
+            head[0] = rs.getLong("id");
+            head[1] = rs.getLong("revision");
+          }
+        }, name);
+    if (head[0] != expectedHeadPolicyId) return PolicyDeletion.STALE_REVISION;
+    for (String table : List.of(
+        "repository_security_scan_config", "asset_security_state",
+        "asset_security_policy_state", "security_scan_waiver")) {
+      // Locking reads see committed references even if MySQL's transaction snapshot predates
+      // an assignment. Plain SELECT would miss a writer that committed while we waited above.
+      List<Long> references = jdbc.query("""
+          SELECT r.policy_id FROM %s r
+          JOIN security_scan_policy p ON p.id = r.policy_id
+          WHERE p.name_normalized = ? LIMIT 1 FOR UPDATE
+          """.formatted(table), (rs, rowNum) -> rs.getLong("policy_id"), name);
+      if (!references.isEmpty()) return PolicyDeletion.IN_USE;
+    }
+    jdbc.update("DELETE FROM security_scan_policy WHERE name_normalized = ?", name);
+    return PolicyDeletion.DELETED;
+  }
+
+  @Override
+  @Transactional
   public int replaceRepositoryPolicy(
       long currentPolicyId, long replacementPolicyId, Instant updatedAt) {
+    lockPolicyReference(replacementPolicyId);
     return jdbc.update("""
         UPDATE repository_security_scan_config
         SET policy_id = ?, config_revision = config_revision + 1, updated_at = ?
@@ -3190,7 +3639,9 @@ public class JdbcSecurityScanDao implements SecurityScanDao {
   }
 
   @Override
+  @Transactional
   public ScanWaiver createWaiver(ScanWaiver waiver) {
+    lockPolicyReference(waiver.policyId());
     long id = JdbcInserts.insert(jdbc, """
         INSERT INTO security_scan_waiver
           (scope_type, repository_id, asset_id, finding_id, advisory_selector,

@@ -7,6 +7,7 @@ import java.util.Locale;
 public enum RepositoryFormat {
   MAVEN2,
   NPM,
+  OHPM,
   PYPI,
   CARGO,
   PUB,
@@ -26,6 +27,7 @@ public enum RepositoryFormat {
   ALPINE,
   R,
   HUGGINGFACE,
+  GITLFS,
   RAW;
 
   @JsonCreator

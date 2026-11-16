@@ -3,6 +3,9 @@ package com.github.klboke.kkrepo.server.browse;
 import com.github.klboke.kkrepo.auth.AccessDecision;
 import com.github.klboke.kkrepo.core.RepositoryFormat;
 import com.github.klboke.kkrepo.core.RepositoryType;
+import com.github.klboke.kkrepo.protocol.ohpm.OhpmBrowsePath;
+import com.github.klboke.kkrepo.protocol.ohpm.OhpmException;
+import com.github.klboke.kkrepo.server.ohpm.OhpmHostedService;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AnsibleGalaxyRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AptRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.AlpineRegistryDao;
@@ -13,6 +16,7 @@ import com.github.klboke.kkrepo.persistence.jdbc.api.MetadataRebuildDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryIndexRebuildDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RRegistryDao;
+import com.github.klboke.kkrepo.protocol.r.RPathParser;
 import com.github.klboke.kkrepo.persistence.jdbc.api.SwiftRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.TerraformRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.AssetRecord;
@@ -48,6 +52,7 @@ import com.github.klboke.kkrepo.server.security.AuthenticatedSubject;
 import com.github.klboke.kkrepo.server.security.SecurityAuthenticationService;
 import com.github.klboke.kkrepo.server.security.SecurityManagementService;
 import jakarta.servlet.http.HttpServletRequest;
+import com.github.klboke.kkrepo.server.transaction.TransientTransactionRetry;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -71,6 +76,13 @@ import org.springframework.web.server.ResponseStatusException;
 @RestController
 @RequestMapping("/internal/browse")
 public class BrowseContentDeleteController {
+  private TransientTransactionRetry transactionRetry;
+
+  @Autowired
+  void setTransactionRetry(TransientTransactionRetry transactionRetry) {
+    this.transactionRetry = transactionRetry;
+  }
+
   private static final List<String> MAVEN_HASH_SUFFIXES = List.of(".sha1", ".sha256", ".sha512", ".md5");
   private static final SwiftPathParser SWIFT_PATHS = new SwiftPathParser();
   private static final NugetPathParser NUGET_PATHS = new NugetPathParser();
@@ -101,6 +113,14 @@ public class BrowseContentDeleteController {
   private CondaService condaService;
   private HelmGroupIndexCache helmGroupIndexCache;
   private DockerBrowseDeleteService dockerDeleteService;
+  private OhpmHostedService ohpmHosted;
+
+  @Autowired
+  void setOhpmDeleteSupport(RepositoryRuntimeRegistry runtimeRegistry,
+      OhpmHostedService ohpmHosted) {
+    this.runtimeRegistry = runtimeRegistry;
+    this.ohpmHosted = ohpmHosted;
+  }
 
   public BrowseContentDeleteController(
       RepositoryDao repositoryDao,
@@ -185,7 +205,6 @@ public class BrowseContentDeleteController {
   }
 
   @DeleteMapping("/{repository}")
-  @Transactional
   public BrowseDeleteResult delete(
       @PathVariable("repository") String repository,
       @RequestParam("path") String path,
@@ -199,7 +218,10 @@ public class BrowseContentDeleteController {
       throw new ResponseStatusException(HttpStatus.FORBIDDEN, decision.reason());
     }
 
-    return deleteAuthorized(repository, path, sourceRepository, subject.userId());
+    return transactionRetry == null
+        ? deleteAuthorized(repository, path, sourceRepository, subject.userId())
+        : transactionRetry.executeIfNoTransaction("browse-content-delete",
+            () -> deleteAuthorized(repository, path, sourceRepository, subject.userId()));
   }
 
   @Transactional
@@ -383,6 +405,21 @@ public class BrowseContentDeleteController {
     }
     RepositoryRecord target = resolveTargetRepository(
         requested, storagePath, resolvedSourceRepository);
+    if (target.format() == RepositoryFormat.OHPM) {
+      if (target.type() != RepositoryType.HOSTED) {
+        throw new ResponseStatusException(HttpStatus.METHOD_NOT_ALLOWED,
+            "OHPM unpublish requires a hosted repository; use cache invalidation for proxy content");
+      }
+      var runtime = runtimeRegistry.resolveFreshById(target.id())
+          .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Repository not found"));
+      try {
+        int deleted = ohpmHosted.deleteBrowse(runtime, OhpmBrowsePath.parse(publicPath));
+        return new BrowseDeleteResult(requested.name(), target.name(), publicPath, deleted);
+      } catch (OhpmException error) {
+        throw new ResponseStatusException(org.springframework.http.HttpStatusCode.valueOf(error.status()),
+            error.getMessage());
+      }
+    }
     if (target.format() == RepositoryFormat.CONDA
         && target.type() == RepositoryType.HOSTED) {
       return deleteCondaPackage(requested, target, publicPath, condaCoordinate, actorId);
@@ -624,13 +661,15 @@ public class BrowseContentDeleteController {
     Optional<RRegistryDao.PackageRecord> direct =
         rRegistry.findPackageByPath(repository.id(), publicPath);
     if (direct.isPresent()) return direct.orElseThrow().path();
-    String[] segments = publicPath.split("/", -1);
-    if (segments.length != 3) return publicPath;
+    var projected = new RPathParser().parseBrowseProjection(publicPath);
+    if (!projected.hostedPackage()) return publicPath;
+    String packageType = RPathParser.packageType(projected.namespace());
     return rRegistry.findPackage(
-            repository.id(), "src/contrib", "source", segments[0], segments[1], "source")
-        .filter(record -> segments[2].equals(record.filename()))
+            repository.id(), projected.namespace(), packageType,
+            projected.packageName(), projected.version(), packageType)
+        .filter(record -> projected.filename().equals(record.filename()))
         .map(RRegistryDao.PackageRecord::path)
-        .orElse(publicPath);
+        .orElse(projected.normalized());
   }
 
   private BrowseDeleteResult deleteResolvedAssets(
@@ -740,16 +779,7 @@ public class BrowseContentDeleteController {
   }
 
   private List<RepositoryRecord> repositorySources(RepositoryRecord repository) {
-    if (repository.format() == RepositoryFormat.SWIFT) {
-      return BrowseRepositorySources.swiftSources(repository, repositoryDao);
-    }
-    if (repository.format() == RepositoryFormat.ANSIBLEGALAXY) {
-      return BrowseRepositorySources.ansibleSources(repository, repositoryDao);
-    }
-    if (repository.format() == RepositoryFormat.CONDA) {
-      return BrowseRepositorySources.condaSources(repository, repositoryDao);
-    }
-    return repositoryDao.listMembers(repository.id());
+    return BrowseRepositorySources.sources(repository, repositoryDao);
   }
 
   private AnsibleGalaxyRegistryDao.CollectionVersion requireMatchingAnsibleVersion(
@@ -937,7 +967,9 @@ public class BrowseContentDeleteController {
       return;
     }
     if (target.format() == RepositoryFormat.YUM) {
-      repositoryIndexRebuildDao.enqueue(target.id(), RepositoryIndexRebuildDao.YUM_METADATA);
+      repositoryIndexRebuildDao.enqueue(target.id(), RepositoryIndexRebuildDao.YUM_METADATA,
+          com.github.klboke.kkrepo.server.yum.YumMetadataDepth.rebuildScope(
+              com.github.klboke.kkrepo.server.yum.YumMetadataDepth.read(target.attributes()), storagePath));
       return;
     }
     if (target.format() == RepositoryFormat.RUBYGEMS) {
@@ -1010,6 +1042,13 @@ public class BrowseContentDeleteController {
   }
 
   private static String toStoragePath(RepositoryFormat format, String publicPath) {
+    if (format == RepositoryFormat.OHPM) {
+      try {
+        return OhpmBrowsePath.parse(publicPath).storagePath();
+      } catch (IllegalArgumentException invalid) {
+        throw new ResponseStatusException(HttpStatus.BAD_REQUEST, invalid.getMessage());
+      }
+    }
     if (format == RepositoryFormat.ANSIBLEGALAXY) {
       AnsibleCoordinate coordinate = ansibleCoordinate(publicPath);
       return coordinate == null
@@ -1020,9 +1059,6 @@ public class BrowseContentDeleteController {
       return CondaBrowsePaths.toStoragePath(publicPath);
     }
     if (format != RepositoryFormat.PYPI) {
-      return publicPath;
-    }
-    if (publicPath.equals("simple") || publicPath.startsWith("simple/")) {
       return publicPath;
     }
     return "packages/" + publicPath;

@@ -20,17 +20,23 @@ import com.github.klboke.kkrepo.persistence.jdbc.api.DockerAuthTokenDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.DockerRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.DockerUploadDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.HuggingFaceRegistryDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.GitLfsDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.MaintenanceCursorDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.MetadataRebuildDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.MigrationCheckpointDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.MigrationJobDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.NpmReleaseIndexDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.OhpmImportDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.OhpmLoginDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.OhpmRepositoryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.PersistenceStoreFactory;
 import com.github.klboke.kkrepo.persistence.jdbc.api.PersistenceStores;
+import com.github.klboke.kkrepo.persistence.jdbc.api.StorageStatisticsDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.ProxyStateDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.PubUploadSessionDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryDao;
+import com.github.klboke.kkrepo.persistence.jdbc.api.RoutingRuleDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryDataMigrationDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryIndexRebuildDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.SecurityAuditDao;
@@ -80,20 +86,26 @@ public final class JdbcPersistenceStoreFactory implements PersistenceStoreFactor
         new JdbcDockerRegistryDao(jdbc, json),
         new JdbcDockerUploadDao(jdbc, json),
         new JdbcHuggingFaceRegistryDao(jdbc, dialect),
+        new JdbcGitLfsDao(jdbc),
         new JdbcMaintenanceCursorDao(jdbc),
         new JdbcMetadataRebuildDao(jdbc, dialect),
         new JdbcMigrationCheckpointDao(jdbc),
         new JdbcMigrationJobDao(jdbc, json),
         new JdbcNpmReleaseIndexDao(jdbc),
+        new JdbcOhpmImportDao(jdbc, json),
+        new JdbcOhpmLoginDao(jdbc),
+        new JdbcOhpmRepositoryDao(jdbc, json),
         new JdbcProxyStateDao(jdbc, 30),
         new JdbcRRegistryDao(jdbc, json, dialect),
         new JdbcPubUploadSessionDao(jdbc, json),
         new JdbcRepositoryDao(jdbc, json),
+        new JdbcRoutingRuleDao(jdbc, json),
         new JdbcRepositoryDataMigrationDao(jdbc, json, dialect),
         new JdbcRepositoryIndexRebuildDao(jdbc, dialect),
         new JdbcSecurityAuditDao(jdbc, json),
         new JdbcSecurityDao(jdbc, json, dialect),
         new JdbcSecurityScanDao(jdbc, json, dialect),
+        new JdbcStorageStatisticsDao(jdbc),
         new JdbcSwiftRegistryDao(jdbc, json, dialect),
         new JdbcTerraformRegistryDao(jdbc),
         new JdbcUiSettingsDao(jdbc));
@@ -118,20 +130,26 @@ public final class JdbcPersistenceStoreFactory implements PersistenceStoreFactor
       DockerRegistryDao dockerRegistry,
       DockerUploadDao dockerUploads,
       HuggingFaceRegistryDao huggingFaceRegistry,
+      GitLfsDao gitLfs,
       MaintenanceCursorDao maintenanceCursors,
       MetadataRebuildDao metadataRebuild,
       MigrationCheckpointDao migrationCheckpoints,
       MigrationJobDao migrationJobs,
       NpmReleaseIndexDao npmReleaseIndexes,
+      OhpmImportDao ohpmImports,
+      OhpmLoginDao ohpmLogin,
+      OhpmRepositoryDao ohpmRepository,
       ProxyStateDao proxyStates,
       RRegistryDao rRegistry,
       PubUploadSessionDao pubUploadSessions,
       RepositoryDao repositories,
+      RoutingRuleDao routingRules,
       RepositoryDataMigrationDao repositoryDataMigrations,
       RepositoryIndexRebuildDao repositoryIndexRebuild,
       SecurityAuditDao securityAudit,
       SecurityDao security,
       SecurityScanDao securityScanning,
+      StorageStatisticsDao storageStatistics,
       SwiftRegistryDao swiftRegistry,
       TerraformRegistryDao terraformRegistry,
       UiSettingsDao uiSettings) implements PersistenceStores {

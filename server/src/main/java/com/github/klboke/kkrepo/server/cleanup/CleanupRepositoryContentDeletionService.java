@@ -13,6 +13,7 @@ import com.github.klboke.kkrepo.server.maven.RepositoryRuntime;
 import com.github.klboke.kkrepo.server.maven.RepositoryRuntimeRegistry;
 import com.github.klboke.kkrepo.server.npm.NpmHostedService;
 import com.github.klboke.kkrepo.server.r.RService;
+import com.github.klboke.kkrepo.server.rubygems.RubygemsService;
 import java.util.List;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -29,6 +30,14 @@ public class CleanupRepositoryContentDeletionService
   private ConanService conanService;
   private AlpineService alpineService;
   private RService rService;
+  private RubygemsService rubygemsService;
+  private com.github.klboke.kkrepo.server.maven.MavenSnapshotDeletionService snapshotDeletion;
+
+  @Autowired
+  void setSnapshotDeletion(com.github.klboke.kkrepo.server.maven.MavenSnapshotDeletionService snapshotDeletion) {
+    this.snapshotDeletion = snapshotDeletion;
+  }
+
 
   public CleanupRepositoryContentDeletionService(
       BrowseContentDeleteController browseDeletion,
@@ -58,6 +67,11 @@ public class CleanupRepositoryContentDeletionService
     this.rService = rService;
   }
 
+  @Autowired
+  void setRubygemsService(RubygemsService rubygemsService) {
+    this.rubygemsService = rubygemsService;
+  }
+
   @Override
   public int deleteForCleanup(
       String repository,
@@ -68,6 +82,9 @@ public class CleanupRepositoryContentDeletionService
     RepositoryRuntime runtime = runtimes.resolve(repository)
         .orElseThrow(() -> new CleanupValidationException(
             "cleanup repository runtime was not found: " + repository));
+    if (MavenSnapshotCleanupService.KIND.equals(subjectKind)) {
+      return snapshotDeletion.delete(repository, subjectId);
+    }
     if (runtime.format() == RepositoryFormat.NPM
         && runtime.type() == RepositoryType.HOSTED
         && "COMPONENT".equals(subjectKind)) {
@@ -79,8 +96,13 @@ public class CleanupRepositoryContentDeletionService
       return conanService.deleteComponentForCleanup(runtime, subjectId, actorId);
     }
     if (runtime.format() != RepositoryFormat.DOCKER) {
-      return browseDeletion.deleteForCleanup(
+      int deleted = browseDeletion.deleteForCleanup(
           repository, subjectKind, subjectId, path, actorId);
+      if (deleted > 0 && runtime.format() == RepositoryFormat.RUBYGEMS
+          && runtime.type() == RepositoryType.HOSTED && rubygemsService != null) {
+        rubygemsService.refreshMetadataAfterAdministrativeDelete(runtime, path);
+      }
+      return deleted;
     }
     if (!"DOCKER_MANIFEST".equals(subjectKind) || path == null) {
       throw new CleanupValidationException("invalid Docker cleanup subject");

@@ -1,5 +1,6 @@
 package com.github.klboke.kkrepo.server.transaction;
 
+import java.sql.SQLException;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Supplier;
 import org.slf4j.Logger;
@@ -31,10 +32,21 @@ public class TransientTransactionRetry {
   }
 
   public <T> T execute(String operation, Supplier<T> callback) {
+    return retry(operation, () -> transactionTemplate.execute(status -> callback.get()));
+  }
+
+  /** Retry a complete transaction owned by the callback, preserving its isolation and rollback rules. */
+  public <T> T retryTransaction(String operation, Supplier<T> transaction) {
+    // An outer transaction must be retried by its owner, never continued after a deadlock.
+    if (TransactionSynchronizationManager.isActualTransactionActive()) return transaction.get();
+    return retry(operation, transaction);
+  }
+
+  private <T> T retry(String operation, Supplier<T> transaction) {
     int attempt = 1;
     while (true) {
       try {
-        return transactionTemplate.execute(status -> callback.get());
+        return transaction.get();
       } catch (RuntimeException e) {
         if (!isTransient(e) || attempt >= maxAttempts) {
           throw e;
@@ -60,6 +72,11 @@ public class TransientTransactionRetry {
     Throwable current = error;
     while (current != null) {
       if (current instanceof TransientDataAccessException) {
+        return true;
+      }
+      // PostgreSQL lock_timeout/NOWAIT can reach Spring's fallback translator as an
+      // UncategorizedSQLException. Retry the whole transaction, never the aborted statement.
+      if (current instanceof SQLException sql && "55P03".equals(sql.getSQLState())) {
         return true;
       }
       current = current.getCause();

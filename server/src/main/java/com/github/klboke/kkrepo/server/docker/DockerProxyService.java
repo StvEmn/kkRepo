@@ -28,6 +28,9 @@ import org.springframework.stereotype.Service;
 
 @Service
 public class DockerProxyService {
+  @Autowired
+  private com.github.klboke.kkrepo.server.proxy.ProgressiveProxyService streaming;
+
   private final DockerBlobStore blobStore;
   private final DockerManifestStore manifestStore;
   private final DockerRemoteRegistryClient remoteClient;
@@ -162,13 +165,28 @@ public class DockerProxyService {
       recordCache(runtime, "blob", "miss");
     }
     String remoteImage = remoteImageName(runtime, imageName);
-    DigestedFile remoteBlob = null;
     String remotePath = remoteImage + "/blobs/" + digest.value();
     if (isNotFoundCached(runtime, remotePath)) {
       recordCache(runtime, "negative", "hit");
       throw new DockerProtocolException(DockerErrorCode.BLOB_UNKNOWN, digest.value());
     }
-    try (HttpRemoteFetcher.Result result = remoteClient.get(runtime, remotePath, "application/octet-stream")) {
+    try {
+      return com.github.klboke.kkrepo.server.proxy.ProgressiveProxyService.fetchDocker(
+          streaming, request -> {
+            HttpRemoteFetcher.Result fetched = request.byteRange() == null
+                ? remoteClient.get(runtime, remotePath, "application/octet-stream")
+                : remoteClient.get(runtime, remotePath, null, "application/octet-stream", request.byteRange());
+            try {
+              if (streaming != null && runtime.streamingEnabled()
+                  && fetched.status() >= 200 && fetched.status() < 300) {
+                manifestStore.beforeBlobRead(runtime, imageName, digest);
+              }
+              return fetched;
+            } catch (RuntimeException error) { fetched.close(); throw error; }
+          }, HttpRemoteFetcher.Request.get(runtime.proxyRemoteUrl()), blobStore.blobPath(digest),
+          runtime, !headOnly && digest.isSha256(), digest.hex(), result -> {
+      DigestedFile remoteBlob = null;
+      try {
       if (result.status() == 404) {
         rememberNotFound(runtime, remotePath);
         recordCache(runtime, "negative", "store_blob");
@@ -216,12 +234,12 @@ public class DockerProxyService {
           .withContentType(blobContentType(stored.blob().contentType()))
           .withHeader(DockerConstants.CONTENT_DIGEST_HEADER, digest.value())
           .withHeader("Accept-Ranges", "bytes");
-    } catch (IOException e) {
-      throw new DockerProtocolException(DockerErrorCode.BLOB_UNKNOWN, "remote blob fetch failed: " + e.getMessage(), 502);
-    } finally {
-      if (remoteBlob != null) {
-        TempBlobFiles.deleteQuietly(remoteBlob.path());
+      } finally {
+        if (remoteBlob != null) TempBlobFiles.deleteQuietly(remoteBlob.path());
       }
+      });
+    } catch (IOException e) {
+      throw new DockerProtocolException(DockerErrorCode.BLOB_UNKNOWN, "remote blob fetch failed", 502);
     }
   }
 
@@ -229,14 +247,14 @@ public class DockerProxyService {
     ensureProxy(runtime);
     String remoteImage = remoteImageName(runtime, imageName);
     int pageSize = Math.max(1, Math.min(limit, 1000));
-    String remotePath = remoteImage + "/tags/list?n=" + (pageSize + 1)
+    String query = "n=" + (pageSize + 1)
         + (last == null || last.isBlank() ? "" : "&last=" + java.net.URLEncoder.encode(last, java.nio.charset.StandardCharsets.UTF_8));
     String namePath = remoteImage + "/tags/list";
     if (isNotFoundCached(runtime, namePath)) {
       recordCache(runtime, "negative", "hit");
       throw new DockerProtocolException(DockerErrorCode.NAME_UNKNOWN, imageName);
     }
-    try (HttpRemoteFetcher.Result result = remoteClient.get(runtime, remotePath, DockerConstants.MEDIA_TYPE_JSON)) {
+    try (HttpRemoteFetcher.Result result = remoteClient.get(runtime, namePath, query, DockerConstants.MEDIA_TYPE_JSON)) {
       if (result.status() == 404) {
         rememberNotFound(runtime, namePath);
         recordCache(runtime, "negative", "store_tags");
@@ -265,11 +283,11 @@ public class DockerProxyService {
   public DockerCatalogList catalog(RepositoryRuntime runtime, String last, int limit) {
     ensureProxy(runtime);
     int pageSize = Math.max(1, Math.min(limit, 1000));
-    String remotePath = "_catalog?n=" + (pageSize + 1)
+    String query = "n=" + (pageSize + 1)
         + (last == null || last.isBlank()
             ? ""
             : "&last=" + java.net.URLEncoder.encode(last, java.nio.charset.StandardCharsets.UTF_8));
-    try (HttpRemoteFetcher.Result result = remoteClient.get(runtime, remotePath, DockerConstants.MEDIA_TYPE_JSON)) {
+    try (HttpRemoteFetcher.Result result = remoteClient.get(runtime, "_catalog", query, DockerConstants.MEDIA_TYPE_JSON)) {
       if (result.status() >= 200 && result.status() < 300) {
         Map<String, Object> body = new com.fasterxml.jackson.databind.ObjectMapper().readValue(result.body(), Map.class);
         Object rawRepositories = body.get("repositories");

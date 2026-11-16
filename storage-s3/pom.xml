@@ -34,12 +34,16 @@
     </dependency>
     <dependency>
       <groupId>software.amazon.awssdk</groupId>
+      <artifactId>sts</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
       <artifactId>apache-client</artifactId>
     </dependency>
     <dependency>
       <groupId>com.aliyun</groupId>
       <artifactId>alibabacloud-oss-v2</artifactId>
-      <version>0.6.0</version>
+      <version>0.6.1</version>
     </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>

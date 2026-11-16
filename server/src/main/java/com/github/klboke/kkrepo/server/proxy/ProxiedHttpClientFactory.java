@@ -2,6 +2,7 @@ package com.github.klboke.kkrepo.server.proxy;
 
 import com.github.klboke.kkrepo.cache.LocalCache;
 import com.github.klboke.kkrepo.cache.LocalCacheFactory;
+import com.github.klboke.kkrepo.core.http.OutboundTlsTrust;
 import com.github.klboke.kkrepo.server.security.OutboundRequestPolicy.ResolvedHttpTarget;
 import jakarta.annotation.PreDestroy;
 import java.io.IOException;
@@ -23,6 +24,7 @@ import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.apache.hc.client5.http.impl.io.DefaultHttpClientConnectionOperator;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
 import org.apache.hc.client5.http.io.DetachedSocketFactory;
 import org.apache.hc.client5.http.io.HttpClientConnectionOperator;
 import org.apache.hc.client5.http.protocol.HttpClientContext;
@@ -45,6 +47,7 @@ import org.apache.hc.core5.net.URIAuthority;
 import org.apache.hc.core5.util.Timeout;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -96,18 +99,38 @@ public class ProxiedHttpClientFactory implements AutoCloseable {
   private final CloseableHttpClient directClient;
   private final Duration idleTtl;
   private final Duration connectTimeout;
+  private final Duration connectionRequestTimeout;
+  private final OutboundTlsTrust tlsTrust;
 
+  @Autowired
   public ProxiedHttpClientFactory(
       @Value("${kkrepo.outbound-proxy.idle-ttl-ms:3600000}") long idleTtlMillis,
-      @Value("${kkrepo.outbound-proxy.connect-timeout-ms:3000}") long connectTimeoutMillis) {
+      @Value("${kkrepo.outbound-proxy.connect-timeout-ms:3000}") long connectTimeoutMillis,
+      @Value("${kkrepo.outbound-proxy.connection-request-timeout-ms:10000}") long connectionRequestTimeoutMillis,
+      OutboundTlsTrust tlsTrust) {
+    this.tlsTrust = tlsTrust;
     this.idleTtl = Duration.ofMillis(Math.max(1L, idleTtlMillis));
     this.connectTimeout = Duration.ofMillis(Math.max(1L, connectTimeoutMillis));
+    this.connectionRequestTimeout = Duration.ofMillis(Math.max(1L, connectionRequestTimeoutMillis));
     this.cache = LocalCacheFactory.standard()
         .<String, CloseableHttpClient>builder("outbound-proxy-clients")
         .expireAfterAccess(this.idleTtl)
         .removalListener((key, client, cause) -> closeQuietly(client))
         .build();
     this.directClient = buildDirect();
+  }
+
+  public ProxiedHttpClientFactory(long idleTtlMillis, long connectTimeoutMillis) {
+    this(idleTtlMillis, connectTimeoutMillis, 10000, OutboundTlsTrust.defaults());
+  }
+
+  public ProxiedHttpClientFactory(
+      long idleTtlMillis, long connectTimeoutMillis, long connectionRequestTimeoutMillis) {
+    this(idleTtlMillis, connectTimeoutMillis, connectionRequestTimeoutMillis, OutboundTlsTrust.defaults());
+  }
+
+  public ProxiedHttpClientFactory(long idleTtlMillis, long connectTimeoutMillis, OutboundTlsTrust tlsTrust) {
+    this(idleTtlMillis, connectTimeoutMillis, 10000, tlsTrust);
   }
 
   /**
@@ -137,6 +160,14 @@ public class ProxiedHttpClientFactory implements AutoCloseable {
     cache.cleanUp();
   }
 
+  /** Drop all authenticated pools owned by a changed/deleted repository on this node. */
+  public void invalidateNtlm(String owner) {
+    String prefix = "ntlm\n" + (owner == null ? "" : owner) + "\n";
+    cache.asMap().keySet().stream().filter(key -> key.startsWith(prefix)).toList()
+        .forEach(cache::invalidate);
+    cache.cleanUp();
+  }
+
   private static String cacheKey(String owner, OutboundProxyConfig config) {
     return (owner == null ? "" : owner) + "\n" + config.cacheKey();
   }
@@ -149,6 +180,9 @@ public class ProxiedHttpClientFactory implements AutoCloseable {
   @PreDestroy
   @Override
   public void close() {
+    // Removal notifications are asynchronous; application shutdown must release owned pools
+    // before returning even when the notification executor is busy or stopping.
+    cache.asMap().values().forEach(ProxiedHttpClientFactory::closeQuietly);
     cache.invalidateAll();
     cache.cleanUp();
     closeQuietly(directClient);
@@ -179,7 +213,9 @@ public class ProxiedHttpClientFactory implements AutoCloseable {
    * <p>The connect timeout is configured once per cached client on its connection manager
    * ({@code kkrepo.outbound-proxy.connect-timeout-ms}), because HttpClient 5.4+ removed per-request
    * connect timeouts ({@code RequestConfig.setConnectTimeout} is deprecated). The response timeout
-   * stays per-request in {@link RequestConfig}.
+   * stays per-request in {@link RequestConfig}. Waiting to lease a pooled connection has its own
+   * timeout ({@code kkrepo.outbound-proxy.connection-request-timeout-ms}, default 10s), independent
+   * of connect and response timeouts.
    */
   @SuppressWarnings("resource") // the shared client is closed by this factory, not per request
   public ProxiedResponse execute(
@@ -208,15 +244,39 @@ public class ProxiedHttpClientFactory implements AutoCloseable {
       byte[] body,
       long responseTimeoutMillis)
       throws IOException {
+    return execute(owner, config, method, target, headers, body, responseTimeoutMillis, null);
+  }
+
+  /**
+   * NTLM is connection-bound. Each repository, credential version and origin has a separate
+   * rebuildable, idle-expiring pool. Every replica selects its pool from the current database
+   * snapshot, so rotated credentials cannot reuse an older authenticated connection.
+   */
+  @SuppressWarnings({"resource", "deprecation"}) // Explicit compatibility with NTLM-only upstreams.
+  public ProxiedResponse execute(
+      String owner, OutboundProxyConfig config, String method, ResolvedHttpTarget target,
+      Map<String, String> headers, byte[] body, long responseTimeoutMillis, NtlmCredentials ntlm)
+      throws IOException {
     if (target == null) {
       throw new IllegalArgumentException("resolved outbound target is required");
     }
-    CloseableHttpClient client = config != null && config.enabled()
-        ? clientFor(owner, config)
-        : directClient;
+    CloseableHttpClient client;
+    if (ntlm == null) {
+      client = config != null && config.enabled() ? clientFor(owner, config) : directClient;
+    } else {
+      String key = "ntlm\n" + (owner == null ? "" : owner) + "\n" + ntlm.cacheKey()
+          + "\n" + target.uri().getScheme() + "://" + target.uri().getRawAuthority()
+          + "\n" + (config == null ? "direct" : config.cacheKey());
+      client = cache.get(key, ignored -> config != null && config.enabled() ? build(config) : buildDirect());
+    }
     boolean proxyEnabled = config != null && config.enabled();
     RequestConfig requestConfig = RequestConfig.custom()
+        .setCookieSpec(target.publicHttpsOnly()
+            ? org.apache.hc.client5.http.cookie.StandardCookieSpec.IGNORE : null)
+        .setConnectionRequestTimeout(Timeout.of(connectionRequestTimeout))
         .setResponseTimeout(Timeout.ofMilliseconds(Math.max(1L, responseTimeoutMillis)))
+        .setTargetPreferredAuthSchemes(ntlm == null ? null : java.util.List.of("NTLM"))
+        .setProxyPreferredAuthSchemes(ntlm == null ? null : java.util.List.of("Basic", "Digest"))
         .build();
     String requestMethod = method == null || method.isBlank() ? "GET" : method;
     if (target.proxyResolvesDns()) {
@@ -225,7 +285,7 @@ public class ProxiedHttpClientFactory implements AutoCloseable {
             "proxy-resolved outbound target requires an enabled proxy config");
       }
       return executeAtTarget(
-          client, config, requestMethod, target.uri(), null, true, headers, body, requestConfig);
+          client, config, requestMethod, target.uri(), null, true, headers, body, requestConfig, ntlm);
     }
     boolean retryable =
         "GET".equalsIgnoreCase(requestMethod) || "HEAD".equalsIgnoreCase(requestMethod);
@@ -233,7 +293,7 @@ public class ProxiedHttpClientFactory implements AutoCloseable {
     for (InetAddress address : target.addresses()) {
       try {
         return executeAtTarget(
-            client, config, requestMethod, target.uri(), address, false, headers, body, requestConfig);
+            client, config, requestMethod, target.uri(), address, false, headers, body, requestConfig, ntlm);
       } catch (IOException e) {
         failure = e;
         if (!retryable) {
@@ -254,7 +314,8 @@ public class ProxiedHttpClientFactory implements AutoCloseable {
       boolean proxyResolvesDns,
       Map<String, String> headers,
       byte[] body,
-      RequestConfig requestConfig)
+      RequestConfig requestConfig,
+      NtlmCredentials ntlm)
       throws IOException {
     int port = effectivePort(uri);
     String originalHost = endpointHost(uri);
@@ -291,6 +352,7 @@ public class ProxiedHttpClientFactory implements AutoCloseable {
     HttpClientContext context = HttpClientContext.create();
     context.setRequestConfig(requestConfig);
     context.setAttribute(ORIGINAL_TARGET_CONTEXT, originalTarget);
+    if (ntlm != null) configureNtlm(context, connectionTarget, originalTarget, config, ntlm);
     // executeOpen returns a live, caller-closed response required by streaming callers.
     ClassicHttpResponse response = client.executeOpen(connectionTarget, request, context);
     Map<String, String> responseHeaders = new LinkedHashMap<>();
@@ -298,6 +360,32 @@ public class ProxiedHttpClientFactory implements AutoCloseable {
       responseHeaders.putIfAbsent(header.getName(), header.getValue());
     }
     return new ProxiedResponse(response, responseHeaders);
+  }
+
+  @SuppressWarnings("deprecation") // Apache retains NTLM as an opt-in scheme for legacy servers.
+  private static void configureNtlm(
+      HttpClientContext context, HttpHost connectionTarget, HttpHost originalTarget,
+      OutboundProxyConfig proxy, NtlmCredentials ntlm) {
+    BasicCredentialsProvider credentials = new BasicCredentialsProvider();
+    var upstream = new org.apache.hc.client5.http.auth.NTCredentials(
+        ntlm.username(), ntlm.password().toCharArray(), ntlm.workstation(), ntlm.domain());
+    // Match only the validated destination and only NTLM; never answer a proxy challenge with
+    // upstream credentials. The route can use a pinned address while the request uses its host.
+    for (HttpHost target : new HttpHost[] {connectionTarget, originalTarget}) {
+      credentials.setCredentials(new AuthScope(target.getSchemeName(), target.getHostName(),
+          target.getPort(), null, "NTLM"), upstream);
+    }
+    if (proxy != null && proxy.authenticated() && proxy.type() == OutboundProxyConfig.Type.HTTP) {
+      credentials.setCredentials(new AuthScope(proxy.host(), proxy.port()),
+          new UsernamePasswordCredentials(proxy.username(), passwordChars(proxy.password())));
+    }
+    context.setCredentialsProvider(credentials);
+    context.setAuthSchemeRegistry(RegistryBuilder.<org.apache.hc.client5.http.auth.AuthSchemeFactory>create()
+        .register("NTLM", org.apache.hc.client5.http.impl.auth.NTLMSchemeFactory.INSTANCE)
+        .register("Basic", org.apache.hc.client5.http.impl.auth.BasicSchemeFactory.INSTANCE)
+        .register("Digest", org.apache.hc.client5.http.impl.auth.DigestSchemeFactory.INSTANCE)
+        .build());
+    context.setUserToken(ntlm.cacheKey());
   }
 
   private static String requestPath(URI uri) {
@@ -340,9 +428,21 @@ public class ProxiedHttpClientFactory implements AutoCloseable {
     return buildHttp(config);
   }
 
+  private TlsSocketStrategy tlsStrategy() {
+    return tlsTrust.configured()
+        ? new DefaultClientTlsStrategy(tlsTrust.sslContext())
+        : DefaultClientTlsStrategy.createDefault();
+  }
+
+  private PoolingHttpClientConnectionManager connectionManager() {
+    return PoolingHttpClientConnectionManagerBuilder.create()
+        .setTlsSocketStrategy(tlsStrategy())
+        .build();
+  }
+
   private CloseableHttpClient buildDirect() {
     PoolingHttpClientConnectionManager connectionManager =
-        new PoolingHttpClientConnectionManager();
+        connectionManager();
     configureConnectionManager(connectionManager);
     return HttpClients.custom()
         .setConnectionManager(connectionManager)
@@ -358,7 +458,7 @@ public class ProxiedHttpClientFactory implements AutoCloseable {
 
   private CloseableHttpClient buildHttp(OutboundProxyConfig config) {
     HttpHost proxy = new HttpHost(URIScheme.HTTP.getId(), config.host(), config.port());
-    PoolingHttpClientConnectionManager connectionManager = new PoolingHttpClientConnectionManager();
+    PoolingHttpClientConnectionManager connectionManager = connectionManager();
     configureConnectionManager(connectionManager);
     var builder = HttpClients.custom()
         .setConnectionManager(connectionManager)
@@ -393,7 +493,7 @@ public class ProxiedHttpClientFactory implements AutoCloseable {
     DetachedSocketFactory socketFactory = proxy ->
         new Socks5TunnelSocket(proxyAddress, username, password);
     Lookup<TlsSocketStrategy> tlsStrategies = RegistryBuilder.<TlsSocketStrategy>create()
-        .register(URIScheme.HTTPS.getId(), DefaultClientTlsStrategy.createDefault())
+        .register(URIScheme.HTTPS.getId(), tlsStrategy())
         .build();
     HttpClientConnectionOperator operator =
         new DefaultHttpClientConnectionOperator(

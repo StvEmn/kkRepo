@@ -32,6 +32,8 @@ R_MIGRATION_ENABLED="${R_MIGRATION_ENABLED:-false}"
 R_MIGRATION_UPSTREAM_CONTAINER="${R_MIGRATION_UPSTREAM_CONTAINER:-${COMPOSE_PROJECT_NAME}-r-upstream}"
 R_MIGRATION_UPSTREAM_URL="${R_MIGRATION_UPSTREAM_URL:-http://${R_MIGRATION_UPSTREAM_CONTAINER}:8080/}"
 
+ANSIBLE_UPSTREAM_JSON="$(python3 -c 'import json,os; print(json.dumps(os.environ.get("ANSIBLE_COMPAT_UPSTREAM_URL") or "https://galaxy.ansible.com/"))')"
+
 START_TIMEOUT_SECONDS="${LIVE_COMPAT_START_TIMEOUT_SECONDS:-240}"
 
 wait_for_http() {
@@ -208,6 +210,30 @@ ensure_r_migration_upstream() {
     'mkdir -p /www/src/contrib && printf "" | gzip -n > /www/src/contrib/PACKAGES.gz && exec httpd -f -p 8080 -h /www' \
     >/dev/null
   echo "[compat] controlled R migration upstream is ready: $R_MIGRATION_UPSTREAM_URL"
+}
+
+configure_nexus_routing_rule_ssrf_allowlist() {
+  NEXUS_URL="$NEXUS_URL" NEXUS_AUTH="$NEXUS_AUTH" python3 - <<'PY_ROUTING'
+import base64, json, os, urllib.request, urllib.error
+url = os.environ["NEXUS_URL"] + "/service/rest/v1/security/ssrf-protection"
+headers = {"Authorization": "Basic " + base64.b64encode(os.environ["NEXUS_AUTH"].encode()).decode(),
+           "Content-Type": "application/json"}
+try:
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=20) as response:
+        config = json.load(response)
+except urllib.error.HTTPError as error:
+    if error.code == 404:  # Older Nexus does not have the SSRF configuration API.
+        raise SystemExit(0)
+    raise
+allowed = list(config.get("allowedDomains") or [])
+if "localhost" not in allowed:
+    allowed.append("localhost")
+    config["allowedDomains"] = allowed
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers, method="PUT",
+            data=json.dumps(config).encode()), timeout=20) as response:
+        response.read()
+print("[compat] Nexus permits the controlled routing-rule loopback fixture")
+PY_ROUTING
 }
 
 configure_nexus_r_migration_ssrf_allowlist() {
@@ -545,7 +571,7 @@ ensure_nexus_repositories() {
     "name":"ansible-proxy",
     "online":true,
     "storage":{"blobStoreName":"default","strictContentTypeValidation":true},
-    "proxy":{"remoteUrl":"https://galaxy.ansible.com/","contentMaxAge":1440,"metadataMaxAge":1440},
+    "proxy":{"remoteUrl":'"$ANSIBLE_UPSTREAM_JSON"',"contentMaxAge":1440,"metadataMaxAge":1440},
     "negativeCache":{"enabled":true,"timeToLive":60},
     "httpClient":{"blocked":false,"autoBlock":true}
   }'
@@ -640,6 +666,16 @@ kkrepo_repo_exists() {
 kkrepo_create_repo() {
   local name="$1"
   local payload="$2"
+  if [[ "${KKREPO_COMPAT_PROXY_STREAMING_ENABLED:-false}" == true ]]; then
+    payload="$(python3 - "$payload" <<'PY'
+import json, sys
+repository = json.loads(sys.argv[1])
+if repository.get("recipe", "").endswith("-proxy"):
+    repository.setdefault("proxy", {})["streamingEnabled"] = True
+print(json.dumps(repository))
+PY
+)"
+  fi
   if kkrepo_repo_exists "$name"; then
     echo "[compat] kkrepo repository exists: $name"
     return 0
@@ -1237,7 +1273,7 @@ PY
     "online":true,
     "blobStoreName":"default",
     "strictContentTypeValidation":true,
-    "proxy":{"remoteUrl":"https://galaxy.ansible.com/","contentMaxAgeMinutes":1440,"metadataMaxAgeMinutes":1440,"negativeCacheEnabled":true,"negativeCacheTtlMinutes":1,"autoBlock":true}
+    "proxy":{"remoteUrl":'"$ANSIBLE_UPSTREAM_JSON"',"contentMaxAgeMinutes":1440,"metadataMaxAgeMinutes":1440,"negativeCacheEnabled":true,"negativeCacheTtlMinutes":1,"autoBlock":true}
   }'
 
   kkrepo_create_repo "ansible-group" '{
@@ -1467,6 +1503,10 @@ configure_nexus_anonymous_access
 configure_nexus_conan_realm
 ensure_r_migration_upstream
 configure_nexus_r_migration_ssrf_allowlist
+configure_nexus_routing_rule_ssrf_allowlist
+if [[ -n "${ANSIBLE_COMPAT_UPSTREAM_REPOSITORY:-}" ]]; then
+  NEXUS_URL="$NEXUS_URL" NEXUS_AUTH="$NEXUS_AUTH" python3 "$SCRIPT_DIR/prepare-ansible-upstream.py"
+fi
 ensure_nexus_repositories
 initialize_kkrepo_admin
 ensure_kkrepo_blob_store

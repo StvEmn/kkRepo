@@ -11,6 +11,7 @@ import com.github.klboke.kkrepo.persistence.jdbc.api.model.AssetRecord;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.ComponentRecord;
 import com.github.klboke.kkrepo.persistence.jdbc.api.PersistenceHashes;
 import com.github.klboke.kkrepo.server.blob.BlobReferenceCodec;
+import com.github.klboke.kkrepo.server.blob.BufferedUpload;
 import com.github.klboke.kkrepo.server.blob.TempBlobFiles;
 import com.github.klboke.kkrepo.server.blob.BlobTransactionCleanup;
 import com.github.klboke.kkrepo.server.cache.AssetMetadataCache;
@@ -19,10 +20,8 @@ import com.github.klboke.kkrepo.server.maven.UpstreamBodyReadException;
 import com.github.klboke.kkrepo.server.transaction.TransientTransactionRetry;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
@@ -34,6 +33,8 @@ import java.util.OptionalLong;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 @Component
 class RawAssetWriter {
@@ -107,6 +108,14 @@ class RawAssetWriter {
       boolean keepResponseFile) {
     return write(runtime, storage, blobStoreId, path, body, contentTypeHint,
         extraBlobAttributes, createdBy, createdByIp, ComponentBinding.none(), keepResponseFile);
+  }
+
+  Stored write(
+      RepositoryRuntime runtime, BlobStorage storage, long blobStoreId, String path,
+      InputStream body, String contentTypeHint, Map<String, ?> extraBlobAttributes,
+      String createdBy, String createdByIp, Map<String, ?> assetAttributes) {
+    return write(runtime, storage, blobStoreId, path, body, contentTypeHint, extraBlobAttributes,
+        createdBy, createdByIp, ComponentBinding.perAsset(), false, path, assetAttributes);
   }
 
   /** Stores a protocol-owned asset without a component or any Browse node. */
@@ -183,6 +192,7 @@ class RawAssetWriter {
       String expectedGitOid) {
     DigestedUpload upload = uploadWithDigests(
         runtime, storage, blobStoreId, path, body, extraBlobAttributes);
+    cleanupAfterRollback(storage, blobStoreId, upload);
     try {
       if (expectedSize != null && expectedSize.longValue() != upload.digests().size()) {
         throw new IllegalArgumentException(
@@ -348,6 +358,7 @@ class RawAssetWriter {
       boolean replaceExisting) {
     DigestedUpload upload = uploadFileWithDigests(
         runtime, storage, blobStoreId, path, file, extraBlobAttributes);
+    cleanupAfterRollback(storage, blobStoreId, upload);
     try {
       Stored stored = executePersist(
           "Persist raw asset " + runtime.name() + "/" + path,
@@ -393,13 +404,23 @@ class RawAssetWriter {
       ComponentBinding componentBinding,
       boolean keepResponseFile,
       String browsePath) {
+    return write(runtime, storage, blobStoreId, path, body, contentTypeHint, extraBlobAttributes,
+        createdBy, createdByIp, componentBinding, keepResponseFile, browsePath, Map.of());
+  }
+
+  private Stored write(
+      RepositoryRuntime runtime, BlobStorage storage, long blobStoreId, String path,
+      InputStream body, String contentTypeHint, Map<String, ?> extraBlobAttributes,
+      String createdBy, String createdByIp, ComponentBinding componentBinding,
+      boolean keepResponseFile, String browsePath, Map<String, ?> assetAttributes) {
     DigestedUpload upload = uploadWithDigests(runtime, storage, blobStoreId, path, body, extraBlobAttributes);
+    cleanupAfterRollback(storage, blobStoreId, upload);
     try {
       Stored stored = executePersist(
           "Persist raw asset " + runtime.name() + "/" + path,
           () -> persist(runtime, storage, blobStoreId, path, upload, contentTypeHint,
               extraBlobAttributes, createdBy, createdByIp, componentBinding,
-              Map.of(), keepResponseFile ? upload.tempFile() : null, browsePath, true));
+              assetAttributes, keepResponseFile ? upload.tempFile() : null, browsePath, true));
       cleanupUnusedUploadedBlob(storage, blobStoreId, upload, stored.blob());
       if (!keepResponseFile) {
         TempBlobFiles.deleteQuietly(upload.tempFile());
@@ -419,42 +440,44 @@ class RawAssetWriter {
     return transactionRetry.executeIfNoTransaction(operation, callback);
   }
 
-  @Transactional
   int deleteAsset(RepositoryRuntime runtime, BlobStorage storage, String path) {
-    Optional<AssetRecord> existing = assetDao.findAssetByPath(runtime.id(), path);
-    if (existing.isEmpty()) {
-      return 0;
-    }
-    AssetRecord asset = existing.get();
-    Long componentId = asset.componentId();
-    int deleted = deleteOne(asset);
-    if (deleted == 0) {
-      return 0;
-    }
-    if (componentId != null) {
-      componentDao.deleteIfNoAssets(componentId);
-    }
-    return 1;
+    return executePersist("raw-delete", () -> {
+      Optional<AssetRecord> existing = assetDao.findAssetByPath(runtime.id(), path);
+      if (existing.isEmpty()) {
+        return 0;
+      }
+      AssetRecord asset = existing.get();
+      Long componentId = asset.componentId();
+      int deleted = deleteOne(asset);
+      if (deleted == 0) {
+        return 0;
+      }
+      if (componentId != null) {
+        componentDao.deleteIfNoAssets(componentId);
+      }
+      return 1;
+    });
   }
 
-  @Transactional
   int deleteAssetById(RepositoryRuntime runtime, long assetId) {
-    Optional<AssetRecord> existing = assetDao.findAssetById(assetId)
-        .filter(asset -> asset.repositoryId() == runtime.id()
-            && asset.format() == runtime.format());
-    if (existing.isEmpty()) {
-      return 0;
-    }
-    AssetRecord asset = existing.orElseThrow();
-    Long componentId = asset.componentId();
-    int deleted = deleteOne(asset);
-    if (deleted == 0) {
-      return 0;
-    }
-    if (componentId != null) {
-      componentDao.deleteIfNoAssets(componentId);
-    }
-    return 1;
+    return executePersist("raw-delete-by-id", () -> {
+      Optional<AssetRecord> existing = assetDao.findAssetById(assetId)
+          .filter(asset -> asset.repositoryId() == runtime.id()
+              && asset.format() == runtime.format());
+      if (existing.isEmpty()) {
+        return 0;
+      }
+      AssetRecord asset = existing.orElseThrow();
+      Long componentId = asset.componentId();
+      int deleted = deleteOne(asset);
+      if (deleted == 0) {
+        return 0;
+      }
+      if (componentId != null) {
+        componentDao.deleteIfNoAssets(componentId);
+      }
+      return 1;
+    });
   }
 
   private Stored persist(
@@ -472,6 +495,7 @@ class RawAssetWriter {
       Path responseFile,
       String browsePath,
       boolean replaceExisting) {
+    com.github.klboke.kkrepo.server.proxy.ProxyCachePublication.check(runtime, path);
     Instant now = Instant.now();
     String contentType = contentTypeHint == null || contentTypeHint.isBlank()
         ? MediaType.APPLICATION_OCTET_STREAM_VALUE
@@ -508,7 +532,9 @@ class RawAssetWriter {
         : assetDao.findBlobById(previousBlobId).orElse(null);
 
     Map<String, Object> blobAttrs = new LinkedHashMap<>();
-    blobAttrs.put("sha512", digests.sha512());
+    if (digests.sha512() != null && !digests.sha512().isBlank()) {
+      blobAttrs.put("sha512", digests.sha512());
+    }
     if (extraBlobAttributes != null) {
       extraBlobAttributes.forEach((key, value) -> {
         if (value != null) blobAttrs.put(key, value);
@@ -516,7 +542,6 @@ class RawAssetWriter {
     }
     AssetBlobRecord persistedBlob = reusableBlob(blobStoreId, digests.sha256(), digests.size(), extraBlobAttributes)
         .orElse(null);
-    long blobId;
     if (persistedBlob == null) {
       AssetBlobRecord blobRecord = new AssetBlobRecord(
           null,
@@ -536,18 +561,13 @@ class RawAssetWriter {
           now,
           blobAttrs);
       persistedBlob = assetDao.insertBlobOrFindExisting(blobRecord);
-      blobId = persistedBlob.id();
-      if (extraBlobAttributes != null && !extraBlobAttributes.isEmpty()
-          && !blobAttrs.equals(persistedBlob.attributes())) {
-        assetDao.updateBlobAttributes(blobId, blobAttrs);
-        persistedBlob = persistedBlob.withAttributes(blobAttrs);
-      }
-    } else {
-      blobId = persistedBlob.id();
-      if (extraBlobAttributes != null && !extraBlobAttributes.isEmpty()) {
-        assetDao.updateBlobAttributes(blobId, blobAttrs);
-        persistedBlob = persistedBlob.withAttributes(blobAttrs);
-      }
+    }
+    long blobId = persistedBlob.id();
+    Map<String, Object> mergedBlobAttributes = new LinkedHashMap<>(persistedBlob.attributes());
+    mergedBlobAttributes.putAll(blobAttrs);
+    if (!mergedBlobAttributes.equals(persistedBlob.attributes())) {
+      assetDao.updateBlobAttributes(blobId, mergedBlobAttributes);
+      persistedBlob = persistedBlob.withAttributes(mergedBlobAttributes);
     }
 
     Long componentId = componentId(runtime, path, now, componentBinding);
@@ -723,6 +743,51 @@ class RawAssetWriter {
       boolean uploaded) {
   }
 
+  RawHostedService.PreparedFile prepareFile(RepositoryRuntime runtime, BlobStorage storage,
+      long blobStoreId, String path, Path file) {
+    if (TransactionSynchronizationManager.isActualTransactionActive()) {
+      throw new IllegalStateException("Prepare protocol files before starting a metadata transaction");
+    }
+    DigestedUpload upload;
+    try {
+      var computed = BufferedUpload.inspect(file, BufferedUpload.Checksums.WITH_SHA512);
+      var digests = new Digests(computed.md5(), computed.sha1(), computed.sha256(),
+          computed.sha512(), computed.size());
+      upload = new DigestedUpload(storage.putFile(runtime.name(), path, file, computed.sha256()),
+          digests, null, true);
+    } catch (IOException error) {
+      throw new java.io.UncheckedIOException(error);
+    }
+    return new RawHostedService.PreparedFile() {
+      private boolean closed;
+
+      @Override
+      public boolean publish(RepositoryRuntime current, String assetPath, String actor, String remoteAddress,
+          ComponentRecord component, String browsePath, boolean replaceExisting) {
+        if (closed || !TransactionSynchronizationManager.isActualTransactionActive()) {
+          throw new IllegalStateException("Prepared publication requires an active metadata transaction");
+        }
+        if (current.id() != runtime.id() || current.blobStoreId() != blobStoreId) {
+          throw new IllegalStateException("Repository storage changed during upload");
+        }
+        return persist(current, storage, blobStoreId, assetPath, upload, "application/octet-stream",
+            Map.of(), actor, remoteAddress, ComponentBinding.explicit(component), Map.of(), null,
+            browsePath, replaceExisting).created();
+      }
+
+      @Override
+      public void close() {
+        if (!closed) {
+          if (TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("Release prepared files after the metadata transaction");
+          }
+          closed = true;
+          cleanupUploadedBlob(storage, blobStoreId, upload);
+        }
+      }
+    };
+  }
+
   private DigestedUpload uploadWithDigests(
       RepositoryRuntime runtime,
       BlobStorage storage,
@@ -732,20 +797,15 @@ class RawAssetWriter {
       Map<String, ?> extraBlobAttributes) {
     Path tmp = null;
     try {
-      tmp = TempBlobFiles.createTempFile(storage, "kkrepo-raw-", ".tmp");
-      MessageDigest md5 = digest("MD5");
-      MessageDigest sha1 = digest("SHA-1");
-      MessageDigest sha256 = digest("SHA-256");
-      MessageDigest sha512 = digest("SHA-512");
-      long size;
-      try (OutputStream out = Files.newOutputStream(tmp, StandardOpenOption.TRUNCATE_EXISTING)) {
-        size = streamWithDigests(UpstreamBodyReadException.wrap(body), out, md5, sha1, sha256, sha512);
-      }
-      String md5Hex = hex(md5.digest());
-      String sha1Hex = hex(sha1.digest());
-      String sha256Hex = hex(sha256.digest());
-      String sha512Hex = hex(sha512.digest());
-      Digests digests = new Digests(md5Hex, sha1Hex, sha256Hex, sha512Hex, size);
+      BufferedUpload buffered = BufferedUpload.create(
+          UpstreamBodyReadException.wrap(body), storage, "kkrepo-raw-",
+          BufferedUpload.Checksums.WITH_SHA512);
+      tmp = buffered.file();
+      BufferedUpload.Digests computed = buffered.digests();
+      Digests digests = new Digests(computed.md5(), computed.sha1(), computed.sha256(),
+          computed.sha512(), computed.size());
+      String sha256Hex = digests.sha256();
+      long size = digests.size();
       Optional<AssetBlobRecord> reusable = precheckedReusableBlob(blobStoreId, sha256Hex, size, extraBlobAttributes);
       if (reusable.isPresent()) {
         AssetBlobRecord blob = reusable.get();
@@ -771,16 +831,9 @@ class RawAssetWriter {
       Path file,
       Map<String, ?> extraBlobAttributes) {
     try {
-      MessageDigest md5 = digest("MD5");
-      MessageDigest sha1 = digest("SHA-1");
-      MessageDigest sha256 = digest("SHA-256");
-      MessageDigest sha512 = digest("SHA-512");
-      long size;
-      try (InputStream in = Files.newInputStream(file)) {
-        size = streamWithDigests(in, null, md5, sha1, sha256, sha512);
-      }
-      Digests digests = new Digests(
-          hex(md5.digest()), hex(sha1.digest()), hex(sha256.digest()), hex(sha512.digest()), size);
+      BufferedUpload.Digests computed = BufferedUpload.inspect(file, BufferedUpload.Checksums.WITH_SHA512);
+      Digests digests = new Digests(computed.md5(), computed.sha1(), computed.sha256(),
+          computed.sha512(), computed.size());
       Optional<AssetBlobRecord> reusable =
           precheckedReusableBlob(blobStoreId, digests.sha256(), digests.size(), extraBlobAttributes);
       if (reusable.isPresent()) {
@@ -794,6 +847,27 @@ class RawAssetWriter {
     } catch (IOException e) {
       throw new java.io.UncheckedIOException("Failed to digest raw file " + path, e);
     }
+  }
+
+  private void cleanupAfterRollback(BlobStorage storage, long blobStoreId, DigestedUpload upload) {
+    if (!upload.uploaded() || !TransactionSynchronizationManager.isActualTransactionActive()
+        || !TransactionSynchronizationManager.isSynchronizationActive()) {
+      return;
+    }
+    TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+      @Override
+      public void afterCompletion(int status) {
+        if (status != STATUS_ROLLED_BACK) return;
+        if (transactionRetry == null) {
+          cleanupUploadedBlob(storage, blobStoreId, upload);
+        } else {
+          transactionRetry.execute("Clean up rolled back protocol upload", () -> {
+            cleanupUploadedBlob(storage, blobStoreId, upload);
+            return null;
+          });
+        }
+      }
+    });
   }
 
   private void cleanupUploadedBlob(BlobStorage storage, long blobStoreId, DigestedUpload upload) {
@@ -851,21 +925,6 @@ class RawAssetWriter {
     }
     assetMetadataCache.evictAfterCommit(asset.repositoryId(), asset.path());
     return 1;
-  }
-
-  private static long streamWithDigests(InputStream in, OutputStream out, MessageDigest... digests)
-      throws IOException {
-    byte[] buf = new byte[TempBlobFiles.responseBufferSize()];
-    long total = 0;
-    int n;
-    while ((n = in.read(buf)) > 0) {
-      for (MessageDigest d : digests) d.update(buf, 0, n);
-      if (out != null) {
-        out.write(buf, 0, n);
-      }
-      total += n;
-    }
-    return total;
   }
 
   private static String rawGroup(String path) {

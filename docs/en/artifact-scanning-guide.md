@@ -135,6 +135,11 @@ volume read-only. It checks every five minutes by default while preserving the s
 successful-update interval. Publication-lock contention beyond ten minutes exits unsuccessfully
 so the restart policy retries.
 
+The Compose updater uses `https://grype.anchore.io/databases` by default. To use an internal HTTPS
+Grype database mirror, set `KKREPO_SCANNER_DB_UPDATE_URL` and uncomment the optional CA environment
+and volume entries in the selected Compose file. Set `KKREPO_SCANNER_DB_CA_CERT_FILE` to the host
+certificate path; the updater mounts it at `/etc/kkrepo-ca/ca.crt`.
+
 Check the containers and scanner readiness:
 
 ```bash
@@ -246,10 +251,60 @@ capability from a repository that has not been activated.
 
 Grant custom roles according to responsibility:
 
+The following built-in application privileges are available in **Security → Privileges** and
+can be assigned through **Security → Roles**:
+
+| Built-in privilege | Domain | Actions |
+| --- | --- | --- |
+| `nx-security-scanning-read` | `security-scanning` | `read` |
+| `nx-security-scanning-update` | `security-scanning` | `update,read` |
+| `nx-security-scanning-waivers-create` | `security-scanning-waivers` | `create` |
+| `nx-security-scanning-waivers-delete` | `security-scanning-waivers` | `delete` |
+
+For a scan reader, create a role with `nx-security-scanning-read` and a repository browse
+privilege, for example `nx-repository-view-maven2-releases-browse` for a Maven repository
+named `releases`. Assign the role to the user. This exposes **Browse → Admin → Security →
+Artifact Scanning**, including results and SBOMs for the repositories they may browse,
+without granting `nexus:*`. A scan-only user lands on Artifact Scanning; authorized hash
+routes, including a specific scanning tab, are preserved. Users who also have selector
+permissions can navigate to Content Selectors. Other administration views remain hidden.
+Read-only users can inspect results, but mutation actions are hidden. Repository/task action
+availability is calculated by the server and is checked again when an action is submitted.
+
+List capabilities reuse repository information only within a request. Task lists batch the
+relevant parent-group and scanning-configuration lookups; finding capabilities read source
+repository IDs without loading every affected artifact's metadata. Waiver lists reuse their
+repository names and administration decisions. This adds no cross-request cache: subsequent
+requests reread shared topology/configuration, and each mutation still rechecks authorization.
+
+For strict repository isolation, also review the default authenticated role: by default,
+`KKREPO_DEFAULT_AUTHENTICATED_ROLE_ID` adds `nx-anonymous`, which includes broad repository
+browse/read privileges. Disabling anonymous access alone does not remove that inherited
+access. See [Content selectors](content-selectors.md#authorization-behavior)
+for configuration and re-authentication requirements.
+
+Waiver privileges are independent: `nx-security-scanning-update` does not grant waiver
+creation or deletion. Waiver operators also need scan read access to use this UI and
+administration permission for the affected repository. Global waivers additionally require
+`nexus:security-scanning:update`. A group administrator can retry/cancel a member task when
+its scan profile applies to that group; rescan still requires administration of the source
+repository.
+
+The MySQL and PostgreSQL upgrade migration adds privilege records and links them only to
+`nx-admin` (which already has `nx-all`); it makes no table-structure or scanning-data changes
+and grants nothing to ordinary roles. Existing privileges with the same ID or name, their
+properties, and existing role assignments are preserved. If a manually created privilege
+uses a built-in name with different actions, inspect its domain/actions before assigning it;
+the migration does not overwrite it. Use a separately named application privilege if needed.
+Permission changes continue to use the existing shared authorization-version invalidation.
+During a rolling upgrade, update all server replicas before relying on the new UI entry;
+older replicas may still reject it or omit action capabilities, which the new UI treats as
+unavailable.
+
 | Operation | Permission |
 | --- | --- |
 | View scan pages, tasks, results, and SBOMs | `nexus:security-scanning:read` plus browse permission for the target repository |
-| Create or revise global policies | `nexus:security-scanning:update` |
+| Create, revise, or delete global policies | `nexus:security-scanning:update` |
 | Configure a repository, rescan, retry, or cancel | `nexus:security-scanning:update` plus repository administration for the target repository |
 | Create a waiver | `nexus:security-scanning-waivers:create` plus repository administration |
 | Delete a waiver | `nexus:security-scanning-waivers:delete` plus repository administration |
@@ -263,7 +318,8 @@ repository-visibility check.
 2. Search for the repository and click **configure**.
 3. Select **Enable scanning for this repository**.
 4. Keep **Mode = Audit only** for the first validation period.
-5. Choose result validity and the applicable content scope.
+5. Select a **Scan policy** (or keep the explicitly unassigned built-in rules), result validity,
+   and the applicable content scope.
 6. Review **Advanced exception handling**. Keep every option at **Allow download** for the first
    rollout.
 7. Save the configuration.
@@ -274,9 +330,9 @@ Configuration fields:
 | --- | --- |
 | Repository | Current repository; read-only |
 | Scan profile | Scanner capability binding; built-in value is `syft-grype-v1`; read-only |
-| Vulnerability policy | Centrally assigned policy or built-in critical baseline; read-only |
+| Scan policy | Assign a named policy revision or select built-in rules with no assigned policy |
 | Mode | `AUDIT` records decisions; `ENFORCE` applies blocking |
-| Result validity | Use the policy default or select 1/7/30 days; expired results are pending |
+| Result validity | Inherit the enabled assigned policy limit or select 1/7/30 days; the shorter limit applies and expired results are pending |
 | Enable scanning | Business activation for this repository |
 | Scan hosted content | Scan hosted artifacts |
 | Scan proxy content | Scan cached proxy artifacts |
@@ -285,10 +341,18 @@ A hosted repository shows only the hosted switch, a proxy shows only the proxy s
 group shows both. A group configuration applies to content resolved from its hosted/proxy members;
 it does not scan an additional synthetic group-file copy.
 
-Repository administrators cannot type IDs or arbitrarily switch the scan profile and policy
-binding. Creating a new policy does not change a repository automatically. Editing a policy that
-is already assigned creates a revision and moves those repositories to the new revision while
-historical decisions retain the old revision.
+The scan profile remains read-only. Repository administrators with security-scanning update
+permission can choose a named policy in the repository dialog. The selector offers each policy's
+latest revision and retains an older current assignment; disabled policies are marked explicitly.
+Policy assignments and unassignments are recorded in the security audit log.
+Creating a policy does not assign it automatically. Editing an assigned policy creates a revision
+and moves its bound repositories to that revision, while historical decisions retain the old one.
+
+**Built-in rules (no assigned policy)** is the Critical severity fallback, not a stored policy in
+the Policies tab. It has no age limit. **Use assigned policy (no repository limit)** inherits only
+from an enabled assigned policy; without one, results have no age expiry unless a repository limit
+is selected. Disabled policies contribute no age limit. The dialog previews the effective validity;
+saving and refreshing the repository table shows the server-resolved value.
 
 ### Advanced Exception Handling
 
@@ -427,6 +491,10 @@ The Runs table shows completed scan runs, completeness, finding counts, and comp
 ### Tasks
 
 Tasks show stage, trigger reason, status, attempts, lease, and error code.
+The Asset column shows the repository browser path alongside the internal asset ID. Click the
+path to open the asset in Repository Browser; group views preserve the member source. Tasks whose
+asset cannot be resolved show “Asset unavailable”. Deleting an asset clears its task reference;
+the former asset ID and path are not retained in historical tasks.
 
 - `PENDING` / `RETRY_WAIT` / `RUNNING`: cancel is available.
 - `FAILED` / `CANCELLED`: retry is available.
@@ -453,8 +521,14 @@ target is applicable.
 
 ### Repositories
 
-Repositories shows Enabled/Disabled, format, type, profile, policy, and mode for every visible
-repository. This is the only UI location for repository scan activation.
+Repositories shows Enabled/Disabled, profile, policy, mode, effective result validity, and
+pending/failure/partial handling for every visible repository. Repository format and type are
+available in the repository-name tooltip. Validity is inherited from the active policy when
+unset on the repository; when both set a limit, the shorter period applies. Disabled policies
+add no age limit. Tooltips explain the value source and exception actions, including audit-only
+or inactive settings and the partial-result bypass for disabled policies. Allowing partial
+results still permits vulnerability evaluation. Tooltips open on hover or keyboard focus.
+This is the only UI location for repository scan activation.
 
 ### Policies
 
@@ -471,6 +545,23 @@ Policies creates and revises centrally managed vulnerability policies:
 Editing does not overwrite the existing row; it creates a new revision. Historical runs and
 decisions keep the old revision, while repositories already assigned to that policy move to the
 new revision.
+
+Use **delete** on the latest revision to remove an unused policy and **all of its revisions**.
+The confirmation names the policy and makes this scope explicit. Older revision IDs return a
+conflict, so an outdated page cannot delete a concurrently revised policy. Deletion is rejected
+if any revision is referenced by a repository configuration (including disabled scanning), an
+asset scan/policy state, or a waiver (including expired waivers). It never clears those references.
+The seeded `default-audit` policy follows the same rules; its name does not make it a global default.
+
+The API is `DELETE /internal/security/scanning/policies/{latestPolicyId}` and requires
+`nexus:security-scanning:update`, the same permission as creating and revising policies. It returns
+204 on success, 404 for a missing policy, and 409 for an older revision or a referenced policy.
+Deletion and its `POLICY_DELETE` audit event commit together; the event records the policy name,
+latest ID/revision, and `ALL_REVISIONS` scope. Database locks serialize deletion with revision
+creation and reference writes across replicas. If deletion commits before a concurrent repository
+assignment or waiver creation, that request returns `409` and must select an existing policy.
+This operation does not archive policies or delete
+scan history, findings, or waivers.
 
 ### Waivers
 
@@ -531,6 +622,9 @@ and OCI registry URL.
 | `KKREPO_SCANNER_DATABASE_UPDATE_ONLY` | `false` | Run one coordinated update and exit without creating the credential-protected HTTP controller; used by the dedicated updater |
 | `KKREPO_SCANNER_DATABASE_UPDATE_LOCK_TIMEOUT` | `10m` | Total bound for acquiring the cross-process publication lock; timeout fails the process so orchestration retries |
 | `KKREPO_SCANNER_DB_DIRECTORY` | `/var/lib/kkrepo-scanner/grype` | Shared root for immutable Grype database generations; serving containers mount it read-only |
+| `KKREPO_SCANNER_DB_UPDATE_URL` | `https://grype.anchore.io/databases` | Optional database listing and archive mirror URL |
+| `KKREPO_SCANNER_DB_CA_CERT` | Empty | Optional CA certificate path inside the updater container |
+| `KKREPO_SCANNER_DB_CA_CERT_FILE` | Not mounted | Compose host path for the optional read-only CA mount |
 | `KKREPO_SCANNER_DB_UPDATE_INTERVAL` | `6h` | Target update interval |
 | `KKREPO_SCANNER_DB_UPDATE_CHECK_INTERVAL` | `1m` | Update-eligibility check interval |
 | `KKREPO_SCANNER_MAX_CONCURRENT_SCANS` | `2` | Active scans per Pod |

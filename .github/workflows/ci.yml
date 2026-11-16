@@ -48,6 +48,9 @@ jobs:
       - name: Run non-live compatibility tests
         run: mvn -B -ntp -pl compat-test -am -Dtest=MavenMetadataMergeCompatibilityTest,MavenWritePolicyCompatibilityTest,NpmProtocolCompatibilityTest -Dsurefire.failIfNoSpecifiedTests=false verify
 
+      - name: Run OHPM protocol tests
+        run: mvn -B -ntp -pl protocol-ohpm -am verify
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7
         with:
@@ -88,6 +91,9 @@ jobs:
           java-version: "25"
           cache: maven
       - run: mvn -B -ntp -pl ${{ matrix.module }} -am -Dtest=${{ matrix.test }} -Dsurefire.failIfNoSpecifiedTests=false test
+      - name: Test Docker catalog pagination on PostgreSQL 16
+        if: matrix.database == 'postgresql'
+        run: mvn -B -ntp -pl persistence-postgresql -am -Dkkrepo.test.postgresql.image=postgres:16 -Dtest=DockerRegistryDaoPostgreSqlIntegrationTest#catalogSupportsCursorPagination -Dsurefire.failIfNoSpecifiedTests=false test
 
   server-smoke:
     name: server-smoke (${{ matrix.database }})
@@ -148,6 +154,7 @@ jobs:
             --set securityScanning.enabled=true \
             --set securityScanning.serviceCredential.existingSecret=kkrepo-scanner
           scripts/ci/check-helm-scanner-isolation.sh
+          scripts/ci/check-helm-database-auth.sh
 
   dev-runtime-deploy-contract:
     name: dev-runtime-deploy-contract
@@ -170,6 +177,12 @@ jobs:
           bash -n scripts/ci/load-e2e-candidate-image.sh
           bash -n scripts/ci/prepare-swift-e2e-tls.sh
           bash -n scripts/ci/setup-swift-e2e-wrappers.sh
+          bash -n scripts/ci/swift-e2e-image-cache.sh
+          bash -n scripts/ci/client-e2e-image-cache.sh
+          bash -n scripts/ci/run-client-e2e-container.sh
+          bash -n scripts/ci/client-e2e-image/install.sh
+          bash -n scripts/ci/client-e2e-image/verify.sh
+          bash -n scripts/ci/prepare-e2e-disk.sh
           bash -n scripts/ci/test-e2e-image-artifact.sh
           bash -n scripts/ci/test-quickstart-data-permissions.sh
           bash -n scripts/ci/test-quickstart-runtime.sh
@@ -186,6 +199,7 @@ jobs:
           scripts/ci/test-quickstart-data-permissions.sh
           scripts/ci/test-quickstart-runtime.sh
           scripts/ci/test-swift-e2e-wrappers.sh
+          python3 -m unittest discover -s scripts/ci -p 'test_e2e_orchestration.py'
           scripts/ci/test-dist-launcher.sh
           test -f .github/deploy/dev/systemd/kkrepo.service
           test -f .github/deploy/dev/systemd/kkrepo-native.service

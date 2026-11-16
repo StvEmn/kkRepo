@@ -22,6 +22,7 @@ import com.github.klboke.kkrepo.persistence.jdbc.api.AptRegistryDao;
 import com.github.klboke.kkrepo.persistence.jdbc.api.model.AssetRecord;
 import com.github.klboke.kkrepo.protocol.apt.AptPath;
 import com.github.klboke.kkrepo.protocol.apt.AptPathParser;
+import com.github.klboke.kkrepo.server.coordination.FencedLeaseManager;
 import com.github.klboke.kkrepo.server.maven.MavenExceptions;
 import com.github.klboke.kkrepo.server.maven.MavenResponse;
 import com.github.klboke.kkrepo.server.maven.RepositoryRuntime;
@@ -540,6 +541,71 @@ class AptServiceTest {
     verify(resign.proxyProjection).refreshForResign(proxyRuntime, resignSettings, "stable");
   }
 
+  @org.junit.jupiter.params.ParameterizedTest
+  @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+  void progressivePackagesValidateBeforeCompletionAndProjectOnlyAfterCaching(boolean resign,
+      @org.junit.jupiter.api.io.TempDir java.nio.file.Path directory) throws Exception {
+    var runtime = runtime(RepositoryType.PROXY, "ALLOW", 60);
+    Fixture fixture = new Fixture();
+    var settings = resign ? new AptRepositorySettings.Settings(
+        "stable", "main", List.of("amd64"), false, true, true, null, "kkRepo", "kkRepo")
+        : fixture.proxySettings;
+    when(fixture.repositorySettings.get(runtime)).thenReturn(settings);
+    String path = "pool/d/demo/demo_1.0_amd64.deb";
+    when(fixture.registry.findPackageByPath(runtime.id(), path)).thenReturn(Optional.of(
+        record(runtime, "stable", "main", "demo", "1.0", "amd64", path, "a".repeat(64), 10L, 20L)));
+    var published = new java.util.concurrent.atomic.AtomicBoolean();
+    try (var transfer = new com.github.klboke.kkrepo.server.proxy.ProgressiveResponseFixture(
+        directory, new byte[] {1, 2, 3}, () -> published.set(true))) {
+      org.mockito.Mockito.doAnswer(call -> {
+        assertFalse(published.get(), "validate before publishing the cache");
+        return null;
+      }).when(fixture.proxyProjection).validateDownloadedPackage(runtime, path, transfer.file());
+      when(fixture.proxy.getPinnedAssetFromUrlUnindexed(eq(runtime), eq(path), anyString(), eq(false)))
+          .thenReturn(transfer.response());
+      MavenResponse response = fixture.service.get(runtime, path, false);
+      verify(fixture.proxyProjection, never()).observePassthrough(any(), any(), any());
+      verify(fixture.proxyProjection, never()).verifyAndBindKnownPackage(any(), anyString());
+      assertEquals(3, response.body().readAllBytes().length);
+      assertTrue(published.get());
+      verify(fixture.proxyProjection).validateDownloadedPackage(runtime, path, transfer.file());
+      if (resign) verify(fixture.proxyProjection).verifyAndBindKnownPackage(runtime, path);
+      else verify(fixture.proxyProjection).observePassthrough(eq(runtime), eq(settings), any(AptPath.class));
+    }
+  }
+
+  @Test
+  void proxiesPackagesUnderDistsUsingTheDecodedCanonicalPath() {
+    RepositoryRuntime runtime = runtime(RepositoryType.PROXY, "ALLOW", 60);
+    String canonical = "dists/stable/pool/stable/amd64/"
+        + "docker-ce_29.9.2-1~debian.12~bookworm_amd64.deb";
+    for (String tilde : new String[]{"~", "%7e", "%7E"}) {
+      for (boolean headOnly : new boolean[]{false, true}) {
+        Fixture fixture = new Fixture();
+        when(fixture.repositorySettings.get(runtime)).thenReturn(fixture.proxySettings);
+        when(fixture.proxy.getPinnedAssetFromUrlUnindexed(
+            runtime, canonical, "https://apt.example/" + canonical, headOnly))
+            .thenReturn(MavenResponse.noBody(200));
+
+        MavenResponse response = fixture.service.get(
+            runtime, canonical.replace("~", tilde), headOnly);
+
+        assertEquals(200, response.status());
+        assertEquals("public, max-age=31536000, immutable",
+            response.headers().get("Cache-Control"));
+        verify(fixture.proxy).getPinnedAssetFromUrlUnindexed(
+            runtime, canonical, "https://apt.example/" + canonical, headOnly);
+        verify(fixture.proxy, never()).getMetadataFromUrlUnindexed(
+            any(), anyString(), anyString(), anyBoolean());
+        ArgumentCaptor<AptPath> projected = ArgumentCaptor.forClass(AptPath.class);
+        verify(fixture.proxyProjection).observePassthrough(
+            eq(runtime), eq(fixture.proxySettings), projected.capture());
+        assertEquals(AptPath.Kind.PACKAGE, projected.getValue().kind());
+        assertEquals(canonical, projected.getValue().normalized());
+      }
+    }
+  }
+
   @Test
   void rejectsNullWrongFormatAndGroupRuntimes() {
     Fixture fixture = new Fixture();
@@ -562,7 +628,7 @@ class AptServiceTest {
     final AptMetadataBuilder metadataBuilder = mock(AptMetadataBuilder.class);
     final AptSigningService signing = mock(AptSigningService.class);
     final AptLeaseManager leases = mock(AptLeaseManager.class);
-    final AptLeaseManager.Lease lease = mock(AptLeaseManager.Lease.class);
+    final FencedLeaseManager.Lease lease = mock(FencedLeaseManager.Lease.class);
     final RawProxyService proxy = mock(RawProxyService.class);
     final AptProxyProjectionService proxyProjection = mock(AptProxyProjectionService.class);
     final AptRepositorySettings.Settings hostedSettings = new AptRepositorySettings.Settings(

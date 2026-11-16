@@ -53,12 +53,19 @@ class NugetServiceTest {
   }
 
   @Test
-  void proxyRemoteUrlPreservesRequestQueryParameters() {
+  void proxySearchDiscoversEndpointAndPreservesVisualStudioQueryParameters() throws Exception {
     RepositoryRuntime runtime = proxy("https://api.nuget.org/v3/index.json");
+    FakeRawProxyService proxy = new FakeRawProxyService("{\"totalHits\":1,\"data\":[{\"id\":\"Serilog\"}]}");
+    NugetService service = new NugetService(null, proxy, new FakeAssetDao(List.of()), MAPPER);
+    MockHttpServletRequest request = new MockHttpServletRequest();
+    String query = "q=&skip=0&take=26&prerelease=false&supportedFramework=net10.0&semVerLevel=2.0.0";
+    request.setQueryString(query);
 
-    String remoteUrl = NugetService.remoteUrlForPath(runtime, "query?q=json&take=20");
+    JsonNode result = MAPPER.readTree(body(service.get(runtime, "query", "http://localhost/repository/nuget",
+        request, false)));
 
-    assertEquals("https://api.nuget.org/query?q=json&take=20", remoteUrl);
+    assertEquals("Serilog", result.path("data").get(0).path("id").asText());
+    assertEquals("https://search.example/search?" + query, proxy.lastRemoteUrl);
   }
 
   @Test
@@ -115,7 +122,7 @@ class NugetServiceTest {
 
     assertEquals("http://localhost:28090/repository/nuget-hosted/v3/registration5-semver1/newtonsoft.json/index.json",
         registration.get("@id").asText());
-    assertEquals(2, registration.get("count").asInt());
+    assertEquals(1, registration.get("count").asInt());
     JsonNode page = registration.get("items").get(0);
     assertEquals(2, page.get("count").asInt());
     JsonNode item = page.get("items").get(1);
@@ -124,6 +131,23 @@ class NugetServiceTest {
     assertEquals(
         "http://localhost:28090/repository/nuget-hosted/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg",
         item.get("packageContent").asText());
+  }
+
+  @Test
+  void generatedRegistrationsExcludeSemVer2OnlyVersionsFromLegacyHives() throws Exception {
+    List<String> versions = List.of("1.0.0", "1.0.1-beta", "1.0.2-beta.1", "1.0.3+build", "1.0.4.0");
+    NugetService service = new NugetService(null, null, new FakeAssetDao(versions.stream()
+        .map(v -> asset("v3-flatcontainer/demo/" + v + "/demo." + v + ".nupkg")).toList()), MAPPER);
+    for (RepositoryRuntime runtime : List.of(hosted(), group(hosted()))) {
+      for (String flavor : List.of("semver1", "semver2")) {
+        JsonNode registration = MAPPER.readTree(body(service.get(runtime,
+            "v3/registration5-" + flavor + "/demo/index.json", "https://kkrepo.example/repository/nuget/", null, false)));
+        List<String> actual = new ArrayList<>();
+        registration.path("items").forEach(page -> page.path("items").forEach(item ->
+            actual.add(item.path("catalogEntry").path("version").asText())));
+        assertEquals(flavor.equals("semver1") ? List.of("1.0.0", "1.0.1-beta", "1.0.4.0") : versions, actual);
+      }
+    }
   }
 
   @Test
@@ -142,7 +166,7 @@ class NugetServiceTest {
     assertEquals("Serilog", body.get("data").get(0).get("id").asText());
     assertTrue(body.get("data").get(0).get("registration").asText()
         .startsWith("http://localhost:28090/repository/nuget-group/v3/registration5-semver1/"));
-    assertEquals("https://api.nuget.org/query?q=seri", proxy.lastRemoteUrl);
+    assertEquals("https://search.example/search?q=seri", proxy.lastRemoteUrl);
   }
 
   @Test
@@ -159,7 +183,7 @@ class NugetServiceTest {
 
     assertEquals(1, body.get("totalHits").asInt());
     assertEquals("Serilog", body.get("data").get(0).asText());
-    assertEquals("https://api.nuget.org/autocomplete?q=seri", proxy.lastRemoteUrl);
+    assertEquals("https://search.example/suggest?q=seri", proxy.lastRemoteUrl);
   }
 
   @Test
@@ -175,7 +199,7 @@ class NugetServiceTest {
             "query", "http://localhost:28090/repository/nuget-group", request, false));
 
     assertEquals("upstream timed out", error.getMessage());
-    assertEquals("https://api.nuget.org/query?q=seri", proxy.lastRemoteUrl);
+    assertEquals("https://search.example/search?q=seri", proxy.lastRemoteUrl);
   }
 
   @Test
@@ -395,6 +419,29 @@ class NugetServiceTest {
     private final String json;
     private final RuntimeException failure;
     private String lastRemoteUrl;
+
+    @Override
+    public MavenResponse getMetadataFromUrlHidden(
+        RepositoryRuntime runtime, String path, String url, boolean head,
+        String validationId, java.util.function.UnaryOperator<java.io.InputStream> validator) {
+      MavenResponse response = getMetadataFromUrlHidden(runtime, path, url, false);
+      return MavenResponse.ok(validator.apply(response.body()), response.contentLength(), "application/json", null, null);
+    }
+
+    @Override
+    public MavenResponse getMetadataFromUrlHidden(
+        RepositoryRuntime runtime, String path, String remoteUrl, boolean headOnly) {
+      if (path.startsWith("_nuget/index/")) {
+        assertEquals("https://api.nuget.org/v3/index.json", remoteUrl);
+        byte[] index = """
+            {"version":"3.0.0","resources":[
+              {"@type":"SearchQueryService/3.5.0","@id":"https://search.example/search"},
+              {"@type":"SearchAutocompleteService/3.5.0","@id":"https://search.example/suggest"}]}
+            """.getBytes(StandardCharsets.UTF_8);
+        return MavenResponse.ok(new ByteArrayInputStream(index), index.length, "application/json", null, null);
+      }
+      return getAssetFromUrl(runtime, path, remoteUrl, headOnly);
+    }
 
     FakeRawProxyService(String json) {
       super(null, null, null, null, null, null, null, null);

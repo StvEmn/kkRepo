@@ -9,6 +9,17 @@
 It also contains unit-level and diagnostic compatibility checks that run during normal `mvn test`
 or when explicitly enabled.
 
+## Custom CA runtime checks
+
+`scripts/ci/check-custom-ca.py --jar server/target/kkrepo-server-1.4.0.jar` starts disposable
+PostgreSQL and HTTPS RustFS containers plus an HTTPS upstream signed by a second private CA.
+It verifies blob-store read/write/delete, hosted artifact upload/download, and an uncached proxy
+download with a combined PEM bundle, then restarts without the bundle and checks TLS rejection.
+Use the jar version produced by your checkout. `--image kkrepo:compat` runs the same checks on
+Linux with Docker host networking; the shared JVM and Native candidate builds both run it.
+Pass `--minio-image <available-minio-image>` to exercise MinIO instead of the default RustFS fixture.
+Docker, OpenSSL and curl are required. The probe removes its own containers and data on exit.
+
 ## Reference Nexus Endpoint
 
 Use the Docker-resident Nexus service as the fixed reference endpoint:
@@ -36,6 +47,18 @@ mvn -pl compat-test -am test
 
 The live black-box tests are skipped by default so the module stays deterministic in CI and local
 builds without Nexus.
+
+`MavenGroupFailureCompatibilityTest` runs with `COMPAT_WRITE_ENABLED=true` and is included in
+the `nexus` suite. It creates and deletes isolated proxy/hosted/group repositories on both servers,
+places the failing proxy first, and compares artifact/checksum GET and HEAD, metadata aggregation,
+and all-member misses for upstream 404/400/500 and a cross-origin redirect to a missing resource.
+The controlled HTTP fixtures run on the test runner; both repository servers must reach them via
+`MAVEN_GROUP_COMPAT_UPSTREAM_HOST` (default `host.docker.internal`, mapped by the compatibility
+compose files). For host-run services, set this to a host address reachable from both servers.
+The candidate must permit this private fixture address, as the compatibility compose files do.
+The redirect target remains unallowlisted, and the test verifies kkRepo never contacts it.
+On Nexus versions with the SSRF configuration API, the test temporarily adds only the fixture host
+to the private-network allowlist and removes that entry afterward, retaining existing settings.
 
 ## Disposable Live Compatibility Environment
 
@@ -88,6 +111,8 @@ Available suites:
   contracts. Composer is required when enabled; a missing Nexus Composer endpoint fails instead of skipping.
   The self-contained Conda fixtures run in this module, while the live Conda comparison is enabled
   explicitly as described below.
+- `ohpm`: standalone HTTP acceptance against a disposable kkRepo candidate; Huawei's protocol is the reference, not Nexus.
+- `ohpm-client-e2e`: the same acceptance with real OHPM publication and installation. Full E2E includes OHPM in the existing core shard on JVM/Native × MySQL/PostgreSQL, with Login disabled/enabled on the same candidate image. See [OHPM acceptance and CI](../docs/en/dev/ohpm-acceptance.md) for candidate preparation, the pinned 5.0.2 installer, required URLs, reports and cleanup limits.
 - `extended`: diagnostic smoke coverage plus currently separated PyPI, Helm, Pub, NuGet, RubyGems, and Yum checks.
 - `client-e2e`: starts from the disposable kkrepo service and uses real package clients to publish
   and then download/resolve through hosted and group/proxy repositories. It covers Maven, npm,
@@ -273,6 +298,14 @@ pre-issued Bearer token can also be supplied with `CONAN_NEXUS_COMPAT_TOKEN` or
 `CONAN_KKREPO_COMPAT_TOKEN`; this is useful when the candidate Browse endpoint is
 anonymous but Conan package writes still require authentication.
 
+To include the 7,922-entry SDK fixture whose manifest also exceeds 1 MiB, set
+`CONAN_MANIFEST_LIMITS_COMPAT_ENABLED=true` alongside the settings above. First configure the
+candidate repository with `conan.manifestMaxEntries=7922` and
+`conan.manifestMaxBytes=16777216` through the repository API/UI (or raise the server defaults).
+The opt-in case publishes the same archive/manifest to Nexus and kkRepo and checks download,
+revision identity, checksums, Range responses, and Browse projection. Normal runs retain the
+small fixture so existing default-limit deployments can still run the baseline matrix.
+
 Run the real Conan 2 client flow with:
 
 ```bash
@@ -449,16 +482,37 @@ The registry specification makes `POST /login` optional and allows `501 Not Impl
 server omits it. kkRepo implements this endpoint, so candidate assertions expect `200` for valid
 credentials and `401` for invalid credentials; `501` is a reference-only/N-A branch for kkrepo.
 
-The scheduled S3-compatible resilience lane runs two kkrepo replicas with PostgreSQL and MinIO
+The scheduled S3-compatible resilience lane runs two kkrepo replicas with PostgreSQL and RustFS
 through the AWS S3 adapter. It covers a multi-megabyte package, shared 429/5xx waterlines and stale
 fallback, expired-lease takeover, restart, and destructive database/object backup-restore. Alibaba
 OSS Native is covered by adapter contracts; this suite does not claim a live OSS Native endpoint.
+The fixture pins RustFS 1.0.0 and AWS CLI 2.37.1. Bucket initialization and object backup/restore
+use the standard S3 API and `aws s3 sync`; the RustFS data volume is private to the Compose project.
 
 Swift migration is `FULL` only for Nexus 3.92.x-3.94.x sources whose datastore asset shape is
 verified. The live Nexus 3.94 matrix covers H2 to MySQL and PostgreSQL source to MySQL/PostgreSQL
 targets, restart/resume, exact-row-count idempotency, and masked/missing proxy-secret fail-closed
 behavior. An affected target proxy remains offline with no placeholder credential until an
 administrator supplies the secret explicitly.
+
+## OHPM External Acceptance
+
+OHPM uses Huawei's official protocol and real clients as the reference. It does not require Nexus.
+Build a disposable executable candidate with `mvn -pl server -am -DskipTests package spring-boot:repackage`,
+then set `KKREPO_COMPAT_BASE_URL`, `KKREPO_COMPAT_USERNAME`, `KKREPO_COMPAT_PASSWORD` and the expected
+`OHPM_COMPAT_LOGIN_ENABLED` state.
+
+```bash
+bash scripts/ci/run-ohpm-compat.sh blackbox
+OHPM_COMMAND=/absolute/path/to/ohpm OHPM_EXPECTED_VERSION=6.0.1 \
+  bash scripts/ci/run-ohpm-compat.sh client-e2e
+```
+
+The entry points require all seven HTTP cases or all eight cases including the client to run without skips.
+They cover hosted/proxy/group, HAR/HSP, normal/stream upload, management/import, Login and client operations.
+Tests retain populated proxy fixtures when the generic API refuses deletion; destroy the disposable database
+and blob store after the run. See [OHPM acceptance](../docs/en/dev/ohpm-acceptance.md) for bootstrap, upstream
+address configuration, the pinned OHPM 5.0.2 installer and the dual-database CI workflow.
 
 ## Live Console And Maven Read Checks
 
@@ -539,6 +593,29 @@ mvn -pl compat-test -am \
   -Dtest=NugetRubygemsYumRepositoryBlackBoxCompatibilityTest \
   test
 ```
+
+The isolated NuGet V3 fixtures exercise NTLM resource discovery and paginated group registration
+merging against disposable repositories. The group fixture compares member precedence, numeric
+version ordering, signed package links, and dependency metadata with Nexus; kkRepo also verifies
+that signed downloads and plain registration leaf, parent and index links reach only the selected member. An additional kkRepo case requires exact
+raw query ordering while hiding resource credentials, follows direct/group links, and checks
+that a proven repository-root fallback survives a root-page outage with automatic blocking enabled.
+Pass `--kkrepo-secondary URL` to run the outage phase through a second replica sharing the same
+database and blob store. Both scripts run in NuGet client E2E.
+
+The kkRepo variants also cover array-valued resource `@type` entries accepted by NuGet.Client
+and textual `catalogEntry` links. Nexus 3.94 returns 404 for the isolated array-type variant;
+the scalar-type reference fixture passes.
+
+```bash
+python3 compat-test/scripts/ntlm-upstream.py --nexus http://localhost:28090 --dotnet
+python3 compat-test/scripts/nuget-group-registration-upstream.py --nexus http://localhost:28090
+KKREPO_COMPAT_AUTH=admin:123456 python3 compat-test/scripts/nuget-group-registration-upstream.py \
+  --kkrepo http://localhost:8080 --upstream-host 127.0.0.1
+```
+
+Use `--upstream-host host.docker.internal` when the target server runs in Docker. Each script
+removes its own repositories and temporary Nexus SSRF exception after the check.
 
 Hosted NuGet multipart push and Yum RPM PUT are opt-in because they write packages into the
 comparison repositories. To target the Browse repository from local dev, set
@@ -762,6 +839,35 @@ with `COMPAT_RAW_REMOTE_URL` and `COMPAT_RAW_PROXY_PROBE_PATH`; defaults are
 
 ## Docker Registry V2 Compatibility
 
+`scripts/docker-auth-pool-upstream.py` compares same-host bearer authentication against Nexus
+and kkRepo using temporary proxy/group repositories. For both GET and HEAD, 25 concurrent misses
+must return 404, followed by a cold manifest returning 200 with the expected digest and body.
+The upstream sends non-empty 401 responses and synchronizes the first 20 challenges to exercise
+the connection-pool boundary. The kkRepo comparison runs in the Docker client E2E suite.
+Use `--concurrency 1` to establish the Nexus protocol baseline separately from the overload test:
+Nexus 3.94.0 also returned some transient 502s at the synchronized 25-request boundary locally.
+The kkRepo regression always requires all 25 misses and the following cold pull to succeed.
+
+```bash
+python3 compat-test/scripts/docker-auth-pool-upstream.py --nexus http://localhost:28090 --concurrency 1
+KKREPO_COMPAT_AUTH=admin:12345678 python3 compat-test/scripts/docker-auth-pool-upstream.py \
+  --kkrepo http://localhost:18090 --upstream-host 127.0.0.1
+```
+
+`scripts/docker-pagination-upstream.py` creates an isolated registry fixture and temporary
+proxy/group repositories. It verifies tag pagination against Nexus and kkRepo, and additionally
+checks kkRepo catalog pagination, encoded cursors, Link headers and the actual upstream query
+separator. It runs in the Docker client E2E suite. The Nexus comparison covers tag listing;
+catalog assertions run against kkRepo.
+
+```bash
+python3 compat-test/scripts/docker-pagination-upstream.py --nexus http://localhost:28090
+KKREPO_COMPAT_AUTH=admin:12345678 python3 compat-test/scripts/docker-pagination-upstream.py \
+  --kkrepo http://localhost:18090 --upstream-host 127.0.0.1
+```
+
+Use `--upstream-host host.docker.internal` when the target runs in Docker.
+
 The Docker Registry V2 checks are disabled by default. They compare a Nexus Docker
 connector with a kkrepo Docker connector and can optionally cover path-based routing,
 proxy, group, and hosted write-policy repositories.
@@ -883,3 +989,17 @@ the Nexus 3.94 `go-hosted` repository, requires a `FULL` datastore-backed migrat
 its assets, checks the module ZIP digest, and runs `go mod download` against both kkrepo replicas.
 The migration workflow enables this fixture only for its Nexus 3.94 H2/PostgreSQL lanes because Go
 hosted repositories were introduced in Nexus 3.93.
+
+### Docker catalog read authorization
+
+`python3 compat-test/scripts/docker-catalog-auth.py --nexus http://localhost:28090 --kkrepo http://localhost:18090`
+checks administrator, repository-specific read, wildcard read, Bearer and anonymous catalog access,
+plus denial on another repository. kkRepo assertions also cover permission revocation on an issued
+catalog token, invalid credentials with anonymous access enabled, and Docker JSON authentication
+errors. It accounts for the optional default authenticated read role; anonymous checks always
+verify strict repository isolation, revocation and disabling anonymous access. Credentials come from `NEXUS_COMPAT_AUTH` and `KKREPO_COMPAT_AUTH` (the existing local
+compatibility defaults apply). Run only on isolated compatibility instances: the fixture temporarily
+changes anonymous settings and enables the Nexus Docker Token Realm, restores both, and removes
+its own repositories, users and roles. Nexus admin-port token URLs use the repository prefix,
+matching that route's reverse-proxy layout. The check runs in Nexus compatibility and every
+Docker client E2E database/runtime shard.

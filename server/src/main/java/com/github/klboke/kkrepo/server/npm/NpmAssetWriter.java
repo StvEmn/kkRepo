@@ -14,6 +14,7 @@ import com.github.klboke.kkrepo.persistence.jdbc.api.model.ComponentRecord;
 import com.github.klboke.kkrepo.protocol.npm.NpmMinimumReleaseAge;
 import com.github.klboke.kkrepo.protocol.npm.NpmPackageId;
 import com.github.klboke.kkrepo.server.blob.BlobReferenceCodec;
+import com.github.klboke.kkrepo.server.blob.BufferedUpload;
 import com.github.klboke.kkrepo.server.blob.TempBlobFiles;
 import com.github.klboke.kkrepo.server.blob.BlobTransactionCleanup;
 import com.github.klboke.kkrepo.server.cache.AssetMetadataCache;
@@ -24,14 +25,8 @@ import com.github.klboke.kkrepo.server.transaction.TransientTransactionRetry;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
-import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -39,6 +34,8 @@ import java.util.OptionalLong;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 @Component
 public class NpmAssetWriter {
@@ -291,6 +288,7 @@ public class NpmAssetWriter {
       NpmMinimumReleaseAge.ReleaseIndex releaseIndex) {
     DigestedUpload upload = uploadWithDigests(runtime, storage, blobStoreId, path, body, extraBlobAttributes);
     try {
+      cleanupAfterRollback(storage, blobStoreId, upload);
       Stored stored = executePersist(
           "Persist npm asset " + runtime.name() + "/" + path,
           () -> persist(runtime, blobStoreId, path, packageId, version, contentType, kind,
@@ -332,12 +330,14 @@ public class NpmAssetWriter {
       Path responseFile,
       boolean indexBrowseNode,
       NpmMinimumReleaseAge.ReleaseIndex releaseIndex) {
+    com.github.klboke.kkrepo.server.proxy.ProxyCachePublication.check(runtime, path);
     Instant now = Instant.now();
     BlobReference ref = upload.reference();
     Digests digests = upload.digests();
     String blobRef = BlobReferenceCodec.format(ref);
 
     Optional<AssetRecord> existing = assetDao.findAssetByPath(runtime.id(), path);
+    enforceHostedWritePolicy(runtime, kind, existing.isPresent());
     Long previousBlobId = existing.map(AssetRecord::assetBlobId).orElse(null);
 
     Map<String, Object> blobAttrs = new LinkedHashMap<>();
@@ -418,6 +418,9 @@ public class NpmAssetWriter {
             record.attributes());
         created = true;
       } else {
+        // The unique path constraint arbitrates across replicas. Reject before a snapshot read,
+        // which need not see the winner under repeatable-read isolation.
+        enforceHostedWritePolicy(runtime, kind, true);
         AssetRecord prior = assetDao.findAssetByPath(runtime.id(), path)
             .orElseThrow(() -> new IllegalStateException(
                 "Concurrent npm asset insert won but row is not visible for " + runtime.name() + "/" + path));
@@ -456,6 +459,34 @@ public class NpmAssetWriter {
       groupMemberAssetCache.invalidateMemberAfterCommit(runtime.id());
     }
     return new Stored(persistedAsset, persistedBlob, digests, created, responseFile);
+  }
+
+  private static void enforceHostedWritePolicy(RepositoryRuntime runtime, String kind, boolean existing) {
+    // Package-root rewrites also serve separately authorized administrative cleanup.
+    if (!runtime.isHosted() || !TARBALL.equals(kind)) return;
+    String policy = runtime.writePolicy() == null ? "ALLOW_ONCE" : runtime.writePolicy();
+    if ("DENY".equals(policy)) {
+      throw new NpmExceptions.WritePolicyDenied("Write policy DENY forbids writing " + kind);
+    }
+    if ("ALLOW_ONCE".equals(policy) && existing) {
+      throw new NpmExceptions.WritePolicyDenied("Write policy ALLOW_ONCE forbids overwriting " + kind);
+    }
+  }
+
+  // A later attachment/root failure can roll back a previously successful write in this publish.
+  // Defer object cleanup until that rollback; referenced/deduplicated objects are never deleted.
+  private void cleanupAfterRollback(BlobStorage storage, long blobStoreId, DigestedUpload upload) {
+    if (upload.uploaded() && TransactionSynchronizationManager.isActualTransactionActive()
+        && TransactionSynchronizationManager.isSynchronizationActive()) {
+      TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+        @Override
+        public void afterCompletion(int status) {
+          if (status == STATUS_ROLLED_BACK) {
+            cleanupUploadedBlob(storage, blobStoreId, upload);
+          }
+        }
+      });
+    }
   }
 
   private AssetRecord updateExistingAsset(
@@ -536,20 +567,15 @@ public class NpmAssetWriter {
       Map<String, String> extraBlobAttributes) {
     Path tmp = null;
     try {
-      tmp = Files.createTempFile("kkrepo-npm-", ".tmp");
-      MessageDigest md5 = digest("MD5");
-      MessageDigest sha1 = digest("SHA-1");
-      MessageDigest sha256 = digest("SHA-256");
-      MessageDigest sha512 = digest("SHA-512");
-      long size;
-      try (OutputStream out = Files.newOutputStream(tmp, StandardOpenOption.TRUNCATE_EXISTING)) {
-        size = streamWithDigests(UpstreamBodyReadException.wrap(body), out, md5, sha1, sha256, sha512);
-      }
-      String md5Hex = hex(md5.digest());
-      String sha1Hex = hex(sha1.digest());
-      String sha256Hex = hex(sha256.digest());
-      String sha512Hex = hex(sha512.digest());
-      Digests digests = new Digests(md5Hex, sha1Hex, sha256Hex, sha512Hex, size);
+      BufferedUpload buffered = BufferedUpload.create(
+          UpstreamBodyReadException.wrap(body), null, "kkrepo-npm-",
+          BufferedUpload.Checksums.WITH_SHA512);
+      tmp = buffered.file();
+      BufferedUpload.Digests computed = buffered.digests();
+      Digests digests = new Digests(computed.md5(), computed.sha1(), computed.sha256(),
+          computed.sha512(), computed.size());
+      String sha256Hex = digests.sha256();
+      long size = digests.size();
       Optional<AssetBlobRecord> reusable = precheckedReusableBlob(blobStoreId, sha256Hex, size, extraBlobAttributes);
       if (reusable.isPresent()) {
         AssetBlobRecord blob = reusable.get();
@@ -608,30 +634,6 @@ public class NpmAssetWriter {
       return Optional.empty();
     }
     return assetDao.findReusableBlobBySha256(blobStoreId, sha256, size);
-  }
-
-  private long streamWithDigests(InputStream in, OutputStream out, MessageDigest... digests) throws IOException {
-    byte[] buf = new byte[TempBlobFiles.responseBufferSize()];
-    long total = 0;
-    int n;
-    while ((n = in.read(buf)) > 0) {
-      for (MessageDigest d : digests) d.update(buf, 0, n);
-      out.write(buf, 0, n);
-      total += n;
-    }
-    return total;
-  }
-
-  private static MessageDigest digest(String algorithm) {
-    try {
-      return MessageDigest.getInstance(algorithm);
-    } catch (NoSuchAlgorithmException e) {
-      throw new IllegalStateException("Missing digest algorithm: " + algorithm, e);
-    }
-  }
-
-  private static String hex(byte[] bytes) {
-    return HexFormat.of().formatHex(bytes);
   }
 
   private static String fileName(String path) {

@@ -10,6 +10,7 @@ import com.github.klboke.kkrepo.core.RepositoryType;
 import com.github.klboke.kkrepo.persistence.jdbc.api.ConanRegistryDao;
 import com.github.klboke.kkrepo.server.apt.AptService;
 import com.github.klboke.kkrepo.server.alpine.AlpineService;
+import com.github.klboke.kkrepo.server.conan.ConanManifestPolicy;
 import com.github.klboke.kkrepo.server.maven.RepositoryRuntime;
 import com.github.klboke.kkrepo.server.maven.RepositoryRuntimeRegistry;
 import com.github.klboke.kkrepo.server.r.RService;
@@ -18,6 +19,10 @@ import com.github.klboke.kkrepo.server.security.SecurityAuthenticationService;
 import com.github.klboke.kkrepo.server.security.SecurityManagementService;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.CreateCommand;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.UpdateCommand;
+import com.github.klboke.kkrepo.server.statistics.StorageStatisticsService;
+import com.github.klboke.kkrepo.server.statistics.StorageStatisticsService.UsageSnapshot;
+import com.github.klboke.kkrepo.server.statistics.StorageUsageResponse;
+import com.github.klboke.kkrepo.server.statistics.StorageUsageResponse.RepositoryUsage;
 import jakarta.servlet.http.HttpServletRequest;
 import java.util.List;
 import java.util.Map;
@@ -48,7 +53,9 @@ public class RepositoriesController {
   private AlpineService alpineService;
   private RService rService;
   private ConanRegistryDao conanRegistry;
+  private ConanManifestPolicy conanManifestPolicy;
   private RepositoryRuntimeRegistry runtimeRegistry;
+  private StorageStatisticsService statistics;
 
   public RepositoriesController(
       RepositoryService service,
@@ -57,6 +64,19 @@ public class RepositoriesController {
     this.service = service;
     this.authenticationService = authenticationService;
     this.securityService = securityService;
+  }
+
+  @Autowired
+  void setStorageStatistics(StorageStatisticsService statistics) {
+    this.statistics = statistics;
+  }
+
+  @GetMapping("/statistics/usage")
+  public UsageSnapshot<RepositoryUsage> statistics(
+      HttpServletRequest request) {
+    requireAuthenticated(request);
+    return StorageUsageResponse.assets(
+        statistics.assets(list("admin", request).stream().map(RepositoryView::id).toList()));
   }
 
   @Autowired(required = false)
@@ -114,7 +134,8 @@ public class RepositoriesController {
   public List<RepositoryView> uploadable(HttpServletRequest request) {
     AuthenticatedSubject subject = requireAuthenticated(request);
     List<RepositoryView> candidates = service.list().stream()
-        .filter(repository -> repository.online() && repository.type() == RepositoryType.HOSTED)
+        .filter(repository -> repository.online() && repository.type() == RepositoryType.HOSTED
+            && repository.format() != RepositoryFormat.GITLFS)
         .toList();
     if (allRepositoryActionAllowed(subject, PermissionAction.EDIT)) {
       return candidates;
@@ -122,6 +143,18 @@ public class RepositoriesController {
     return candidates.stream()
         .filter(repository -> repositoryActionAllowed(subject, repository, PermissionAction.EDIT))
         .toList();
+  }
+
+  @Autowired
+  void setConanManifestPolicy(ConanManifestPolicy policy) {
+    this.conanManifestPolicy = policy;
+  }
+
+  @GetMapping("/conan/defaults")
+  public RepositoryCommands.ConanSettings conanDefaults(HttpServletRequest request) {
+    // Like recipes, these non-secret defaults are needed before a repository exists.
+    requireAuthenticated(request);
+    return conanManifestPolicy.defaults();
   }
 
   @GetMapping("/recipes")

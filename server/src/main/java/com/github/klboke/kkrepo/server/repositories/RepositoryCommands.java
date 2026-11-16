@@ -24,7 +24,73 @@ public final class RepositoryCommands {
       GroupSettings group,
       AptSettings apt,
       AlpineSettings alpine,
-      PypiSettings pypi) {
+      PypiSettings pypi,
+      YumSettings yum,
+      ConanSettings conan,
+      @com.fasterxml.jackson.annotation.JsonAlias("routingRule") String routingRuleName) {
+    /** Compatibility constructor for repository clients without routing rules. */
+    public CreateCommand(
+        String name,
+        String recipe,
+        Boolean online,
+        String blobStoreName,
+        Boolean strictContentTypeValidation,
+        HostedSettings hosted,
+        ProxySettings proxy,
+        RawSettings raw,
+        DockerSettings docker,
+        CargoSettings cargo,
+        GroupSettings group,
+        AptSettings apt,
+        AlpineSettings alpine,
+        PypiSettings pypi,
+        YumSettings yum,
+        ConanSettings conan) {
+      this(name, recipe, online, blobStoreName, strictContentTypeValidation, hosted, proxy, raw,
+          docker, cargo, group, apt, alpine, pypi, yum, conan, null);
+    }
+
+    /** Compatibility constructor for callers without Conan manifest overrides. */
+    public CreateCommand(
+        String name,
+        String recipe,
+        Boolean online,
+        String blobStoreName,
+        Boolean strictContentTypeValidation,
+        HostedSettings hosted,
+        ProxySettings proxy,
+        RawSettings raw,
+        DockerSettings docker,
+        CargoSettings cargo,
+        GroupSettings group,
+        AptSettings apt,
+        AlpineSettings alpine,
+        PypiSettings pypi,
+        YumSettings yum) {
+      this(name, recipe, online, blobStoreName, strictContentTypeValidation, hosted, proxy, raw, docker,
+          cargo, group, apt, alpine, pypi, yum, null);
+    }
+
+    /** Compatibility constructor for callers that predate Yum repodata-depth settings. */
+    public CreateCommand(
+        String name,
+        String recipe,
+        Boolean online,
+        String blobStoreName,
+        Boolean strictContentTypeValidation,
+        HostedSettings hosted,
+        ProxySettings proxy,
+        RawSettings raw,
+        DockerSettings docker,
+        CargoSettings cargo,
+        GroupSettings group,
+        AptSettings apt,
+        AlpineSettings alpine,
+        PypiSettings pypi) {
+      this(name, recipe, online, blobStoreName, strictContentTypeValidation, hosted, proxy, raw, docker,
+          cargo, group, apt, alpine, pypi, null);
+    }
+
     public CreateCommand(
         String name,
         String recipe,
@@ -90,7 +156,67 @@ public final class RepositoryCommands {
       GroupSettings group,
       AptSettings apt,
       AlpineSettings alpine,
-      PypiSettings pypi) {
+      PypiSettings pypi,
+      YumSettings yum,
+      ConanSettings conan,
+      @com.fasterxml.jackson.annotation.JsonAlias("routingRule") String routingRuleName) {
+    /** Compatibility constructor for repository clients without routing rules. */
+    public UpdateCommand(
+        Boolean online,
+        String blobStoreName,
+        Boolean strictContentTypeValidation,
+        HostedSettings hosted,
+        ProxySettings proxy,
+        RawSettings raw,
+        DockerSettings docker,
+        CargoSettings cargo,
+        GroupSettings group,
+        AptSettings apt,
+        AlpineSettings alpine,
+        PypiSettings pypi,
+        YumSettings yum,
+        ConanSettings conan) {
+      this(online, blobStoreName, strictContentTypeValidation, hosted, proxy, raw,
+          docker, cargo, group, apt, alpine, pypi, yum, conan, null);
+    }
+
+    /** Compatibility constructor for callers without Conan manifest overrides. */
+    public UpdateCommand(
+        Boolean online,
+        String blobStoreName,
+        Boolean strictContentTypeValidation,
+        HostedSettings hosted,
+        ProxySettings proxy,
+        RawSettings raw,
+        DockerSettings docker,
+        CargoSettings cargo,
+        GroupSettings group,
+        AptSettings apt,
+        AlpineSettings alpine,
+        PypiSettings pypi,
+        YumSettings yum) {
+      this(online, blobStoreName, strictContentTypeValidation, hosted, proxy, raw, docker, cargo, group,
+          apt, alpine, pypi, yum, null);
+    }
+
+    /** Compatibility constructor for callers that predate Yum repodata-depth settings. */
+    public UpdateCommand(
+        Boolean online,
+        String blobStoreName,
+        Boolean strictContentTypeValidation,
+        HostedSettings hosted,
+        ProxySettings proxy,
+        RawSettings raw,
+        DockerSettings docker,
+        CargoSettings cargo,
+        GroupSettings group,
+        AptSettings apt,
+        AlpineSettings alpine,
+        PypiSettings pypi) {
+      this(online, blobStoreName, strictContentTypeValidation, hosted, proxy, raw, docker, cargo, group,
+          apt, alpine, pypi, null);
+    }
+
     public UpdateCommand(
         Boolean online,
         String blobStoreName,
@@ -138,6 +264,9 @@ public final class RepositoryCommands {
     }
   }
 
+  /** When supplied, replaces both overrides; null fields inherit the server defaults. */
+  public record ConanSettings(Integer manifestMaxEntries, Integer manifestMaxBytes) {}
+
   public record HostedSettings(
       String writePolicy,
       String versionPolicy,
@@ -161,7 +290,61 @@ public final class RepositoryCommands {
       String outboundProxyPassword,
       Boolean outboundProxyPasswordConfigured,
       Integer minimumReleaseAgeMinutes,
-      List<String> allowedRedirectHosts) {
+      List<String> allowedRedirectHosts,
+      String remoteAuthenticationType,
+      String remoteNtlmDomain,
+      String remoteNtlmHost,
+      Boolean streamingEnabled) {
+    /** Compatibility constructor for callers without progressive proxy delivery. */
+    public ProxySettings(
+      String remoteUrl,
+      Integer contentMaxAgeMinutes,
+      Integer metadataMaxAgeMinutes,
+      Boolean autoBlock,
+      String remoteUsername,
+      String remotePassword,
+      Boolean remotePasswordConfigured,
+      String remoteBearerToken,
+      Boolean remoteBearerTokenConfigured,
+      String outboundProxyType,
+      String outboundProxyHost,
+      Integer outboundProxyPort,
+      String outboundProxyUsername,
+      String outboundProxyPassword,
+      Boolean outboundProxyPasswordConfigured,
+      Integer minimumReleaseAgeMinutes,
+      List<String> allowedRedirectHosts,
+      String remoteAuthenticationType,
+      String remoteNtlmDomain,
+      String remoteNtlmHost) {
+      this(remoteUrl, contentMaxAgeMinutes, metadataMaxAgeMinutes, autoBlock, remoteUsername, remotePassword, remotePasswordConfigured, remoteBearerToken, remoteBearerTokenConfigured, outboundProxyType, outboundProxyHost, outboundProxyPort, outboundProxyUsername, outboundProxyPassword, outboundProxyPasswordConfigured, minimumReleaseAgeMinutes, allowedRedirectHosts, remoteAuthenticationType, remoteNtlmDomain, remoteNtlmHost, null);
+    }
+
+    /** Compatibility constructor for callers that predate upstream NTLM authentication. */
+    public ProxySettings(
+        String remoteUrl,
+        Integer contentMaxAgeMinutes,
+        Integer metadataMaxAgeMinutes,
+        Boolean autoBlock,
+        String remoteUsername,
+        String remotePassword,
+        Boolean remotePasswordConfigured,
+        String remoteBearerToken,
+        Boolean remoteBearerTokenConfigured,
+        String outboundProxyType,
+        String outboundProxyHost,
+        Integer outboundProxyPort,
+        String outboundProxyUsername,
+        String outboundProxyPassword,
+        Boolean outboundProxyPasswordConfigured,
+        Integer minimumReleaseAgeMinutes,
+        List<String> allowedRedirectHosts) {
+      this(remoteUrl, contentMaxAgeMinutes, metadataMaxAgeMinutes, autoBlock, remoteUsername, remotePassword,
+          remotePasswordConfigured, remoteBearerToken, remoteBearerTokenConfigured, outboundProxyType,
+          outboundProxyHost, outboundProxyPort, outboundProxyUsername, outboundProxyPassword,
+          outboundProxyPasswordConfigured, minimumReleaseAgeMinutes, allowedRedirectHosts, null, null, null);
+    }
+
     /** Compatibility constructor for callers that predate redirect-host allowlisting. */
     public ProxySettings(
         String remoteUrl,
@@ -301,6 +484,10 @@ public final class RepositoryCommands {
       String signatureType,
       String description,
       List<String> upstreamPublicKeys) {
+  }
+
+  /** Number of path segments before a hosted Yum metadata root. */
+  public record YumSettings(Integer repodataDepth) {
   }
 
   /** Nexus-compatible PyPI proxy settings. Empty indexPath means the upstream root index. */
