@@ -26,6 +26,7 @@ import com.github.klboke.kkrepo.server.support.dao.AssetDaoAdapter;
 import com.github.klboke.kkrepo.server.support.dao.BrowseNodeDaoAdapter;
 import com.github.klboke.kkrepo.server.support.dao.ComponentDaoAdapter;
 import com.github.klboke.kkrepo.server.support.dao.RepositoryDaoAdapter;
+import com.github.klboke.kkrepo.server.support.SingleFlight;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -133,7 +134,7 @@ class PypiGroupServiceCacheTest {
       RecordingPypiHostedService hosted,
       BlobStorageRegistry registry) {
     PypiGroupService groupService() {
-      return new PypiGroupService(hosted, null, cache, null, registry, writer, reader);
+      return new PypiGroupService(hosted, null, cache, null, registry, writer, reader, new SingleFlight());
     }
   }
 

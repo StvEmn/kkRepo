@@ -1,5 +1,6 @@
 package com.github.klboke.kkrepo.server.maven;
 
+import com.github.klboke.kkrepo.server.support.SingleFlight;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.mock;
@@ -58,7 +59,7 @@ class MavenGroupReleaseAgeTest {
   private static MavenGroupService service(MavenHostedService hosted, MavenProxyService proxy) {
     return new MavenGroupService(
         hosted, proxy, mock(AssetDao.class), mock(BlobStorageRegistry.class),
-        mock(MavenAssetWriter.class), mock(AssetMetadataCache.class));
+        mock(MavenAssetWriter.class), mock(AssetMetadataCache.class), new SingleFlight());
   }
 
   private static RepositoryRuntime member(

@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.Map;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 @Repository
@@ -19,7 +20,12 @@ public class JdbcCacheVersionDao implements com.github.klboke.kkrepo.persistence
     this.coordinationDialect = databaseDialect.coordination();
   }
 
-  @Transactional
+  /**
+   * REQUIRES_NEW: bump typically runs from an afterCommit callback where the original
+   * transaction's resources are not fully cleaned up yet; joining that (possibly abnormal)
+   * context is undefined. Suspend-new-commit-resume keeps this single statement deterministic.
+   */
+  @Transactional(propagation = Propagation.REQUIRES_NEW)
   public long bump(String name) {
     String normalized = normalize(name);
     return coordinationDialect.bumpCacheVersion(jdbcTemplate, normalized);

@@ -18,6 +18,7 @@ import com.github.klboke.kkrepo.server.cache.NexusLikeCacheInfo;
 import com.github.klboke.kkrepo.server.blob.BlobReferenceCodec;
 import com.github.klboke.kkrepo.server.releaseage.ReleaseAgeDeniedException;
 import com.github.klboke.kkrepo.server.securityscan.ArtifactDownloadPolicy;
+import com.github.klboke.kkrepo.server.support.SingleFlight;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -55,6 +56,7 @@ public class MavenGroupService {
   private final AssetMetadataCache assetMetadataCache;
   private final NexusLikeCacheController cacheController;
   private final ArtifactDownloadPolicy downloadPolicy;
+  private final SingleFlight singleFlight;
   private final MavenPathParser parser = new MavenPathParser();
   private final MavenMetadataMerger metadataMerger = new MavenMetadataMerger();
 
@@ -63,7 +65,8 @@ public class MavenGroupService {
       AssetDao assetDao, BlobStorageRegistry blobStorageRegistry, MavenAssetWriter writer,
       AssetMetadataCache assetMetadataCache,
       NexusLikeCacheController cacheController,
-      ArtifactDownloadPolicy downloadPolicy) {
+      ArtifactDownloadPolicy downloadPolicy,
+      SingleFlight singleFlight) {
     this.hosted = hosted;
     this.proxy = proxy;
     this.assetDao = assetDao;
@@ -72,6 +75,7 @@ public class MavenGroupService {
     this.assetMetadataCache = assetMetadataCache;
     this.cacheController = cacheController;
     this.downloadPolicy = downloadPolicy;
+    this.singleFlight = singleFlight;
   }
 
   public MavenGroupService(
@@ -81,7 +85,8 @@ public class MavenGroupService {
       BlobStorageRegistry blobStorageRegistry,
       MavenAssetWriter writer,
       AssetMetadataCache assetMetadataCache,
-      NexusLikeCacheController cacheController) {
+      NexusLikeCacheController cacheController,
+      SingleFlight singleFlight) {
     this(
         hosted,
         proxy,
@@ -90,12 +95,14 @@ public class MavenGroupService {
         writer,
         assetMetadataCache,
         cacheController,
-        null);
+        null,
+        singleFlight);
   }
 
   public MavenGroupService(MavenHostedService hosted, MavenProxyService proxy,
       AssetDao assetDao, BlobStorageRegistry blobStorageRegistry, MavenAssetWriter writer,
-      AssetMetadataCache assetMetadataCache) {
+      AssetMetadataCache assetMetadataCache,
+      SingleFlight singleFlight) {
     this(
         hosted,
         proxy,
@@ -104,7 +111,8 @@ public class MavenGroupService {
         writer,
         assetMetadataCache,
         null,
-        null);
+        null,
+        singleFlight);
   }
 
   public MavenResponse get(RepositoryRuntime group, MavenPath path, boolean headOnly) {
@@ -234,6 +242,15 @@ public class MavenGroupService {
   }
 
   private MavenResponse serveMergedMetadata(
+      RepositoryRuntime group, MavenPath path, boolean headOnly, DispatchedRepositories dispatched) {
+    // Singleflight covers cache read + member collect + merge + write-back: concurrent requests
+    // for the same metadata path wait for the leader instead of each re-collecting from members
+    // (slow upstream fetches) and queuing N cache_version bumps on the same hot row.
+    return singleFlight.execute("maven:" + group.id() + ":" + path.path(), () ->
+        serveMergedMetadataInFlight(group, path, headOnly, dispatched));
+  }
+
+  private MavenResponse serveMergedMetadataInFlight(
       RepositoryRuntime group, MavenPath path, boolean headOnly, DispatchedRepositories dispatched) {
     Instant now = Instant.now();
     int ttl = group.effectiveMetadataMaxAgeMinutesOrDefault();

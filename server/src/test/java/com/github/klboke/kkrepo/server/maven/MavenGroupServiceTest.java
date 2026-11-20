@@ -31,6 +31,7 @@ import com.github.klboke.kkrepo.server.cache.AssetMetadataCache;
 import com.github.klboke.kkrepo.server.cache.CachedAssetMetadata;
 import com.github.klboke.kkrepo.server.securityscan.ArtifactDownloadPolicy;
 import com.github.klboke.kkrepo.server.support.InMemorySharedCache;
+import com.github.klboke.kkrepo.server.support.SingleFlight;
 import com.github.klboke.kkrepo.server.support.dao.AssetDaoAdapter;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -87,7 +88,8 @@ class MavenGroupServiceTest {
           .thenReturn(Optional.of(safe), Optional.of(overwritten ? replaced : safe));
       var writer = new CapturingWriter();
       var service = new MavenGroupService(new MissingHostedService(), new FailingProxyService(),
-          new EmptyAssetDao(), new FixedBlobStorageRegistry(new BytesBlobStorage("allowed")), writer, cache, tokens);
+          new EmptyAssetDao(), new FixedBlobStorageRegistry(new BytesBlobStorage("allowed")), writer, cache,
+          tokens, new SingleFlight());
       try (var body = service.get(projected, path, false).body()) {
         assertEquals("allowed", new String(body.readAllBytes(), StandardCharsets.UTF_8));
       }
@@ -123,7 +125,7 @@ class MavenGroupServiceTest {
   @Test
   void gradleModuleMetadataMissStillProbesLaterMembersLikeNexus() throws IOException {
     MavenGroupService service = new MavenGroupService(new MissingHostedService(), new SuccessfulProxyService(),
-        null, null, null, null);
+        null, null, null, null, new SingleFlight());
 
     MavenResponse response = service.get(group(), gradleModuleMetadata(), false);
 
@@ -134,7 +136,7 @@ class MavenGroupServiceTest {
   @Test
   void nestedGroupCycleDoesNotRecurseForeverAndContinuesLaterMembers() throws IOException {
     MavenGroupService service = new MavenGroupService(new MissingHostedService(), new SuccessfulProxyService(),
-        null, null, null, null);
+        null, null, null, null, new SingleFlight());
     List<RepositoryRuntime> rootMembers = new ArrayList<>();
     List<RepositoryRuntime> nestedMembers = new ArrayList<>();
     RepositoryRuntime root = group(10, "root", rootMembers);
@@ -161,7 +163,8 @@ class MavenGroupServiceTest {
         new EmptyAssetDao(),
         new FixedBlobStorageRegistry(new BytesBlobStorage("cached-group")),
         null,
-        cache);
+        cache,
+        new SingleFlight());
 
     MavenResponse response = service.get(group(), path, false);
 
@@ -192,7 +195,8 @@ class MavenGroupServiceTest {
         null,
         cache,
         null,
-        policy);
+        policy,
+        new SingleFlight());
 
     MavenResponse response = service.get(group(), path, true);
 
@@ -233,7 +237,8 @@ class MavenGroupServiceTest {
         null,
         cache,
         null,
-        policy);
+        policy,
+        new SingleFlight());
 
     MavenResponse response = service.get(outer, path, true);
 
@@ -282,7 +287,8 @@ class MavenGroupServiceTest {
         new EmptyAssetDao(),
         new FixedBlobStorageRegistry(new BytesBlobStorage("cached-group")),
         null,
-        cache);
+        cache,
+        new SingleFlight());
 
     MavenResponse response = service.get(group(1L, "maven-public", List.of(proxy(1, 1440))), path, false);
 
@@ -303,7 +309,8 @@ class MavenGroupServiceTest {
         new EmptyAssetDao(),
         null,
         writer,
-        cache);
+        cache,
+        new SingleFlight());
 
     MavenResponse response = service.get(group(), path, true);
 
@@ -313,7 +320,7 @@ class MavenGroupServiceTest {
 
   private static MavenGroupService service() {
     return new MavenGroupService(new MissingHostedService(), new FailingProxyService(),
-        null, null, null, null);
+        null, null, null, null, new SingleFlight());
   }
 
   private static MavenPath markerJar() {

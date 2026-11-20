@@ -18,11 +18,14 @@ import com.github.klboke.kkrepo.server.cache.AssetMetadataCache.Loaded;
 import com.github.klboke.kkrepo.server.support.InMemorySharedCache;
 import com.github.klboke.kkrepo.server.support.InMemoryVersionWatermark;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 class AssetMetadataCacheTest {
@@ -213,6 +216,55 @@ class AssetMetadataCacheTest {
     }
 
     assertFalse(sharedCache.getString("asset-metadata", "7:x.jar").isPresent());
+  }
+
+  @Test
+  void watermarkBumpRunsAfterCommitAndAFailureNeitherRollsBackNorBlocksLaterWork() {
+    // New convoy semantics: evictAfterCommit schedules the watermark bump for afterCommit.
+    List<String> events = new ArrayList<>();
+    AtomicInteger bumps = new AtomicInteger();
+    VersionWatermark watermark = new VersionWatermark() {
+      @Override public long bump(String name) {
+        if (bumps.incrementAndGet() == 1) {
+          events.add("bump-fail");
+          throw new IllegalStateException("busy version row");
+        }
+        events.add("bump-ok");
+        return bumps.get();
+      }
+      @Override public long current(String name) { return 0L; }
+      @Override public long currentDurable(String name) { return 0L; }
+      @Override public Map<String, Long> currentAll() { return Map.of(); }
+    };
+    AssetMetadataCache cache = new AssetMetadataCache(sharedCache, watermark, true, 120, 5);
+
+    TransactionSynchronizationManager.initSynchronization();
+    try {
+      cache.find(7L, "x.jar",
+          () -> Optional.of(new Loaded(asset(1L, 7L, "x.jar"), blob(10L))));
+      cache.evictAfterCommit(7L, "x.jar");
+      events.add("scheduled");
+      assertTrue(events.stream().noneMatch(event -> event.startsWith("bump")),
+          "bump must not run before commit");
+
+      // Play the commit lifecycle in the transaction manager's order: data commit first, then
+      // the registered synchronizations — a failing bump is swallowed, later callbacks proceed.
+      events.add("commit");
+      for (TransactionSynchronization sync : TransactionSynchronizationManager.getSynchronizations()) {
+        sync.beforeCommit(false);
+      }
+      for (TransactionSynchronization sync : TransactionSynchronizationManager.getSynchronizations()) {
+        sync.afterCommit();
+        sync.afterCompletion(TransactionSynchronization.STATUS_COMMITTED);
+      }
+    } finally {
+      TransactionSynchronizationManager.clearSynchronization();
+    }
+
+    assertEquals(List.of("scheduled", "commit", "bump-fail"), events);
+    // The next write can still bump — the failed bump poisoned nothing.
+    assertEquals(2L, watermark.bump("asset-metadata:repo:7"));
+    assertEquals(List.of("scheduled", "commit", "bump-fail", "bump-ok"), events);
   }
 
   @Test

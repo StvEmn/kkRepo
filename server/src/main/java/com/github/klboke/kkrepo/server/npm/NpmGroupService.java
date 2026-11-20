@@ -14,6 +14,7 @@ import com.github.klboke.kkrepo.server.cache.NexusCacheType;
 import com.github.klboke.kkrepo.server.maven.BlobStorageRegistry;
 import com.github.klboke.kkrepo.server.maven.MavenResponse;
 import com.github.klboke.kkrepo.server.maven.RepositoryRuntime;
+import com.github.klboke.kkrepo.server.support.SingleFlight;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -35,6 +36,7 @@ public class NpmGroupService {
   private final GroupMemberAssetCache groupMemberAssetCache;
   private final BlobStorageRegistry blobStorageRegistry;
   private final NpmAssetWriter writer;
+  private final SingleFlight singleFlight;
 
   public NpmGroupService(
       NpmHostedService hosted,
@@ -43,7 +45,8 @@ public class NpmGroupService {
       NpmGroupPackumentCache packumentCache,
       GroupMemberAssetCache groupMemberAssetCache,
       BlobStorageRegistry blobStorageRegistry,
-      NpmAssetWriter writer) {
+      NpmAssetWriter writer,
+      SingleFlight singleFlight) {
     this.hosted = hosted;
     this.proxy = proxy;
     this.mapper = mapper;
@@ -51,6 +54,7 @@ public class NpmGroupService {
     this.groupMemberAssetCache = groupMemberAssetCache;
     this.blobStorageRegistry = blobStorageRegistry;
     this.writer = writer;
+    this.singleFlight = singleFlight;
   }
 
   public MavenResponse get(RepositoryRuntime group, NpmPath path, String repositoryBaseUrl, boolean headOnly) {
@@ -95,30 +99,35 @@ public class NpmGroupService {
       NpmPackageId packageId,
       NpmPackumentVariant variant,
       Instant now) {
-    if (packumentCache != null) {
-      Optional<CachedAssetMetadata> cached = packumentCache.findFresh(group, packageId, variant, now);
-      if (cached.isPresent()) {
-        Optional<PackageRootContent> loaded = loadCachedPackageRoot(group, packageId, variant, cached.get());
-        if (loaded.isPresent()) {
-          return loaded.get();
+    // Singleflight covers cache read + rebuild + write-back: concurrent requests for the same
+    // packument wait for the leader's committed write instead of each re-running the member
+    // merge (slow upstream fetches) and queuing N cache_version bumps on the same hot row.
+    return singleFlight.execute("npm:" + group.id() + ":" + packageId.id() + ":" + variant, () -> {
+      if (packumentCache != null) {
+        Optional<CachedAssetMetadata> cached = packumentCache.findFresh(group, packageId, variant, now);
+        if (cached.isPresent()) {
+          Optional<PackageRootContent> loaded = loadCachedPackageRoot(group, packageId, variant, cached.get());
+          if (loaded.isPresent()) {
+            return loaded.get();
+          }
         }
       }
-    }
 
-    MergedPackageRoot merged = mergePackageRoot(
-        group,
-        packageId,
-        containsMinimumReleaseAgeProxy(group),
-        variant);
-    Instant lastModified = now;
-    if (packumentCache != null && packumentCache.enabled()) {
-      NpmAssetWriter.Stored stored = storePackageRoot(
-          group, packageId, variant, merged.bytes(), now,
-          merged.minimumReleaseAgeValidUntil());
-      lastModified = stored.asset().lastUpdatedAt();
-    }
-    return new PackageRootContent(
-        merged.packageRoot(), lastModified, merged.minimumReleaseAgeValidUntil());
+      MergedPackageRoot merged = mergePackageRoot(
+          group,
+          packageId,
+          containsMinimumReleaseAgeProxy(group),
+          variant);
+      Instant lastModified = now;
+      if (packumentCache != null && packumentCache.enabled()) {
+        NpmAssetWriter.Stored stored = storePackageRoot(
+            group, packageId, variant, merged.bytes(), now,
+            merged.minimumReleaseAgeValidUntil());
+        lastModified = stored.asset().lastUpdatedAt();
+      }
+      return new PackageRootContent(
+          merged.packageRoot(), lastModified, merged.minimumReleaseAgeValidUntil());
+    });
   }
 
   private Optional<PackageRootContent> loadCachedPackageRoot(

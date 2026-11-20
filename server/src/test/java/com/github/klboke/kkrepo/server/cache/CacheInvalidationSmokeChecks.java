@@ -86,31 +86,31 @@ public final class CacheInvalidationSmokeChecks {
       TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
         @Override public void afterCommit() {
           assertEquals(1, read(observer, "SELECT value FROM cache_invalidation_probe"));
-          assertEquals(1, read(observer, "SELECT version FROM cache_version WHERE name = '" + VERSION + "'"),
-              "another replica must see the generation before connection cleanup");
+          assertEquals(0, read(observer, "SELECT version FROM cache_version WHERE name = '" + VERSION + "'"),
+              "the bump must not execute before the data commit");
           assertEquals(1, pool.getHikariPoolMXBean().getActiveConnections());
         }
       });
       return null;
     });
     assertEquals(0, pool.getHikariPoolMXBean().getActiveConnections());
-    assertEquals(1, watermark.current(VERSION));
+    assertEquals(1, watermark.current(VERSION),
+        "the bump commits after the write, before the connection is released");
 
-    // Force an actual database timeout on the first attempt, then release the blocking replica.
+    // Force an actual database timeout on the bump: the write is already committed, so the
+    // failure is swallowed and never retried or rolled back.
     var release = new CountDownLatch(1);
     var released = new CountDownLatch(1);
-    var attempts = new AtomicInteger();
     var failed = new AtomicInteger();
     VersionWatermark contended = new VersionWatermark() {
       @Override public long bump(String name) {
-        attempts.incrementAndGet();
         setLockTimeout(persistence, mysql);
         try {
           return watermark.bump(name);
         } catch (DataAccessException failure) {
           failed.incrementAndGet();
           assertEquals(1, read(observer, "SELECT value FROM cache_invalidation_probe"),
-              "the failed attempt must not publish its business write");
+              "the committed write must survive a failed bump");
           release.countDown();
           await(released);
           throw failure;
@@ -133,7 +133,7 @@ public final class CacheInvalidationSmokeChecks {
         return null;
       });
       try {
-        retry.execute("retry invalidation lock timeout", () -> {
+        retry.execute("swallow invalidation lock timeout after commit", () -> {
           persistence.execute().accept("UPDATE cache_invalidation_probe SET value = value + 1 WHERE id = 1");
           cache(contended).evictAfterCommit(REPOSITORY, "simple/retry/");
           return null;
@@ -143,16 +143,18 @@ public final class CacheInvalidationSmokeChecks {
         release.countDown();
       }
     }
-    assertEquals(1, failed.get());
-    assertEquals(2, attempts.get(), "the complete transaction must retry after a real lock timeout");
-    assertEquals(2, read(observer, "SELECT value FROM cache_invalidation_probe"));
-    assertEquals(2, dao.current(VERSION));
+    assertEquals(1, failed.get(),
+        "a bump failure after commit is swallowed, not retried");
+    assertEquals(2, read(observer, "SELECT value FROM cache_invalidation_probe"),
+        "the write stays committed");
+    assertEquals(2, dao.current(VERSION),
+        "only the blocking observer's bump landed; the failed one is lost to TTL");
     assertEquals(0, pool.getHikariPoolMXBean().getActiveConnections());
 
-    // Exhausting the retry budget rolls back both data and version, and releases the connection.
+    // A lock timeout on the business write itself still rolls back and retries the transaction.
     observer.setAutoCommit(false);
     try (var statement = observer.createStatement()) {
-      statement.executeUpdate("UPDATE cache_version SET version = version + 1 WHERE name = '" + VERSION + "'");
+      statement.executeUpdate("UPDATE cache_invalidation_probe SET value = value + 1 WHERE id = 1");
     }
     try {
       assertThrows(DataAccessException.class, () -> retry.execute("exhausted invalidation", () -> {

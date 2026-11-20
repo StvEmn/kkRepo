@@ -11,10 +11,12 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 /**
  * Transaction-scoped invalidations, not a cache or an asynchronous work queue.
  *
- * <p>Durable invalidations join the asset transaction. Cascading group changes run first, then
- * repository watermarks are bumped once in a stable order immediately before commit. Failures
- * reach the transaction owner, which can roll back and retry the complete write. Only local
- * cache eviction runs after commit; no additional pooled connection is needed for invalidation.
+ * <p>Cascading group changes join the asset transaction and run immediately before commit.
+ * Repository watermarks, however, are bumped best-effort after commit: the bump's hot-row lock
+ * must never extend the business transaction's lock window, and a failed bump no longer rolls
+ * back an already committed write — replicas may briefly serve stale cache until TTL expiry or
+ * the next write re-invalidates. Only local cache eviction and watermark bumps run after commit;
+ * no additional pooled connection is needed before commit.
  */
 public final class CacheInvalidation {
   private static final Logger log = LoggerFactory.getLogger(CacheInvalidation.class);
@@ -37,6 +39,8 @@ public final class CacheInvalidation {
     if (pending == null) {
       bump.run();
     } else {
+      // Registered before commit only to reject late registrations; execution itself is
+      // deferred to afterCommit so the hot-row lock never overlaps the business transaction.
       pending.requireBeforeCommit();
       pending.watermarks.putIfAbsent(name, bump);
     }
@@ -86,15 +90,27 @@ public final class CacheInvalidation {
 
     @Override
     public void beforeCommit(boolean readOnly) {
-      // Cascades can enqueue more group mutations and watermarks. Drain them in this same
+      // Cascades can enqueue more group mutations and watermarks. Drain mutations in this same
       // callback rather than registering a synchronization too late for Spring's snapshot.
+      // Watermarks stay queued; they execute in afterCommit so their hot-row lock never
+      // extends the business transaction and convoys every concurrent writer.
       drain(mutations);
-      drain(watermarks);
     }
 
     @Override
     public void afterCommit() {
       committed = true;
+      // Watermark bumps run after the business write is durable: a failure here must never
+      // propagate (an exception would make TransientTransactionRetry replay an already
+      // committed write). Log it — replicas may serve stale cache until TTL or the next write.
+      while (!watermarks.isEmpty()) {
+        try {
+          takeFirst(watermarks).run();
+        } catch (RuntimeException e) {
+          log.warn("Write already committed, but cache version bump failed; replicas may serve "
+              + "stale cache until TTL or the next write", e);
+        }
+      }
       while (!evictions.isEmpty()) {
         try {
           takeFirst(evictions).run();

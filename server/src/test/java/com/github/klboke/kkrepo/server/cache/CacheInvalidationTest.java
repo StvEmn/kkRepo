@@ -18,7 +18,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 class CacheInvalidationTest {
   @Test
-  void cascadesDrainBeforeSortedDeduplicatedWatermarksAndLocalEvictions() throws Exception {
+  void cascadesDrainBeforeCommitWhileWatermarksAndLocalEvictionsRunAfter() throws Exception {
     List<String> events = new ArrayList<>();
     var tx = new TransactionTemplate(manager(events));
     tx.executeWithoutResult(status -> {
@@ -33,27 +33,32 @@ class CacheInvalidationTest {
       CacheInvalidation.beforeCommit("group", () -> events.add("duplicate"));
       assertTrue(events.isEmpty());
     });
-    assertEquals(List.of("group", "ancestor", "a", "z", "commit", "evict"), events);
+    // Watermark bumps (sorted, deduplicated) no longer join the business transaction: they run
+    // after the data is committed, together with local evictions.
+    assertEquals(List.of("group", "ancestor", "commit", "a", "z", "evict"), events);
     assertTrue(TransactionSynchronizationManager.getResourceMap().isEmpty());
   }
 
   @Test
-  void failedWatermarkRollsBackAndRetriesBusinessWriteBeforeEvicting() throws Exception {
+  void failedWatermarkAfterCommitCannotRollBackOrRetryTheCommittedWrite() throws Exception {
     List<String> events = new ArrayList<>();
     var retry = new TransientTransactionRetry(manager(events), 3, 0);
     var attempts = new AtomicInteger();
     retry.execute("cache invalidation", () -> {
-      int attempt = attempts.incrementAndGet();
-      events.add("write-" + attempt);
+      attempts.incrementAndGet();
+      events.add("write");
       CacheInvalidation.watermarkBeforeCommit("repo", () -> {
-        if (attempt == 1) throw new CannotAcquireLockException("busy version row");
         events.add("bump");
+        throw new CannotAcquireLockException("busy version row");
       });
       CacheInvalidation.afterCommit("local", () -> events.add("evict"));
       return null;
     });
-    assertEquals(List.of("write-1", "rollback", "write-2", "bump", "commit", "evict"), events);
-    assertTrue(TransactionSynchronizationManager.getResourceMap().isEmpty());
+    // The write committed first; a failing bump must be swallowed (only logged) so it can never
+    // trigger TransientTransactionRetry to replay the already-committed write. Later invalidations
+    // still run, and the next write can bump the watermark again.
+    assertEquals(1, attempts.get());
+    assertEquals(List.of("write", "commit", "bump", "evict"), events);
   }
 
   @Test
@@ -72,7 +77,9 @@ class CacheInvalidationTest {
       });
       status.setRollbackOnly();
     });
-    assertEquals(List.of("inner", "commit", "inner-evict", "rollback"), events);
+    // The inner transaction commits its own bump; the rolled-back outer transaction's bump is
+    // discarded with it — a rollback must never publish a watermark.
+    assertEquals(List.of("commit", "inner", "inner-evict", "rollback"), events);
     assertTrue(TransactionSynchronizationManager.getResourceMap().isEmpty());
   }
 

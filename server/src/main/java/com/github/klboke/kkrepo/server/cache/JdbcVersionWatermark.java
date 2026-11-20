@@ -30,8 +30,10 @@ public class JdbcVersionWatermark implements VersionWatermark {
   public long bump(String name) {
     long version = dao.bump(name);
     if (TransactionSynchronizationManager.isSynchronizationActive()) {
-      // Never expose an uncommitted generation to another thread, or retain it after rollback.
-      // Invalidate again on completion to discard reads racing the transaction's commit.
+      // Typically inactive now that bumps run from afterCommit callbacks (dao.bump uses
+      // REQUIRES_NEW). Kept for direct in-transaction callers: never expose an uncommitted
+      // generation to another thread, or retain it after rollback. Invalidate again on
+      // completion to discard reads racing the transaction's commit.
       localVersions.invalidate(name);
       TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
         @Override

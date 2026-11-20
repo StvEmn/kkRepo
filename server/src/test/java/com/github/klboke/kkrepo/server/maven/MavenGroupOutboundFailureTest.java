@@ -1,5 +1,6 @@
 package com.github.klboke.kkrepo.server.maven;
 
+import com.github.klboke.kkrepo.server.support.SingleFlight;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -123,7 +124,7 @@ class MavenGroupOutboundFailureTest {
     when(storage.get(any())).thenAnswer(invocation -> Optional.of(new ByteArrayInputStream(merged.get())));
     BlobStorageRegistry registry = mock(BlobStorageRegistry.class);
     when(registry.forBlobStoreId(anyLong())).thenReturn(storage);
-    groupService = new MavenGroupService(hosted, proxy, dao, registry, writer, cache);
+    groupService = new MavenGroupService(hosted, proxy, dao, registry, writer, cache, new SingleFlight());
     proxyRepo = runtime(1, RepositoryType.PROXY, "http://127.0.0.1:" + upstream.getAddress().getPort(), List.of());
     hostedRepo = runtime(2, RepositoryType.HOSTED, null, List.of());
   }

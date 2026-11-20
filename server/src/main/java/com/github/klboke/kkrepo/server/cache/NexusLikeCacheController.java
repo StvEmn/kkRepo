@@ -136,7 +136,7 @@ public class NexusLikeCacheController {
     invalidate(repositoryId, NexusCacheType.METADATA);
   }
 
-  /** Make invalidation visible at commit; the durable bump participates in the current write. */
+  /** Best-effort after-commit invalidation; the durable bump runs once the data is committed. */
   public void invalidateAfterCommit(long repositoryId, NexusCacheType type) {
     deferInvalidation(tokenKey(repositoryId, type));
   }

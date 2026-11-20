@@ -7,6 +7,7 @@ import com.github.klboke.kkrepo.server.cache.NexusCacheType;
 import com.github.klboke.kkrepo.server.maven.BlobStorageRegistry;
 import com.github.klboke.kkrepo.server.maven.RepositoryRuntime;
 import com.github.klboke.kkrepo.server.releaseage.ReleaseAgeDeniedException;
+import com.github.klboke.kkrepo.server.support.SingleFlight;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -25,6 +26,7 @@ public class PypiGroupService {
   private final BlobStorageRegistry blobStorageRegistry;
   private final PypiAssetWriter writer;
   private final PypiAssetReader reader;
+  private final SingleFlight singleFlight;
 
   public PypiGroupService(
       PypiHostedService hosted,
@@ -33,7 +35,8 @@ public class PypiGroupService {
       GroupMemberAssetCache groupMemberAssetCache,
       BlobStorageRegistry blobStorageRegistry,
       PypiAssetWriter writer,
-      PypiAssetReader reader) {
+      PypiAssetReader reader,
+      SingleFlight singleFlight) {
     this.hosted = hosted;
     this.proxy = proxy;
     this.simpleIndexCache = simpleIndexCache;
@@ -41,6 +44,7 @@ public class PypiGroupService {
     this.blobStorageRegistry = blobStorageRegistry;
     this.writer = writer;
     this.reader = reader;
+    this.singleFlight = singleFlight;
   }
 
   public PypiResponse getRootIndex(RepositoryRuntime group, boolean headOnly) {
@@ -110,18 +114,23 @@ public class PypiGroupService {
       boolean headOnly,
       java.util.function.Supplier<String> loader) {
     Instant now = Instant.now();
-    if (simpleIndexCache != null) {
-      Optional<CachedAssetMetadata> cached = simpleIndexCache.findFresh(group, path, kind, now);
-      if (cached.isPresent()) {
-        return reader.serveSnapshot(cached.get(), headOnly, path);
+    // Singleflight covers cache read + rebuild + write-back: concurrent requests for the same
+    // index wait for the leader's committed write instead of each re-running the member merge
+    // (slow upstream fetches) and queuing N cache_version bumps on the same hot row.
+    return singleFlight.execute("pypi:" + group.id() + ":" + path, () -> {
+      if (simpleIndexCache != null) {
+        Optional<CachedAssetMetadata> cached = simpleIndexCache.findFresh(group, path, kind, now);
+        if (cached.isPresent()) {
+          return reader.serveSnapshot(cached.get(), headOnly, path);
+        }
       }
-    }
-    String html = loader.get();
-    if (simpleIndexCache == null || !simpleIndexCache.enabled()) {
-      return htmlResponse(html, headOnly, now);
-    }
-    PypiAssetWriter.Stored stored = storeIndex(group, path, kind, projectName, html, !headOnly);
-    return responseFromStored(stored, headOnly);
+      String html = loader.get();
+      if (simpleIndexCache == null || !simpleIndexCache.enabled()) {
+        return htmlResponse(html, headOnly, now);
+      }
+      PypiAssetWriter.Stored stored = storeIndex(group, path, kind, projectName, html, !headOnly);
+      return responseFromStored(stored, headOnly);
+    });
   }
 
   private PypiAssetWriter.Stored storeIndex(

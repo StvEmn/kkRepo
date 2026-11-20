@@ -227,9 +227,10 @@ public class AssetMetadataCache {
   }
 
   /**
-   * Commit the durable repository generation with the asset write, then evict local entries.
-   * Repeated writes in one transaction share one generation bump, performed after cascading
-   * group mutations. A failed bump aborts the write so its owner can retry safely.
+   * Commit the asset write, then advance the repository generation and evict local entries.
+   * Repeated writes in one transaction share one generation bump, performed best-effort after
+   * the data commit (cascading group mutations still run in-transaction). A failed bump no
+   * longer rolls the write back — replicas may serve stale cache until TTL or the next write.
    */
   public void evictAfterCommit(long repositoryId, String storagePath) {
     if (storagePath == null) return;

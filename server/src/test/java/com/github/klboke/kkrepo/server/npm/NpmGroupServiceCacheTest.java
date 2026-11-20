@@ -38,6 +38,7 @@ import com.github.klboke.kkrepo.server.support.dao.AssetDaoAdapter;
 import com.github.klboke.kkrepo.server.support.dao.BrowseNodeDaoAdapter;
 import com.github.klboke.kkrepo.server.support.dao.ComponentDaoAdapter;
 import com.github.klboke.kkrepo.server.support.dao.RepositoryDaoAdapter;
+import com.github.klboke.kkrepo.server.support.SingleFlight;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -262,7 +263,7 @@ class NpmGroupServiceCacheTest {
     NpmProxyService proxy = new ReleaseAgeNpmProxyService();
     NpmGroupService groupService = new NpmGroupService(
         fixture.hosted, proxy, fixture.mapper, fixture.packumentCache, memberCache,
-        fixture.registry, fixture.writer);
+        fixture.registry, fixture.writer, new SingleFlight());
     NpmPackageId packageId = NpmPackageId.parse("@example/demo");
     String tarballName = "demo-2.0.0.tgz";
     String cachePath = packageId.tarballPath(tarballName);
@@ -288,7 +289,7 @@ class NpmGroupServiceCacheTest {
         fixture.repositories, new NexusLikeCacheController(new InMemoryVersionWatermark(), 60), true, 60);
     NpmProxyService proxy = mock(NpmProxyService.class);
     NpmGroupService service = new NpmGroupService(fixture.hosted, proxy, fixture.mapper,
-        fixture.packumentCache, memberCache, fixture.registry, fixture.writer);
+        fixture.packumentCache, memberCache, fixture.registry, fixture.writer, new SingleFlight());
     RepositoryRuntime first = runtime(101L, "first", RepositoryType.PROXY, List.of());
     RepositoryRuntime second = runtime(102L, "second", RepositoryType.PROXY, List.of());
     RepositoryRuntime group = runtime(999L, "group", RepositoryType.GROUP, List.of(first, second));
@@ -415,11 +416,13 @@ class NpmGroupServiceCacheTest {
       RecordingNpmHostedService hosted,
       BlobStorageRegistry registry) {
     NpmGroupService groupService() {
-      return new NpmGroupService(hosted, null, mapper, packumentCache, null, registry, writer);
+      return new NpmGroupService(hosted, null, mapper, packumentCache, null, registry, writer,
+        new SingleFlight());
     }
 
     NpmGroupService groupServiceWithProxy(NpmProxyService proxy) {
-      return new NpmGroupService(hosted, proxy, mapper, packumentCache, null, registry, writer);
+      return new NpmGroupService(hosted, proxy, mapper, packumentCache, null, registry, writer,
+        new SingleFlight());
     }
   }
 
