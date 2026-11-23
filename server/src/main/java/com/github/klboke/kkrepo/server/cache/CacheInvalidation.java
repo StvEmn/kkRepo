@@ -55,6 +55,11 @@ public final class CacheInvalidation {
     }
   }
 
+  // afterCommit note: watermark/eviction runnables that throw an Error (not a RuntimeException)
+  // abort the remaining afterCommit queue and propagate to the commit() caller — RuntimeExceptions
+  // are swallowed per-callback, Errors are not. Current trade-off: an Error after commit means the
+  // JVM is likely broken anyway; the write is already durable either way.
+
   private static Pending pending() {
     if (!TransactionSynchronizationManager.isSynchronizationActive()) return null;
     Pending pending = (Pending) TransactionSynchronizationManager.getResource(RESOURCE);

@@ -19,6 +19,9 @@ import org.springframework.stereotype.Component;
  * {@code format + ":" + repositoryId + ":" + path}), otherwise unrelated requests would queue
  * behind each other.
  *
+ * <p>Waiters do not respond to interruption: {@code join()} blocks until the leader completes,
+ * so an interrupted waiter only observes its interrupt flag after the flight ends.
+ *
  * @author zhangtianbin
  */
 @Component

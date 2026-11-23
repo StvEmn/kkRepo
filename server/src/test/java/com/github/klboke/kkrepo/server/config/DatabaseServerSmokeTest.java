@@ -310,7 +310,12 @@ class DatabaseServerSmokeTest {
                 new com.github.klboke.kkrepo.persistence.jdbc.internal.JdbcCacheVersionDao(
                     jdbc, first.getBean(DatabaseDialect.class)),
                 new org.springframework.jdbc.datasource.DataSourceTransactionManager(source), jdbc::execute);
-          }, type == DatabaseType.MYSQL);
+          },
+          // A real Spring proxy so the dao's @Transactional(REQUIRES_NEW) on bump() is applied:
+          // without the proxy the bump would silently join the caller's transaction.
+          source -> com.github.klboke.kkrepo.server.cache.CacheInvalidationSmokeChecks.proxiedBump(
+              source, first.getBean(DatabaseDialect.class)),
+          type == DatabaseType.MYSQL);
       com.github.klboke.kkrepo.server.docker.DockerUploadTransactionSmokeChecks.verify(
           first.getBean(com.zaxxer.hikari.HikariDataSource.class), source ->
               new com.github.klboke.kkrepo.server.docker.DockerUploadTransactionSmokeChecks.Persistence(

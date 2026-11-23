@@ -95,9 +95,11 @@ public class SecurityAuthorizationCache {
     if (!enabled) {
       return;
     }
-    // Permission mutations and their shared generation must commit together. A failed bump
-    // must roll back the revocation rather than leave other replicas using old grants.
-    CacheInvalidation.watermarkBeforeCommit(VERSION_NAME, () -> watermark.bump(VERSION_NAME));
+    // Strict, in-transaction bump (low-frequency, correctness-sensitive): bump uses REQUIRES_NEW
+    // and commits independently, so a failed bump propagates and rolls back the permission write
+    // — a revocation never commits without its generation advance. If the outer write rolls back
+    // for another reason, the already-committed bump only causes one harmless extra invalidation.
+    watermark.bump(VERSION_NAME);
     CacheInvalidation.afterCommit(INVALIDATION_RESOURCE_KEY, () -> versionCache.invalidate(VERSION_NAME));
   }
 

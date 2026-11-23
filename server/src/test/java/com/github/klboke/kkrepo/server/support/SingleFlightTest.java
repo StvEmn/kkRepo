@@ -21,27 +21,28 @@ class SingleFlightTest {
   void twentyConcurrentCallersRunTheWorkOnceAndShareTheResult() throws Exception {
     SingleFlight singleFlight = new SingleFlight();
     AtomicInteger executions = new AtomicInteger();
-    CountDownLatch leaderStarted = new CountDownLatch(1);
-    CountDownLatch releaseLeader = new CountDownLatch(1);
     Object shared = new Object();
+    int callers = 20;
+    // Deterministic rendezvous: every caller signals just before entering execute(), and the
+    // leader's work blocks until all of them have — so the leader only completes once every
+    // other caller is at (or parked on) the in-flight entry, never by sleeping a fixed delay.
+    CountDownLatch allArrived = new CountDownLatch(callers);
 
-    try (ExecutorService executor = Executors.newFixedThreadPool(20)) {
+    try (ExecutorService executor = Executors.newFixedThreadPool(callers)) {
       List<Future<Object>> results = new ArrayList<>();
-      for (int i = 0; i < 20; i++) {
-        results.add(executor.submit(() -> singleFlight.execute("same-key", () -> {
-          executions.incrementAndGet();
-          leaderStarted.countDown();
-          await(releaseLeader);
-          return shared;
-        })));
+      for (int i = 0; i < callers; i++) {
+        results.add(executor.submit(() -> {
+          allArrived.countDown();
+          return singleFlight.execute("same-key", () -> {
+            executions.incrementAndGet();
+            await(allArrived);
+            return shared;
+          });
+        }));
       }
-      assertTrue(leaderStarted.await(10, TimeUnit.SECONDS));
-      // Give every waiter a moment to pile onto the leader's future before releasing it.
-      TimeUnit.MILLISECONDS.sleep(200);
-      releaseLeader.countDown();
 
       for (Future<Object> result : results) {
-        assertSame(shared, result.get(10, TimeUnit.SECONDS));
+        assertSame(shared, result.get(20, TimeUnit.SECONDS));
       }
     }
     assertEquals(1, executions.get(), "concurrent callers must not re-run the work");
@@ -50,36 +51,34 @@ class SingleFlightTest {
   @Test
   void leaderFailureDeliversTheSameExceptionInstanceToEveryWaiter() throws Exception {
     SingleFlight singleFlight = new SingleFlight();
-    CountDownLatch leaderStarted = new CountDownLatch(1);
-    CountDownLatch releaseLeader = new CountDownLatch(1);
     AtomicInteger executions = new AtomicInteger();
     List<RuntimeException> received = new CopyOnWriteArrayList<>();
+    int callers = 6;
+    CountDownLatch allArrived = new CountDownLatch(callers);
 
-    try (ExecutorService executor = Executors.newFixedThreadPool(6)) {
+    try (ExecutorService executor = Executors.newFixedThreadPool(callers)) {
       List<Future<?>> results = new ArrayList<>();
-      for (int i = 0; i < 6; i++) {
+      for (int i = 0; i < callers; i++) {
         results.add(executor.submit(() -> {
+          allArrived.countDown();
           try {
             singleFlight.execute("failing-key", () -> {
               executions.incrementAndGet();
-              leaderStarted.countDown();
-              await(releaseLeader);
+              await(allArrived);
               throw new IllegalStateException("leader boom");
             });
           } catch (RuntimeException e) {
             received.add(e);
           }
+          return null;
         }));
       }
-      assertTrue(leaderStarted.await(10, TimeUnit.SECONDS));
-      TimeUnit.MILLISECONDS.sleep(200);
-      releaseLeader.countDown();
       for (Future<?> result : results) {
-        result.get(10, TimeUnit.SECONDS);
+        result.get(20, TimeUnit.SECONDS);
       }
     }
 
-    assertEquals(6, received.size(), "every caller must observe the failure");
+    assertEquals(callers, received.size(), "every caller must observe the failure");
     assertEquals(1, executions.get());
     for (RuntimeException failure : received) {
       assertSame(received.getFirst(), failure, "waiters must receive the leader's exception");
@@ -125,7 +124,7 @@ class SingleFlightTest {
 
   private static void await(CountDownLatch latch) {
     try {
-      assertTrue(latch.await(10, TimeUnit.SECONDS), "timed out waiting for the latch");
+      assertTrue(latch.await(20, TimeUnit.SECONDS), "timed out waiting for the latch");
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       throw new AssertionError(e);

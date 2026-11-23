@@ -245,13 +245,32 @@ public class MavenGroupService {
       RepositoryRuntime group, MavenPath path, boolean headOnly, DispatchedRepositories dispatched) {
     // Singleflight covers cache read + member collect + merge + write-back: concurrent requests
     // for the same metadata path wait for the leader instead of each re-collecting from members
-    // (slow upstream fetches) and queuing N cache_version bumps on the same hot row.
-    return singleFlight.execute("maven:" + group.id() + ":" + path.path(), () ->
-        serveMergedMetadataInFlight(group, path, headOnly, dispatched));
+    // (slow upstream fetches) and queuing N cache_version bumps on the same hot row. The flight
+    // returns only neutral data (stored asset handles or a deletion marker); responses and
+    // download-policy checks are built per request after the flight so no request can receive
+    // another request's response object, head-only semantics, or policy accounting.
+    MergedMetadataResult result = singleFlight.execute(
+        "maven:" + group.id() + ":" + path.path(),
+        () -> serveMergedMetadataInFlight(group, path, dispatched));
+    if (result.deleted()) {
+      throw new MavenExceptions.MavenNotFoundException(path.path());
+    }
+    return serveCached(CachedAssetMetadata.of(result.asset(), result.blob()), headOnly, path);
   }
 
-  private MavenResponse serveMergedMetadataInFlight(
-      RepositoryRuntime group, MavenPath path, boolean headOnly, DispatchedRepositories dispatched) {
+  /** Neutral singleflight outcome: what was persisted, never a per-request response. */
+  private record MergedMetadataResult(AssetRecord asset, AssetBlobRecord blob, boolean deleted) {
+    static MergedMetadataResult stored(AssetRecord asset, AssetBlobRecord blob) {
+      return new MergedMetadataResult(asset, blob, false);
+    }
+
+    static MergedMetadataResult missing() {
+      return new MergedMetadataResult(null, null, true);
+    }
+  }
+
+  private MergedMetadataResult serveMergedMetadataInFlight(
+      RepositoryRuntime group, MavenPath path, DispatchedRepositories dispatched) {
     Instant now = Instant.now();
     int ttl = group.effectiveMetadataMaxAgeMinutesOrDefault();
     if (containsMinimumReleaseAgeProxy(group)) {
@@ -266,7 +285,7 @@ public class MavenGroupService {
         () -> AssetMetadataCache.Loaded.from(
             assetDao.findAssetByPath(group.id(), path.path()), assetDao));
     if (cached.isPresent() && isGroupMetadataFresh(group, cached.get(), ttl, now)) {
-      return serveCached(cached.get(), headOnly, path);
+      return MergedMetadataResult.stored(cached.get().toAssetRecord(), cached.get().toBlobRecord());
     }
     List<byte[]> members = collectMemberMetadata(group, path, dispatched);
     if (members.isEmpty()) {
@@ -276,26 +295,14 @@ public class MavenGroupService {
         BlobStorage storage = blobStorageRegistry.forBlobStoreId(blobStoreId);
         writer.deleteAsset(group, storage, path);
       }
-      throw new MavenExceptions.MavenNotFoundException(path.path());
+      return MergedMetadataResult.missing();
     }
     byte[] merged = metadataMerger.merge(members, now);
     long blobStoreId = requireBlobStore(group);
     BlobStorage storage = blobStorageRegistry.forBlobStoreId(blobStoreId);
     MavenAssetWriter.Stored stored = writer.writeBytes(
         group, storage, blobStoreId, path, merged, MavenContentType.XML, "group", group.name());
-    AssetRecord asset = stored.asset();
-    AssetBlobRecord blob = stored.blob();
-    if (downloadPolicy != null) {
-      downloadPolicy.beforeReadFromRepository(asset.id(), blob.id(), asset.repositoryId());
-    }
-    if (headOnly) {
-      return MavenResponse.noBody(200, blob.size(), asset.contentType(), blob.sha1(), asset.lastUpdatedAt());
-    }
-    return MavenResponse.ok(
-        () -> blobStorageRegistry.forBlobStoreId(blob.blobStoreId()).get(
-            BlobReferenceCodec.reference(blob.blobRef(), blob.objectKey(), blob.sha256(), blob.size()))
-            .orElseThrow(() -> new MavenExceptions.MavenNotFoundException(path.path())),
-        blob.size(), asset.contentType(), blob.sha1(), asset.lastUpdatedAt());
+    return MergedMetadataResult.stored(stored.asset(), stored.blob());
   }
 
   private static boolean containsMinimumReleaseAgeProxy(RepositoryRuntime runtime) {

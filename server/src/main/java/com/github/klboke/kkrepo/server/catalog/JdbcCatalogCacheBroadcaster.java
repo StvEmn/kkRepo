@@ -66,11 +66,13 @@ class JdbcCatalogCacheBroadcaster implements CatalogCacheBroadcaster, Scheduling
   @Override
   public void publishRefresh(String catalogName) {
     String name = versionName(catalogName);
-    CacheInvalidation.watermarkBeforeCommit(name, () -> {
-      long version = watermark.bump(name);
-      // A rolled-back publisher must not suppress a later committed generation on this node.
-      CacheInvalidation.afterCommit(name, () -> lastSeen.merge(name, version, Math::max));
-    });
+    // Strict, in-transaction bump (low-frequency, correctness-sensitive): bump uses REQUIRES_NEW
+    // and commits independently, so a failed bump propagates and rolls back the publisher — a
+    // catalog change never commits without its refresh generation. If the outer write rolls back
+    // for another reason, the already-committed bump only causes one harmless extra refresh.
+    long version = watermark.bump(name);
+    // A rolled-back publisher must not suppress a later committed generation on this node.
+    CacheInvalidation.afterCommit(name, () -> lastSeen.merge(name, version, Math::max));
   }
 
   public void poll() {

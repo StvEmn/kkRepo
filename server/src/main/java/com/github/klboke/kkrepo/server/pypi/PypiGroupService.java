@@ -1,6 +1,7 @@
 package com.github.klboke.kkrepo.server.pypi;
 
 import com.github.klboke.kkrepo.core.BlobStorage;
+import com.github.klboke.kkrepo.server.blob.BlobReferenceCodec;
 import com.github.klboke.kkrepo.server.cache.CachedAssetMetadata;
 import com.github.klboke.kkrepo.server.cache.GroupMemberAssetCache;
 import com.github.klboke.kkrepo.server.cache.NexusCacheType;
@@ -116,21 +117,52 @@ public class PypiGroupService {
     Instant now = Instant.now();
     // Singleflight covers cache read + rebuild + write-back: concurrent requests for the same
     // index wait for the leader's committed write instead of each re-running the member merge
-    // (slow upstream fetches) and queuing N cache_version bumps on the same hot row.
-    return singleFlight.execute("pypi:" + group.id() + ":" + path, () -> {
+    // (slow upstream fetches) and queuing N cache_version bumps on the same hot row. The flight
+    // returns only neutral data (the index html or the stored asset handles); responses and
+    // reader.beforeRead accounting are built per request after the flight so no request can
+    // receive another request's response object or head-only semantics.
+    SimpleIndexContent content = singleFlight.execute("pypi:" + group.id() + ":" + path, () -> {
       if (simpleIndexCache != null) {
         Optional<CachedAssetMetadata> cached = simpleIndexCache.findFresh(group, path, kind, now);
         if (cached.isPresent()) {
-          return reader.serveSnapshot(cached.get(), headOnly, path);
+          return SimpleIndexContent.cached(cached.get());
         }
       }
       String html = loader.get();
       if (simpleIndexCache == null || !simpleIndexCache.enabled()) {
-        return htmlResponse(html, headOnly, now);
+        return SimpleIndexContent.html(html, now);
       }
-      PypiAssetWriter.Stored stored = storeIndex(group, path, kind, projectName, html, !headOnly);
-      return responseFromStored(stored, headOnly);
+      return SimpleIndexContent.stored(storeIndex(group, path, kind, projectName, html));
     });
+    if (content.html() != null) {
+      return htmlResponse(content.html(), headOnly, content.lastModified());
+    }
+    if (content.snapshot() != null) {
+      return reader.serveSnapshot(content.snapshot(), headOnly, path);
+    }
+    return responseFromStored(content.stored(), headOnly);
+  }
+
+  /**
+   * Neutral singleflight outcome: the merged html (cache disabled), a cached snapshot, or a
+   * freshly written index's stored handles — never a per-request response.
+   */
+  private record SimpleIndexContent(
+      String html,
+      Instant lastModified,
+      CachedAssetMetadata snapshot,
+      PypiAssetWriter.Stored stored) {
+    static SimpleIndexContent html(String html, Instant lastModified) {
+      return new SimpleIndexContent(html, lastModified, null, null);
+    }
+
+    static SimpleIndexContent cached(CachedAssetMetadata snapshot) {
+      return new SimpleIndexContent(null, snapshot.lastUpdatedAt(), snapshot, null);
+    }
+
+    static SimpleIndexContent stored(PypiAssetWriter.Stored stored) {
+      return new SimpleIndexContent(null, stored.asset().lastUpdatedAt(), null, stored);
+    }
   }
 
   private PypiAssetWriter.Stored storeIndex(
@@ -138,8 +170,7 @@ public class PypiGroupService {
       String path,
       String kind,
       String projectName,
-      String html,
-      boolean keepResponseFile) {
+      String html) {
     long blobStoreId = requireBlobStore(group);
     BlobStorage storage = blobStorageRegistry.forBlobStoreId(blobStoreId);
     return writer.writeSimpleIndexCache(
@@ -153,20 +184,27 @@ public class PypiGroupService {
         simpleIndexCache.freshAttributes(group, projectName, Instant.now()),
         "group",
         group.name(),
-        keepResponseFile);
+        false);
   }
 
   private PypiResponse responseFromStored(PypiAssetWriter.Stored stored, boolean headOnly) {
     try {
       reader.beforeRead(
           stored.asset().id(), stored.blob().id(), stored.asset().repositoryId());
+      var blob = stored.blob();
       if (headOnly) {
         stored.discardBody();
-        return PypiResponse.noBody(200, stored.blob().size(), stored.asset().contentType(),
-            stored.blob().sha1(), stored.asset().lastUpdatedAt());
+        return PypiResponse.noBody(200, blob.size(), stored.asset().contentType(),
+            blob.sha1(), stored.asset().lastUpdatedAt());
       }
-      return PypiResponse.ok(stored.openBody(), stored.blob().size(), stored.asset().contentType(),
-          stored.blob().sha1(), stored.asset().lastUpdatedAt());
+      // The writer's temp file is request-scoped; followers in the same flight must stream from
+      // the committed blob store instead of racing over one shared temp file.
+      return PypiResponse.ok(
+          () -> blobStorageRegistry.forBlobStoreId(blob.blobStoreId()).get(
+              BlobReferenceCodec.reference(blob.blobRef(), blob.objectKey(), blob.sha256(), blob.size()))
+              .orElseThrow(() -> new IllegalStateException(
+                  "Group index blob disappeared: " + stored.asset().path())),
+          blob.size(), stored.asset().contentType(), blob.sha1(), stored.asset().lastUpdatedAt());
     } catch (RuntimeException e) {
       stored.discardBody();
       throw e;

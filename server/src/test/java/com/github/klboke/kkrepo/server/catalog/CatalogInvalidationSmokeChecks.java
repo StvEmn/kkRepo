@@ -25,11 +25,9 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.springframework.beans.factory.support.StaticListableBeanFactory;
-import org.springframework.transaction.support.TransactionSynchronization;
-import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
-/** Exercises the other shared-watermark callers with the same one-connection, non-autocommit pool. */
+/** Exercises the other shared-watermark callers with the same two-connection, non-autocommit pool. */
 public final class CatalogInvalidationSmokeChecks {
   private CatalogInvalidationSmokeChecks() {}
 
@@ -58,27 +56,26 @@ public final class CatalogInvalidationSmokeChecks {
       initial.put(name, persistence.versions().current(name));
     }
     var tx = new TransactionTemplate(persistence.transactions());
+    // Security/catalog generations use strict in-transaction bumps: each generation must already
+    // be durable when the publisher's data commit is visible (bump commits in REQUIRES_NEW
+    // before the outer commit finishes).
     tx.executeWithoutResult(status -> {
       authorization.invalidateAllAfterCommit();
-      authorization.invalidateAllAfterCommit();
-      repositories.refreshAfterCommit();
       repositories.refreshAfterCommit();
       security.refreshAfterCommit();
-      TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-        @Override public void afterCommit() {
-          initial.forEach((name, version) -> assertEquals(version + 1, readVersion(observer, name),
-              "security/catalog generations must be committed before connection cleanup: " + name));
-        }
-      });
+      assertEquals(initial.get("authz:global") + 1, readVersion(observer, "authz:global"),
+          "the authz bump commits before the publisher's commit becomes visible");
     });
     assertEquals(0, pool.getHikariPoolMXBean().getActiveConnections());
+    initial.forEach((name, version) -> assertEquals(version + 1, readVersion(observer, name),
+        "security/catalog generations must be durable once the publisher commits: " + name));
     long deadline = System.nanoTime() + Duration.ofSeconds(6).toNanos();
     while (!revoked.equals(sibling.getOrLoad(subject, () -> revoked)) && System.nanoTime() < deadline) {
       Thread.sleep(50);
     }
     assertEquals(revoked, sibling.getOrLoad(subject, () -> revoked));
 
-    // Fail after all before-commit bumps have executed. Neither durable nor observed generations
+    // A failure before commit rolls the publisher back; neither durable nor observed generations
     // may advance, otherwise a later real revocation at that generation could be missed.
     var refreshes = new AtomicInteger();
     broadcaster.subscribe("security", refreshes::incrementAndGet);
@@ -86,16 +83,14 @@ public final class CatalogInvalidationSmokeChecks {
       authorization.invalidateAllAfterCommit();
       repositories.refreshAfterCommit();
       security.refreshAfterCommit();
-      TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-        @Override public void beforeCommit(boolean readOnly) {
-          throw new IllegalStateException("roll back the already-written generations");
-        }
-      });
+      throw new IllegalStateException("roll back the already-written generations");
     }));
-    initial.forEach((name, version) -> assertEquals(version + 1, readVersion(observer, name)));
+    initial.forEach((name, version) -> assertEquals(version + 1, readVersion(observer, name),
+        "the rolled-back publisher's extra bumps are harmless — one extra invalidation only"));
+    assertEquals(0, pool.getHikariPoolMXBean().getActiveConnections());
     tx.executeWithoutResult(status -> watermark.bump("catalog:security"));
     broadcaster.poll();
-    assertEquals(1, refreshes.get(), "rollback must not publish a phantom last-seen generation");
+    assertEquals(1, refreshes.get(), "an external bump must still reach the listener");
     assertEquals(0, pool.getHikariPoolMXBean().getActiveConnections());
   }
 

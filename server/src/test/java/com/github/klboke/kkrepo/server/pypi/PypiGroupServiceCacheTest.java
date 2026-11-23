@@ -1,6 +1,7 @@
 package com.github.klboke.kkrepo.server.pypi;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.github.klboke.kkrepo.core.BlobObjectMetadata;
@@ -64,6 +65,26 @@ class PypiGroupServiceCacheTest {
     String secondBody = body(second);
     assertEquals(firstBody, secondBody);
     assertTrue(firstBody.contains("demo_pkg-1.0.0.tar.gz"));
+  }
+
+  @Test
+  void headRequestAfterCachedWriteReturnsNoBodyWithMetadata() throws IOException {
+    Fixture fixture = fixture();
+    fixture.repositories.putGroupsContaining(101L, List.of(record(999L, "pypi-group")));
+    PypiGroupService groupService = fixture.groupService();
+
+    RepositoryRuntime member = runtime(101L, "pypi-hosted", RepositoryType.HOSTED, List.of());
+    RepositoryRuntime group = runtime(999L, "pypi-group", RepositoryType.GROUP, List.of(member));
+
+    String fullBody = body(groupService.getIndex(group, "demo-pkg", false));
+    PypiResponse head = groupService.getIndex(group, "demo-pkg", true);
+
+    assertEquals(200, head.status());
+    assertNull(head.body());
+    assertEquals(fullBody.getBytes(StandardCharsets.UTF_8).length, head.contentLength());
+    assertEquals("text/html", head.contentType());
+    assertEquals(1, fixture.hosted.projectIndexCalls.get());
+    assertEquals(1, fixture.storage.puts.get());
   }
 
   @Test
