@@ -7,29 +7,30 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.github.klboke.kkrepo.persistence.jdbc.api.CacheVersionDao;
 import com.github.klboke.kkrepo.persistence.jdbc.internal.JdbcCacheVersionDao;
 import com.github.klboke.kkrepo.persistence.jdbc.spi.DatabaseDialect;
+import com.github.klboke.kkrepo.persistence.jdbc.spi.DatabaseType;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.util.Map;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import javax.sql.DataSource;
+import org.springframework.aop.framework.ProxyFactory;
 import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionStatus;
 import org.springframework.transaction.annotation.AnnotationTransactionAttributeSource;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.interceptor.TransactionInterceptor;
 import org.springframework.transaction.support.TransactionCallbackWithoutResult;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
-import org.springframework.aop.framework.ProxyFactory;
 
 /**
  * Real lock waits, a two-connection pool, and a proxied bump against both database engines —
@@ -51,23 +52,54 @@ public final class CacheInvalidationSmokeChecks {
   public record Persistence(CacheVersionDao versions, PlatformTransactionManager transactions,
       Consumer<String> execute) {}
 
-  /** Proxied bump entry point — see {@link #verify(HikariDataSource, Function, Function, boolean)}. */
+  /** Proxied bump entry point — see {@link #verify(HikariDataSource, Function, Function)}. */
   public interface BumpService {
     long bump(String name);
   }
 
+  /** Sets the session lock timeout, then delegates — see {@link #proxiedBump}. */
+  private record TimedBumpDao(JdbcCacheVersionDao delegate, JdbcTemplate jdbc, boolean mysql)
+      implements CacheVersionDao {
+
+    @Override
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public long bump(String name) {
+      // Same connection and same transaction as the UPDATE: a SET issued on the (already
+      // committed) business connection would not reach this REQUIRES_NEW connection, whose
+      // lock timeout would stay at the engine default (50s MySQL, unbounded PostgreSQL).
+      jdbc.execute(mysql ? "SET SESSION innodb_lock_wait_timeout = 1"
+          : "SET LOCAL lock_timeout = '200ms'");
+      return delegate.bump(name);
+    }
+
+    @Override
+    public long current(String name) {
+      throw new UnsupportedOperationException("use watermark.currentDurable in this smoke");
+    }
+
+    @Override
+    public Map<String, Long> selectAll() {
+      throw new UnsupportedOperationException();
+    }
+  }
+
   /**
-   * Wraps a {@link JdbcCacheVersionDao} in a real Spring transaction proxy so the dao's
-   * {@code @Transactional(REQUIRES_NEW)} on {@code bump()} is honored: the bump suspends the
-   * caller's transaction, commits independently, and needs its own pooled connection.
+   * Wraps a {@link JdbcCacheVersionDao} so {@code bump(name)} starts a {@code REQUIRES_NEW}
+   * transaction that first sets the engine lock timeout and only then advances the watermark:
+   * the SET and the UPDATE share the fresh connection, and the timeout applies to the bump's
+   * row lock exactly as it would for a session-configured timeout in production. The nested
+   * {@code @Transactional} on the delegate is inert (no proxy) — the delegate joins the outer
+   * transaction started here.
    */
   public static BumpService proxiedBump(DataSource source, DatabaseDialect dialect) {
-    JdbcCacheVersionDao dao = new JdbcCacheVersionDao(new JdbcTemplate(source), dialect);
+    JdbcTemplate jdbc = new JdbcTemplate(source);
+    JdbcCacheVersionDao dao = new JdbcCacheVersionDao(jdbc, dialect);
+    boolean mysql = dialect.type() == DatabaseType.MYSQL;
     PlatformTransactionManager transactions = new DataSourceTransactionManager(source);
     TransactionInterceptor interceptor = new TransactionInterceptor(
         transactions, new AnnotationTransactionAttributeSource());
     ProxyFactory proxy = new ProxyFactory();
-    proxy.setTarget(dao);
+    proxy.setTarget(new TimedBumpDao(dao, jdbc, mysql));
     proxy.setInterfaces(BumpService.class);
     proxy.addAdvice(interceptor);
     return (BumpService) proxy.getProxy();
@@ -79,15 +111,14 @@ public final class CacheInvalidationSmokeChecks {
    * @param source            the runtime application's pooled datasource (credentials and URL)
    * @param persistenceFactory builds DAOs/transaction accessors on top of a fresh test pool
    * @param bumpFactory       builds a <b>transaction-proxied</b> {@code bump(name)} entry point
-   *                          whose {@code @Transactional(REQUIRES_NEW)} annotation is actually
-   *                          applied (Spring proxy or equivalent template); a bare DAO object
-   *                          would silently join the caller's transaction and void the test
-   * @param mysql             selects MySQL vs PostgreSQL lock-timeout session SQL
+   *                          that opens a {@code REQUIRES_NEW} transaction setting the lock
+   *                          timeout before the UPDATE (Spring proxy or equivalent template);
+   *                          a bare DAO object would silently join the caller's transaction
+   *                          and void the test
    */
   public static void verify(HikariDataSource source,
       Function<DataSource, Persistence> persistenceFactory,
-      Function<DataSource, BumpService> bumpFactory,
-      boolean mysql) throws Exception {
+      Function<DataSource, BumpService> bumpFactory) throws Exception {
     HikariConfig config = new HikariConfig();
     config.setJdbcUrl(source.getJdbcUrl());
     config.setUsername(source.getUsername());
@@ -112,7 +143,7 @@ public final class CacheInvalidationSmokeChecks {
       try {
         Persistence persistence = persistenceFactory.apply(pool);
         BumpService bumps = bumpFactory.apply(pool);
-        verify(pool, observer, persistence, bumps, mysql);
+        verify(pool, observer, persistence, bumps);
       } finally {
         if (!observer.getAutoCommit()) observer.rollback();
         observer.setAutoCommit(true);
@@ -125,7 +156,7 @@ public final class CacheInvalidationSmokeChecks {
   }
 
   private static void verify(HikariDataSource pool, Connection observer,
-      Persistence persistence, BumpService bumps, boolean mysql) throws Exception {
+      Persistence persistence, BumpService bumps) throws Exception {
     // The watermark under test mirrors JdbcVersionWatermark but routes bump() through the
     // transaction-proxied service so REQUIRES_NEW genuinely suspends and opens a connection.
     JdbcVersionWatermark watermark = new JdbcVersionWatermark(new BumpDaoAdapter(bumps), 60);
@@ -134,28 +165,29 @@ public final class CacheInvalidationSmokeChecks {
         persistence.transactions(), 3, 0);
 
     // 1. The bump executes only after the data commit, and is durable once the caller returns.
-    var dataCommitted = new CountDownLatch(1);
+    // The probe registers before the first evictAfterCommit: Spring runs same-priority
+    // synchronizations in registration order, so the probe's afterCommit precedes the Pending
+    // callback's watermark drain and observes "data committed, bump not yet executed".
+    var probe = new TransactionSynchronization() {
+      @Override public void afterCommit() {
+        try {
+          assertEquals(1, read(observer, "SELECT value FROM cache_invalidation_probe"),
+              "the data write must already be committed when the bump runs");
+          assertEquals(0, read(observer, "SELECT version FROM cache_version WHERE name = '" + VERSION + "'"),
+              "the bump must not execute before the data commit");
+        } catch (AssertionError failure) {
+          throw new IllegalStateException(failure);
+        }
+      }
+    };
     retry.execute("atomic cache generation", () -> {
+      TransactionSynchronizationManager.registerSynchronization(probe);
       persistence.execute().accept("UPDATE cache_invalidation_probe SET value = value + 1 WHERE id = 1");
       cache.evictAfterCommit(REPOSITORY, "simple/a/");
       cache.evictAfterCommit(REPOSITORY, "simple/b/");
       cache.evictAfterCommit(REPOSITORY, "simple/a/"); // deduplicated to one bump
-      TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-        @Override public void afterCommit() {
-          try {
-            assertEquals(1, read(observer, "SELECT value FROM cache_invalidation_probe"),
-                "the data write must already be committed when the bump runs");
-            assertEquals(0, read(observer, "SELECT version FROM cache_version WHERE name = '" + VERSION + "'"),
-                "the bump must not execute before the data commit");
-          } catch (AssertionError failure) {
-            throw new IllegalStateException(failure);
-          }
-        }
-      });
-      dataCommitted.countDown();
       return null;
     });
-    assertTrue(dataCommitted.await(10, TimeUnit.SECONDS));
     assertEquals(0, pool.getHikariPoolMXBean().getActiveConnections(),
         "every connection must be returned once the call completes");
     assertEquals(1, watermark.currentDurable(VERSION),
@@ -163,7 +195,6 @@ public final class CacheInvalidationSmokeChecks {
 
     // 2. A bump that times out after the commit is swallowed: the write stays durable, the
     //    failure is neither retried nor propagated, and the connection is still returned.
-    setLockTimeout(persistence, mysql);
     observer.setAutoCommit(false);
     try (var statement = observer.createStatement()) {
       statement.executeUpdate("UPDATE cache_version SET version = version + 1 WHERE name = '" + VERSION + "'");
@@ -219,7 +250,6 @@ public final class CacheInvalidationSmokeChecks {
     try {
       assertThrows(DataAccessException.class, () -> strict.execute(new TransactionCallbackWithoutResult() {
         @Override protected void doInTransactionWithoutResult(TransactionStatus status) {
-          setLockTimeout(persistence, mysql);
           persistence.execute().accept("UPDATE cache_invalidation_probe SET value = value + 1 WHERE id = 1");
           bumps.bump(VERSION);
         }
@@ -262,11 +292,6 @@ public final class CacheInvalidationSmokeChecks {
   private static AssetMetadataCache cache(VersionWatermark watermark) {
     return new AssetMetadataCache(new com.github.klboke.kkrepo.cache.InMemorySharedCache(
         new com.fasterxml.jackson.databind.ObjectMapper(), 100, null), watermark, true, 60, 5);
-  }
-
-  private static void setLockTimeout(Persistence persistence, boolean mysql) {
-    persistence.execute().accept(mysql
-        ? "SET SESSION innodb_lock_wait_timeout = 1" : "SET LOCAL lock_timeout = '200ms'");
   }
 
   private static long read(Connection connection, String sql) {
